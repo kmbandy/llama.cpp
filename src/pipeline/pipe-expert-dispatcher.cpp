@@ -3723,8 +3723,12 @@ struct dispatcher::impl {
         return sent;
     }
 
-    // WP_SCORE_SUMMARY=1 only: one PIPE_EXPERT_SCORE_SUMMARY frame per worker,
-    // covering that worker's own expert range, for `layer`. Sent after the
+    // WP_SCORE_SUMMARY=1 only: PIPE_EXPERT_SCORE_SUMMARY frames for `layer`,
+    // one per CONTIGUOUS RUN of experts each worker serves on this layer. The
+    // served set comes from routes (the same table that routes requests), not
+    // from info.expert_first/last: a worker's advertised range need not be
+    // indexable against this layer's router (scores_by_expert is indexed by
+    // global expert id, length = the layer's router width). Sent after the
     // layer's request, through the same FIFO writer queue as hints, so it is
     // not subject to the hint in-flight guard. Synchronous-issue mode has no
     // writer queue and skips the frame (counted as skipped), so it never
@@ -3733,47 +3737,69 @@ struct dispatcher::impl {
         if (scores_by_expert.empty()) {
             return 0;
         }
+        const auto route_it = routes.find(layer);
+        if (route_it == routes.end()) {
+            hint_stats.n_score_skipped += workers.size();
+            return 0;
+        }
+        const std::vector<std::vector<size_t>> & layer_routes = route_it->second;
+        const size_t n_scored = std::min(scores_by_expert.size(), layer_routes.size());
         // Sent after the layer's request frames. Async mode queues on the
         // socket's writer FIFO behind the request. Synchronous mode writes the
         // frame on this thread, after the request bytes are fully written, so
         // the two cannot interleave. Hints use the same ordering.
         size_t sent = 0;
-        for (worker & value : workers) {
-            if (!value.socket || poisoned || value.info.expert_first < 0 ||
-                value.info.expert_last < value.info.expert_first) {
+        for (size_t wi = 0; wi < workers.size(); ++wi) {
+            worker & value = workers[wi];
+            if (!value.socket || poisoned) {
                 ++hint_stats.n_score_skipped;
                 continue;
             }
-            const size_t first = (size_t) value.info.expert_first;
-            const size_t last  = std::min(scores_by_expert.size() - 1, (size_t) value.info.expert_last);
-            if (first > last) {
-                ++hint_stats.n_score_skipped;
-                continue;
-            }
-            pipe_expert_score_summary summary;
-            summary.layer        = layer;
-            summary.expert_first = (int32_t) first;
-            summary.scores.assign(scores_by_expert.begin() + (ptrdiff_t) first,
-                                  scores_by_expert.begin() + (ptrdiff_t) last + 1);
-            const std::vector<uint8_t> payload = pipe_encode_expert_score_summary(summary);
-            if (async_issue) {
-                wire_frame frame;
-                frame.type    = PIPE_EXPERT_SCORE_SUMMARY;
-                frame.seq_id  = 0;
-                frame.payload = payload;
-                try {
-                    enqueue_frame(value, std::move(frame));
-                } catch (...) {
-                    ++hint_stats.n_score_skipped;
+            // Maximal contiguous [first, last] runs of experts this worker serves.
+            std::vector<std::pair<size_t, size_t>> runs;
+            for (size_t e = 0; e < n_scored; ++e) {
+                const std::vector<size_t> & owners = layer_routes[e];
+                if (std::find(owners.begin(), owners.end(), wi) == owners.end()) {
                     continue;
                 }
-            } else if (!pipe_send_frame(*value.socket, PIPE_EXPERT_SCORE_SUMMARY, 0,
-                                        payload.data(), payload.size())) {
+                if (!runs.empty() && runs.back().second + 1 == e) {
+                    runs.back().second = e;
+                } else {
+                    runs.emplace_back(e, e);
+                }
+            }
+            if (runs.empty()) {
                 ++hint_stats.n_score_skipped;
                 continue;
             }
-            ++hint_stats.n_score_frames;
-            ++sent;
+            for (const auto & run : runs) {
+                const size_t first = run.first;
+                const size_t last  = run.second;
+                pipe_expert_score_summary summary;
+                summary.layer        = layer;
+                summary.expert_first = (int32_t) first;
+                summary.scores.assign(scores_by_expert.begin() + (ptrdiff_t) first,
+                                      scores_by_expert.begin() + (ptrdiff_t) last + 1);
+                const std::vector<uint8_t> payload = pipe_encode_expert_score_summary(summary);
+                if (async_issue) {
+                    wire_frame frame;
+                    frame.type    = PIPE_EXPERT_SCORE_SUMMARY;
+                    frame.seq_id  = 0;
+                    frame.payload = payload;
+                    try {
+                        enqueue_frame(value, std::move(frame));
+                    } catch (...) {
+                        ++hint_stats.n_score_skipped;
+                        break;
+                    }
+                } else if (!pipe_send_frame(*value.socket, PIPE_EXPERT_SCORE_SUMMARY, 0,
+                                            payload.data(), payload.size())) {
+                    ++hint_stats.n_score_skipped;
+                    break;
+                }
+                ++hint_stats.n_score_frames;
+                ++sent;
+            }
         }
         return sent;
     }

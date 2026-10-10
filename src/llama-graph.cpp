@@ -2659,6 +2659,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // [n_expert, n_tokens] router probs, kept before the reshape below (which
+    // makes ne[0] == 1). WP_SCORE_SUMMARY indexes experts along ne[0].
+    ggml_tensor * probs_2d = probs;
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2753,7 +2756,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // WP_SCORE_SUMMARY=1 only (decode, unchunked): hand the unbiased router
                 // probs to the issue op as an extra read-only source.
                 if (n_tokens <= 16 && expert_dispatch->score_summary_enabled()) {
-                    expert_dispatch->set_score_probs(il, probs);
+                    expert_dispatch->set_score_probs(il, probs_2d);
                 }
                 moe_out = expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il,
                                                        dispatch_swiglu_clamp);

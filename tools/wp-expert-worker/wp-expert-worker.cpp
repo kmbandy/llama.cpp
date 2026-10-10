@@ -24273,7 +24273,11 @@ public:
     // RAM-tier hybrid score EWMA. Advisory and response-free; a no-op unless
     // WP_HOST_TIER_POLICY=hybrid has sized host_score_.
     void note_score_summary(const pipe_expert_score_summary & summary) {
-        g_score_summary_frames.fetch_add(1, std::memory_order_relaxed);
+        if (g_score_summary_frames.fetch_add(1, std::memory_order_relaxed) == 0) {
+            std::cerr << "wp expert worker: first SCORE_SUMMARY layer=" << summary.layer
+                      << " expert_first=" << summary.expert_first
+                      << " n=" << summary.scores.size() << std::endl;
+        }
         if (host_score_.size() == 0) {
             return;
         }
