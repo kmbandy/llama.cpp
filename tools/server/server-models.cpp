@@ -470,7 +470,7 @@ static std::vector<std::string> get_environment() {
 
 static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & vec);
 
-void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
+void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path, server_child_mode mode) {
     // update params
     unset_reserved_args(preset, false);
     // a child on another machine gets its --host from that machine's node (its own bind address)
@@ -536,8 +536,9 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     // render args
     args = preset.to_args(bin_path);
     // kv-preserve: the flags are not presets of their own (to_args() renders none of them), so
-    // they are appended here, for a local or a remote child alike
-    if (kv_preserve_applies()) {
+    // they are appended here, for a local or a remote child alike. Only the serving child gets
+    // them: a download or estimate child would otherwise touch the slot autosave directory.
+    if (mode == SERVER_CHILD_MODE_NORMAL && kv_preserve_applies()) {
         const auto kv_args = router_kv_preserve_child_args(kv_preserve_root, name, kv_preserve_mb);
         args.insert(args.end(), kv_args.begin(), kv_args.end());
     }
@@ -897,7 +898,7 @@ void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
         meta.preset = it->second;
         meta.source = source_map.at(meta.name);
         parse_model_placement(meta);
-        meta.update_args(ctx_preset, bin_path);
+        meta.update_args(ctx_preset, bin_path, SERVER_CHILD_MODE_NORMAL);
         meta.update_caps(base_params);
         models_preset_applied_mtimes[meta.name] = *mtime_after;
         SRV_INF("reloaded models preset '%s' for child model '%s'\n", base_params.models_preset.c_str(), meta.name.c_str());
@@ -962,7 +963,7 @@ void server_models::add_model(server_model_meta && meta) {
     }
 
     parse_model_placement(meta);
-    meta.update_args(ctx_preset, bin_path); // render args
+    meta.update_args(ctx_preset, bin_path, SERVER_CHILD_MODE_NORMAL); // render args
     if (!meta.is_external()) {
         meta.update_caps(base_params); // a worker has no model of its own to probe
     }
@@ -1235,6 +1236,46 @@ static void parse_model_env(server_model_meta & meta) {
     }
 }
 
+void server_model_parse_group_keys(server_model_meta & meta) {
+    const router_group_section sec = router_group_parse_section(meta.preset, meta.name);
+    meta.kind              = sec.kind;
+    meta.depends           = sec.depends;
+    meta.launch            = sec.launch;
+    meta.machine           = sec.machine;
+    meta.gpu               = sec.gpu;
+    meta.park_file         = sec.park_file;
+    meta.park_mode         = sec.park_mode;
+    meta.slot_autosave     = sec.slot_autosave;
+    meta.startup_timeout_s = sec.startup_timeout_s;
+    meta.worker_port       = sec.worker_port;
+    meta.kv_preserve_root  = sec.kv_preserve_root;
+    meta.kv_preserve_mb    = sec.kv_preserve_mb;
+    if (meta.is_external() && !meta.kv_preserve_root.empty()) {
+        SRV_WRN("kv-preserve is ignored on kind=external section '%s' (only a serving model child gets it)\n",
+                meta.name.c_str());
+    }
+}
+
+void server_model_apply_stop_timeout(server_model_meta & meta) {
+    std::string val;
+    const bool has_explicit = meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val);
+    if (has_explicit) {
+        try {
+            meta.stop_timeout = std::stoi(val);
+        } catch (...) {
+            SRV_WRN("invalid stop-timeout value '%s' for model '%s', using default %d seconds\n",
+                val.c_str(), meta.name.c_str(), DEFAULT_STOP_TIMEOUT);
+            meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
+            if (meta.kv_preserve_applies()) {
+                SRV_WRN("model '%s' has kv-preserve: the %d s stop-timeout floor is skipped because stop-timeout is set; a multi-slot save may be killed\n",
+                    meta.name.c_str(), ROUTER_KV_PRESERVE_STOP_TIMEOUT_S);
+            }
+        }
+    }
+    // kv-preserve: a multi-slot save needs longer than the default before it may be SIGKILLed
+    meta.stop_timeout = router_stop_timeout_floor(meta.stop_timeout, has_explicit, meta.kv_preserve_applies());
+}
+
 void server_models::parse_model_placement(server_model_meta & meta) {
     meta.placement = {};
     std::string pinned;
@@ -1280,21 +1321,7 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // Model-group keys: same capture-now hazard (kind/depends/launch/... are stripped by
     // unset_reserved_args()). slot-autosave is NOT stripped: it is a real llama-server flag
     // and reaches the spine child through the preset as LLAMA_ARG_SLOT_AUTOSAVE.
-    {
-        const router_group_section sec = router_group_parse_section(meta.preset, meta.name);
-        meta.kind              = sec.kind;
-        meta.depends           = sec.depends;
-        meta.launch            = sec.launch;
-        meta.machine           = sec.machine;
-        meta.gpu               = sec.gpu;
-        meta.park_file         = sec.park_file;
-        meta.park_mode         = sec.park_mode;
-        meta.slot_autosave     = sec.slot_autosave;
-        meta.startup_timeout_s = sec.startup_timeout_s;
-        meta.worker_port       = sec.worker_port;
-        meta.kv_preserve_root  = sec.kv_preserve_root;
-        meta.kv_preserve_mb    = sec.kv_preserve_mb;
-    }
+    server_model_parse_group_keys(meta);
 
     std::string gpu;
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
@@ -1842,7 +1869,7 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
     SRV_INF("estimate cache MISS for model %s: key=%s (measuring fresh)\n", meta.name.c_str(), key.c_str());
 
     server_model_meta est = meta;
-    est.update_args(ctx_preset, bin_path);
+    est.update_args(ctx_preset, bin_path, SERVER_CHILD_MODE_ESTIMATE);
     // The estimate child runs through this machine's node like every other child (its env is the
     // node's base env = the router's, plus these two).
     std::vector<std::string> child_args = est.args;
@@ -3428,21 +3455,8 @@ void server_models::load_models() {
         }
     };
     auto apply_stop_timeout = [&]() {
-        for (auto & [name, inst] : mapping) {
-            std::string val;
-            const bool has_explicit = inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val);
-            if (has_explicit) {
-                try {
-                    inst.meta.stop_timeout = std::stoi(val);
-                } catch (...) {
-                    SRV_WRN("invalid stop-timeout value '%s' for model '%s', using default %d seconds\n",
-                        val.c_str(), name.c_str(), DEFAULT_STOP_TIMEOUT);
-                    inst.meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
-                }
-            }
-            // kv-preserve: a multi-slot save needs longer than the default before it may be SIGKILLed
-            inst.meta.stop_timeout = router_stop_timeout_floor(
-                inst.meta.stop_timeout, has_explicit, inst.meta.kv_preserve_applies());
+        for (auto & entry : mapping) {
+            server_model_apply_stop_timeout(entry.second.meta);
         }
     };
     // Log only — do NOT re-parse here. parse_model_placement() already set
@@ -3646,7 +3660,7 @@ void server_models::load_models() {
             }
 
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
-            inst.meta.update_args(ctx_preset, bin_path);
+            inst.meta.update_args(ctx_preset, bin_path, SERVER_CHILD_MODE_NORMAL);
             if (!inst.meta.is_external()) {
                 inst.meta.update_caps(base_params);
             }
@@ -4294,7 +4308,7 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     SRV_INF("spawning server instance with name=%s on %s\n", inst.meta.name.c_str(),
             remote ? ("machine " + node->machine() + " (port by its node)").c_str() : ("port " + std::to_string(inst.meta.port)).c_str());
 
-    inst.meta.update_args(ctx_preset, bin); // render args
+    inst.meta.update_args(ctx_preset, bin, opts.mode); // render args
 
     std::vector<std::string> child_args = inst.meta.args; // copy
     // child_env: built and temp-dir checked before placement (see above)

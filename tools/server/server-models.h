@@ -232,9 +232,20 @@ struct server_model_meta {
         return status == SERVER_MODEL_STATUS_UNLOADED && exit_code != 0;
     }
 
-    void update_args(common_preset_context & ctx_presets, std::string bin_path);
+    // mode: the kind of child these args are for. kv-preserve flags go to NORMAL children only
+    // (a download or estimate child must never touch the slot autosave directory).
+    void update_args(common_preset_context & ctx_presets, std::string bin_path, server_child_mode mode);
     void update_caps(const common_params & base);
 };
+
+// Captures the group keys (kind, depends, launch, kv-preserve, ...) of meta.preset into meta.
+// Must run before update_args() strips them. Warns when kv-preserve is set on a kind=external
+// section (it is ignored there).
+void server_model_parse_group_keys(server_model_meta & meta);
+
+// Sets meta.stop_timeout from the preset stop-timeout, else the kv-preserve floor (see
+// router_stop_timeout_floor()). Logs when a kv-preserve model's stop-timeout cannot be parsed.
+void server_model_apply_stop_timeout(server_model_meta & meta);
 
 struct server_models_routes;
 struct server_lru_sched; // defined in server-models.cpp

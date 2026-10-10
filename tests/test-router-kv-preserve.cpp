@@ -1,13 +1,17 @@
-// Tests for the router's kv-preserve preset keys (tools/server/server-router-groups.cpp):
-// parse, the child argv fragment, alias sanitisation, the slot-autosave conflict, the
-// stop-timeout floor and replica subdirectories. Driven through the real preset ini parser.
+// Tests for the router's kv-preserve preset keys (tools/server/server-router-groups.cpp and
+// the wiring in tools/server/server-models.cpp): parse, the child argv through the real
+// update_args() path, mode gating (download/estimate children get no flags), replicas,
+// alias sanitisation, the slot-autosave conflict, and the stop-timeout floor through the real
+// apply path. Driven through the real preset ini parser.
 
 #include "server-router-groups.h"
 #include "server-router-admission.h"
+#include "server-models.h"
 
 #include "arg.h"
 #include "preset.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
@@ -60,11 +64,45 @@ static const router_group_section & find(const std::vector<router_group_section>
 
 using argv_t = std::vector<std::string>;
 
+// a model meta built the way the router builds one: preset from the ini, group keys parsed
+static server_model_meta model_meta(const common_presets & presets, const std::string & name) {
+    server_model_meta meta;
+    meta.name   = name;
+    meta.preset = presets.at(name);
+    server_model_parse_group_keys(meta);
+    return meta;
+}
+
+// the child argv for a mode, through the real update_args() path
+static argv_t child_args(server_model_meta & meta, server_child_mode mode) {
+    common_preset_context ctx(LLAMA_EXAMPLE_SERVER);
+    meta.update_args(ctx, "", mode);
+    return meta.args;
+}
+
+static size_t count_of(const argv_t & a, const std::string & s) {
+    return (size_t) std::count(a.begin(), a.end(), s);
+}
+
+// true when `flag` is immediately followed by `value`
+static bool has_pair(const argv_t & a, const std::string & flag, const std::string & value) {
+    for (size_t i = 0; i + 1 < a.size(); ++i) {
+        if (a[i] == flag && a[i + 1] == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool has_kv_flags(const argv_t & a) {
+    return count_of(a, CHILD_ARG_SLOT_AUTOSAVE_DIR) > 0 || count_of(a, CHILD_ARG_SLOT_AUTOSAVE_BUDGET_MB) > 0;
+}
+
 int main() {
     std::vector<router_group_section> sections;
     const std::string fixture = "tests/router-fixtures/kv-preserve/kv-preserve.ini";
     const common_presets presets = load_presets(fixture, &sections);
-    assert(sections.size() == 6);
+    assert(sections.size() == 7);
 
     // parse: both keys are read verbatim into the section
     const auto & local = find(sections, "local");
@@ -77,49 +115,112 @@ int main() {
     assert(plain.kv_preserve_root.empty());
     assert(plain.kv_preserve_mb == 0);
 
-    // local child argv fragment: dir and budget
-    assert((router_kv_preserve_child_args(local.kv_preserve_root, local.name, local.kv_preserve_mb) ==
-            argv_t{ "--slot-autosave-dir", "/var/lib/kv/local", "--slot-autosave-budget-mb", "4096" }));
+    // ---- child argv through the real update_args() path ----
 
-    // remote child: machine= does not change the fragment, and the root is used verbatim (no budget)
-    const auto & remote = find(sections, "remote");
-    assert(remote.machine == "mad-lab-2026");
-    assert(remote.kv_preserve_mb == 0);
-    assert((router_kv_preserve_child_args(remote.kv_preserve_root, remote.name, remote.kv_preserve_mb) ==
-            argv_t{ "--slot-autosave-dir", "/var/lib/kv/remote" }));
+    // local, serving child: dir and budget
+    {
+        auto meta = model_meta(presets, "local");
+        const argv_t a = child_args(meta, SERVER_CHILD_MODE_NORMAL);
+        assert(has_pair(a, "--slot-autosave-dir", "/var/lib/kv/local"));
+        assert(has_pair(a, "--slot-autosave-budget-mb", "4096"));
+        assert(count_of(a, "--slot-autosave-dir") == 1);
 
-    // group spine: the flags of the spine itself, under its own subdirectory
-    const auto & spine = find(sections, "spine");
-    assert(spine.kind == ROUTER_KIND_MODEL);
-    assert(!spine.depends.empty());
-    assert((router_kv_preserve_child_args(spine.kv_preserve_root, spine.name, spine.kv_preserve_mb) ==
-            argv_t{ "--slot-autosave-dir", "/var/lib/kv/spine", "--slot-autosave-budget-mb", "2048" }));
+        // rendering again must not duplicate the flags
+        const argv_t again = child_args(meta, SERVER_CHILD_MODE_NORMAL);
+        assert(count_of(again, "--slot-autosave-dir") == 1);
+    }
 
-    // a worker of the group parses the key too, but it is kind=external: the router never
-    // applies kv-preserve to a worker (checked in server_model_meta::kv_preserve_applies())
-    const auto & worker = find(sections, "spine-w1");
-    assert(worker.kind == ROUTER_KIND_EXTERNAL);
-    assert(worker.kv_preserve_root == "/var/lib/kv");
+    // remote (machine=) serving child: the root is verbatim and there is no budget
+    {
+        auto meta = model_meta(presets, "remote");
+        assert(meta.machine == "mad-lab-2026");
+        const argv_t a = child_args(meta, SERVER_CHILD_MODE_NORMAL);
+        assert(has_pair(a, "--slot-autosave-dir", "/var/lib/kv/remote"));
+        assert(count_of(a, "--slot-autosave-budget-mb") == 0);
+    }
 
-    // stop-timeout: no explicit value gets the 60 s floor; an explicit one always wins
+    // group spine: the flags of the spine itself
+    {
+        auto meta = model_meta(presets, "spine");
+        assert(meta.kind == ROUTER_KIND_MODEL && !meta.depends.empty());
+        const argv_t a = child_args(meta, SERVER_CHILD_MODE_NORMAL);
+        assert(has_pair(a, "--slot-autosave-dir", "/var/lib/kv/spine"));
+        assert(has_pair(a, "--slot-autosave-budget-mb", "2048"));
+    }
+
+    // a worker of the group never gets the flags
+    {
+        auto meta = model_meta(presets, "spine-w1");
+        assert(meta.is_external());
+        assert(!has_kv_flags(child_args(meta, SERVER_CHILD_MODE_NORMAL)));
+    }
+
+    // replica: the router names it "alias~rK" and it gets its own subdirectory
+    {
+        auto alias = model_meta(presets, "local");
+        server_model_meta replica = alias; // make_replica_meta_locked copies the alias meta
+        replica.name = router_replica_name("local", 2);
+        const argv_t a = child_args(replica, SERVER_CHILD_MODE_NORMAL);
+        assert(has_pair(a, "--slot-autosave-dir", "/var/lib/kv/local_r2"));
+        assert(has_pair(a, "--slot-autosave-budget-mb", "4096"));
+    }
+
+    // download and estimate children never get the flags, whatever the model
+    {
+        auto local_meta = model_meta(presets, "local");
+        assert(!has_kv_flags(child_args(local_meta, SERVER_CHILD_MODE_DOWNLOAD)));
+        assert(!has_kv_flags(child_args(local_meta, SERVER_CHILD_MODE_ESTIMATE)));
+
+        auto spine_meta = model_meta(presets, "spine");
+        assert(!has_kv_flags(child_args(spine_meta, SERVER_CHILD_MODE_DOWNLOAD)));
+        assert(!has_kv_flags(child_args(spine_meta, SERVER_CHILD_MODE_ESTIMATE)));
+    }
+
+    // plain model: no flags
+    {
+        auto meta = model_meta(presets, "plain");
+        assert(!has_kv_flags(child_args(meta, SERVER_CHILD_MODE_NORMAL)));
+    }
+
+    // ---- stop-timeout through the real apply path ----
+    {
+        auto meta = model_meta(presets, "local");
+        meta.stop_timeout = 10; // the default the router builds models with
+        server_model_apply_stop_timeout(meta);
+        assert(meta.stop_timeout == ROUTER_KV_PRESERVE_STOP_TIMEOUT_S);
+        assert(meta.stop_timeout == 60);
+    }
+    {
+        auto meta = model_meta(presets, "explicit"); // stop-timeout = 15 in the preset
+        meta.stop_timeout = 10;
+        server_model_apply_stop_timeout(meta);
+        assert(meta.stop_timeout == 15); // explicit wins over the floor
+    }
+    {
+        auto meta = model_meta(presets, "plain");
+        meta.stop_timeout = 10;
+        server_model_apply_stop_timeout(meta);
+        assert(meta.stop_timeout == 10);
+    }
+    {
+        auto meta = model_meta(presets, "spine-w1"); // a worker: no floor
+        meta.stop_timeout = 10;
+        server_model_apply_stop_timeout(meta);
+        assert(meta.stop_timeout == 10);
+    }
+    {
+        // unparsable explicit value: falls back to the default and the floor is skipped
+        auto meta = model_meta(presets, "badst");
+        meta.stop_timeout = 10;
+        server_model_apply_stop_timeout(meta);
+        assert(meta.stop_timeout == 10);
+    }
+
+    // pure floor rules
     assert(router_stop_timeout_floor(10, false, true) == 60);
     assert(router_stop_timeout_floor(10, false, false) == 10);
     assert(router_stop_timeout_floor(120, false, true) == 120); // never lowered
-    assert(router_stop_timeout_floor(15, true, true) == 15);     // explicit wins
-    assert(router_stop_timeout_floor(10, true, true) == 10);     // explicit wins even at the default
-
-    {
-        const auto & explicit_sec = find(sections, "explicit");
-        std::string val;
-        const bool has_explicit = presets.at("explicit").get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val);
-        assert(has_explicit && val == "15");
-        assert(router_stop_timeout_floor(15, has_explicit, !explicit_sec.kv_preserve_root.empty()) == 15);
-
-        std::string none;
-        const bool plain_explicit = presets.at("plain").get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, none);
-        assert(!plain_explicit);
-        assert(router_stop_timeout_floor(10, plain_explicit, !plain.kv_preserve_root.empty()) == 10);
-    }
+    assert(router_stop_timeout_floor(15, true, true) == 15);
 
     // conflict: kv-preserve and slot-autosave in one section name both keys
     {
@@ -148,12 +249,10 @@ int main() {
     assert(router_kv_preserve_dirname(".") == "_");
     assert(router_kv_preserve_dirname("..") == "_");
 
-    // replicas: each gets its own subdirectory, named from the router's replica name
+    // replica naming used by the subdirectory
     assert(router_replica_name("qwen", 1) == "qwen");
     assert(router_kv_preserve_dirname(router_replica_name("qwen", 2)) == "qwen_r2");
     assert(router_kv_preserve_dirname(router_replica_name("qwen", 3)) == "qwen_r3");
-    assert((router_kv_preserve_child_args("/var/lib/kv", router_replica_name("qwen", 3), 0) ==
-            argv_t{ "--slot-autosave-dir", "/var/lib/kv/qwen_r3" }));
 
     return 0;
 }
