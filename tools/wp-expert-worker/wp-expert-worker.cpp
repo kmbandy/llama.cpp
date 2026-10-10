@@ -2164,10 +2164,11 @@ public:
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
     void set_ram_hybrid_stats(uint64_t evictions_hybrid, uint64_t evictions_hybrid_nontail,
-                              uint64_t admissions_dropped_hybrid) {
+                              uint64_t admissions_dropped_hybrid, uint64_t score_summary_frames) {
         ram_evictions_hybrid_          = evictions_hybrid;
         ram_evictions_hybrid_nontail_  = evictions_hybrid_nontail;
         ram_admissions_dropped_hybrid_ = admissions_dropped_hybrid;
+        ram_score_summary_frames_      = score_summary_frames;
     }
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
                        uint64_t pinned_bytes, uint64_t evictions,
@@ -2483,6 +2484,7 @@ private:
                   << " ram_evictions_hybrid=" << ram_evictions_hybrid_
                   << " ram_evictions_hybrid_nontail=" << ram_evictions_hybrid_nontail_
                   << " ram_admissions_dropped_hybrid=" << ram_admissions_dropped_hybrid_
+                  << " score_summary_frames=" << ram_score_summary_frames_
                   << " ram_admission_cold_landed=" << ram_admission_cold_landed_
                   << " ram_reject_promotions=" << ram_reject_promotions_
                   << " ram_spec_promotions_rejected=" << ram_spec_promotions_rejected_
@@ -2748,6 +2750,7 @@ private:
     uint64_t           ram_evictions_hybrid_          = 0;
     uint64_t           ram_evictions_hybrid_nontail_  = 0;
     uint64_t           ram_admissions_dropped_hybrid_ = 0;
+    uint64_t           ram_score_summary_frames_      = 0;
     uint64_t           ram_reject_promotions_ = 0;
     uint64_t           ram_spec_promotions_rejected_ = 0;
     uint64_t          n_host_hit_ = 0;
@@ -12555,6 +12558,10 @@ void attach_weight(
     // pointers. Padding is zeroed before H2D on slot.raw (I8, full slot).
 }
 
+// WP_SCORE_SUMMARY diagnostic: PIPE_EXPERT_SCORE_SUMMARY frames this worker
+// process has received (reported with the hybrid RAM counters).
+static std::atomic<uint64_t> g_score_summary_frames{ 0 };
+
 class DeviceWorker {
 public:
     ~DeviceWorker();
@@ -15718,7 +15725,8 @@ public:
                                  arena.spec_promotions_rejected(),
                                  arena.evictions_lfu_nonfront());
             stats_.set_ram_hybrid_stats(arena.evictions_hybrid(), arena.evictions_hybrid_nontail(),
-                                        arena.admissions_dropped_hybrid());
+                                        arena.admissions_dropped_hybrid(),
+                                        g_score_summary_frames.load(std::memory_order_relaxed));
             stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
                                     pool_.ns_victim_demote(), arena.drops(), pool_.ns_victim_wait());
         }
@@ -24265,6 +24273,7 @@ public:
     // RAM-tier hybrid score EWMA. Advisory and response-free; a no-op unless
     // WP_HOST_TIER_POLICY=hybrid has sized host_score_.
     void note_score_summary(const pipe_expert_score_summary & summary) {
+        g_score_summary_frames.fetch_add(1, std::memory_order_relaxed);
         if (host_score_.size() == 0) {
             return;
         }

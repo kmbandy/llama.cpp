@@ -3730,18 +3730,24 @@ struct dispatcher::impl {
     // writer queue and skips the frame (counted as skipped), so it never
     // interleaves bytes with an outstanding request.
     size_t send_score_summary(int32_t layer, const std::vector<uint8_t> & scores_by_expert) {
-        if (poisoned || !async_issue || scores_by_expert.empty()) {
+        if (scores_by_expert.empty()) {
             return 0;
         }
+        // Sent after the layer's request frames. Async mode queues on the
+        // socket's writer FIFO behind the request. Synchronous mode writes the
+        // frame on this thread, after the request bytes are fully written, so
+        // the two cannot interleave. Hints use the same ordering.
         size_t sent = 0;
         for (worker & value : workers) {
-            if (!value.socket || value.info.expert_first < 0 ||
+            if (!value.socket || poisoned || value.info.expert_first < 0 ||
                 value.info.expert_last < value.info.expert_first) {
+                ++hint_stats.n_score_skipped;
                 continue;
             }
             const size_t first = (size_t) value.info.expert_first;
             const size_t last  = std::min(scores_by_expert.size() - 1, (size_t) value.info.expert_last);
             if (first > last) {
+                ++hint_stats.n_score_skipped;
                 continue;
             }
             pipe_expert_score_summary summary;
@@ -3749,15 +3755,24 @@ struct dispatcher::impl {
             summary.expert_first = (int32_t) first;
             summary.scores.assign(scores_by_expert.begin() + (ptrdiff_t) first,
                                   scores_by_expert.begin() + (ptrdiff_t) last + 1);
-            wire_frame frame;
-            frame.type    = PIPE_EXPERT_SCORE_SUMMARY;
-            frame.seq_id  = 0;
-            frame.payload = pipe_encode_expert_score_summary(summary);
-            try {
-                enqueue_frame(value, std::move(frame));
-            } catch (...) {
+            const std::vector<uint8_t> payload = pipe_encode_expert_score_summary(summary);
+            if (async_issue) {
+                wire_frame frame;
+                frame.type    = PIPE_EXPERT_SCORE_SUMMARY;
+                frame.seq_id  = 0;
+                frame.payload = payload;
+                try {
+                    enqueue_frame(value, std::move(frame));
+                } catch (...) {
+                    ++hint_stats.n_score_skipped;
+                    continue;
+                }
+            } else if (!pipe_send_frame(*value.socket, PIPE_EXPERT_SCORE_SUMMARY, 0,
+                                        payload.data(), payload.size())) {
+                ++hint_stats.n_score_skipped;
                 continue;
             }
+            ++hint_stats.n_score_frames;
             ++sent;
         }
         return sent;

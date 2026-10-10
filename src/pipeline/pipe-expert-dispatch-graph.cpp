@@ -2691,7 +2691,7 @@ void graph_dispatcher::end_decode() noexcept {
         LLAMA_LOG_WARN(
             "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
             "sent_in_flight=%llu send_failed=%llu no_route=%llu "
-            "skip_dynamic=%llu skip_in_flight=%llu\n",
+            "skip_dynamic=%llu skip_in_flight=%llu score_frames=%llu score_skipped=%llu\n",
             oracle_.layers().size(),
             (unsigned long long) hstats.n_frames,
             (unsigned long long) hstats.n_experts,
@@ -2699,7 +2699,9 @@ void graph_dispatcher::end_decode() noexcept {
             (unsigned long long) hstats.n_send_failed,
             (unsigned long long) hstats.n_no_oracle,
             (unsigned long long) hstats.n_skipped_dynamic,
-            (unsigned long long) hstats.n_skipped_in_flight);
+            (unsigned long long) hstats.n_skipped_in_flight,
+            (unsigned long long) hstats.n_score_frames,
+            (unsigned long long) hstats.n_score_skipped);
         if (router2_pscore() != nullptr) {
             // Cumulative since process start. admit_by_d lists d=2..K+1; admit_by_p
             // is deciles of P (0.0-0.1 ... 0.9-1.0; only >= PMIN are nonzero).

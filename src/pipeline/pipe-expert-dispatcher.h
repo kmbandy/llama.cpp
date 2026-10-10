@@ -147,6 +147,11 @@ struct prefetch_hint_stats {
     uint64_t n_skipped_in_flight = 0;
     // Frames sent while at least one request response was outstanding.
     uint64_t n_sent_in_flight = 0;
+    // WP_SCORE_SUMMARY: PIPE_EXPERT_SCORE_SUMMARY frames handed to the transport
+    // (async enqueue or synchronous send), and per-worker summaries skipped
+    // (no socket, poisoned, or transport refused).
+    uint64_t n_score_frames  = 0;
+    uint64_t n_score_skipped = 0;
 };
 
 // Cumulative expert-deferral mechanism counters (spec section 4).
