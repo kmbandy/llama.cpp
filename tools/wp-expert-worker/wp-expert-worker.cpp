@@ -2163,6 +2163,12 @@ public:
 
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
+    void set_ram_hybrid_stats(uint64_t evictions_hybrid, uint64_t evictions_hybrid_nontail,
+                              uint64_t admissions_dropped_hybrid) {
+        ram_evictions_hybrid_          = evictions_hybrid;
+        ram_evictions_hybrid_nontail_  = evictions_hybrid_nontail;
+        ram_admissions_dropped_hybrid_ = admissions_dropped_hybrid;
+    }
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
                        uint64_t pinned_bytes, uint64_t evictions,
                        uint64_t admission_cold_landed,
@@ -2471,6 +2477,12 @@ private:
                   // lfu picks that were not the LRU front (policy changed
                   // the choice); 0 unless WP_HOST_TIER_POLICY=lfu.
                   << " ram_evictions_lfu_nonfront=" << ram_evictions_lfu_nonfront_
+                  // hybrid picks / picks that were not the LRU tail / incoming
+                  // speculative pages dropped by the admission gate; 0 unless
+                  // WP_HOST_TIER_POLICY=hybrid.
+                  << " ram_evictions_hybrid=" << ram_evictions_hybrid_
+                  << " ram_evictions_hybrid_nontail=" << ram_evictions_hybrid_nontail_
+                  << " ram_admissions_dropped_hybrid=" << ram_admissions_dropped_hybrid_
                   << " ram_admission_cold_landed=" << ram_admission_cold_landed_
                   << " ram_reject_promotions=" << ram_reject_promotions_
                   << " ram_spec_promotions_rejected=" << ram_spec_promotions_rejected_
@@ -2733,6 +2745,9 @@ private:
     uint64_t           ram_evictions_reject_  = 0;
     uint64_t           ram_evictions_lru_     = 0;
     uint64_t           ram_evictions_lfu_nonfront_ = 0;
+    uint64_t           ram_evictions_hybrid_          = 0;
+    uint64_t           ram_evictions_hybrid_nontail_  = 0;
+    uint64_t           ram_admissions_dropped_hybrid_ = 0;
     uint64_t           ram_reject_promotions_ = 0;
     uint64_t           ram_spec_promotions_rejected_ = 0;
     uint64_t          n_host_hit_ = 0;
@@ -15702,6 +15717,8 @@ public:
                                  arena.evictions_lru(), arena.reject_promotions(),
                                  arena.spec_promotions_rejected(),
                                  arena.evictions_lfu_nonfront());
+            stats_.set_ram_hybrid_stats(arena.evictions_hybrid(), arena.evictions_hybrid_nontail(),
+                                        arena.admissions_dropped_hybrid());
             stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
                                     pool_.ns_victim_demote(), arena.drops(), pool_.ns_victim_wait());
         }
@@ -22757,6 +22774,33 @@ public:
                     if (v > 0) cfg.lfu_age_period = (uint64_t) v;
                 }
             }
+            // WP_HOST_TIER_POLICY=hybrid: RAM-tier eviction key = 0.5 *
+            // recency_rank + 0.5 * score_rank over the first
+            // WP_HOST_TIER_HYBRID_SAMPLE LRU-tail entries, score = per-page
+            // EWMA of the router's unbiased max-over-rows prob (half-life
+            // WP_HOST_TIER_SCORE_HALFLIFE decode steps). Default off. Only the
+            // RAM tier changes; CPU/GPU placement never reads it (see the
+            // determinism notes in the worker's cpu_tier decision block).
+            if (const char * e = std::getenv("WP_HOST_TIER_POLICY")) {
+                cfg.hybrid_eviction = std::strcmp(e, "hybrid") == 0;
+            }
+            if (cfg.hybrid_eviction) {
+                if (const char * e = std::getenv("WP_HOST_TIER_HYBRID_SAMPLE")) {
+                    const long v = std::strtol(e, nullptr, 10);
+                    if (v > 0) cfg.hybrid_sample = (size_t) v;
+                }
+                double halflife = 10.0;
+                if (const char * e = std::getenv("WP_HOST_TIER_SCORE_HALFLIFE")) {
+                    const double v = std::strtod(e, nullptr);
+                    if (v > 0.0) halflife = v;
+                }
+                size_t n_cache = 0;
+                for (const auto & item : catalog_.pages) {
+                    n_cache = std::max<size_t>(n_cache, (size_t) std::max(item.second.cache_id, -1) + 1);
+                }
+                host_score_.reset(n_cache, halflife);
+                cfg.hybrid_score = [this](int page_idx) { return host_score_.score(page_idx); };
+            }
             // WP_HOST_TIER_PROTECT_DEMAND=1: default off. Narrows a
             // speculative begin_read's reservation-time eviction fallback
             // to spec_lru_/reject_lru_ only (never lru_, the demand list)
@@ -22924,6 +22968,13 @@ public:
                           << " tier_mb=" << (cfg.tier_bytes >> 20)
                           << " entries=" << arena_.entry_count()
                           << " sketch_width=" << cfg.sketch_width << std::endl;
+            }
+            if (cfg.hybrid_eviction) {
+                std::cerr << "wp::HostArena: WP_HOST_TIER_POLICY=hybrid engaged"
+                          << " sample=" << cfg.hybrid_sample
+                          << " score_pages=" << host_score_.size()
+                          << " tier_mb=" << (cfg.tier_bytes >> 20)
+                          << " entries=" << arena_.entry_count() << std::endl;
             }
             if (cfg.lfu_eviction) {
                 std::cerr << "wp::HostArena: WP_HOST_TIER_POLICY=lfu engaged"
@@ -25844,6 +25895,9 @@ private:
     // is still alive when a DeviceWorker's own teardown drains any live
     // batch (same destruction-order discipline as ExpertSlotPool's
     // spec_batches_ comment).
+    // WP_HOST_TIER_POLICY=hybrid: per-page EWMA router score read by the RAM
+    // arena's hybrid victim choice. Declared before arena_ (destroyed after it).
+    wp::HostScoreTable host_score_;
     wp::HostArena arena_;
     std::string   arena_kind_;
     size_t        arena_inflight_max_ = 16;

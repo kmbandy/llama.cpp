@@ -80,6 +80,9 @@ void HostArena::shutdown() {
     evictions_reject_     = 0;
     evictions_lru_        = 0;
     evictions_lfu_nonfront_ = 0;
+    evictions_hybrid_       = 0;
+    evictions_hybrid_nontail_ = 0;
+    admissions_dropped_hybrid_ = 0;
     spec_evicted_unused_  = 0;
     spec_promotions_      = 0;
     reject_promotions_    = 0;
@@ -336,18 +339,88 @@ void HostArena::admit_landed_locked_(size_t idx, bool prefill_hint) {
 // rather than falling back to lru_, because a speculative read must never
 // steal room from a confirmed demand page just to seat a guess (see the
 // .h EvictScope comment).
-bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand) {
+bool HostArena::hybrid_pick_locked_(const std::list<size_t> & list, size_t & idx_out,
+                                    double & key_out, bool & nontail_out,
+                                    int incoming_page, double * incoming_key_out) const {
+    const size_t K = std::max<size_t>(cfg_.hybrid_sample, 1);
+    std::vector<size_t> cand;
+    cand.reserve(K);
+    for (size_t c : list) {
+        if (entries_[c].borrows != 0) continue;   // skipped in place, not sampled
+        cand.push_back(c);
+        if (cand.size() >= K) break;
+    }
+    if (cand.empty()) return false;
+
+    // Sample is in LRU order, so the sample index IS the recency rank
+    // (0 = oldest). Score rank = count of sampled entries with a strictly
+    // lower score, so ties share a rank and cold (all-zero) scores fall back
+    // to pure LRU. Both ranks are normalised to [0,1] by (n-1).
+    const size_t n   = cand.size();
+    const double den = n > 1 ? (double) (n - 1) : 1.0;
+    std::vector<float> sc(n);
+    for (size_t i = 0; i < n; ++i) {
+        sc[i] = cfg_.hybrid_score ? cfg_.hybrid_score(entries_[cand[i]].page_idx) : 0.0f;
+    }
+
+    double best = 2.0;
+    size_t bi   = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t less = 0;
+        for (size_t j = 0; j < n; ++j) {
+            if (sc[j] < sc[i]) ++less;
+        }
+        const double key = 0.5 * ((double) i / den) + 0.5 * ((double) less / den);
+        if (key < best) { best = key; bi = i; }   // strict: ties keep the older entry
+    }
+    idx_out     = cand[bi];
+    key_out     = best;
+    nontail_out = bi != 0;
+
+    if (incoming_page >= 0 && incoming_key_out != nullptr) {
+        // Incoming page: recency rank 0 (a speculative guess has no demand
+        // recency yet), score rank against the same sample.
+        const float s_in = cfg_.hybrid_score ? cfg_.hybrid_score(incoming_page) : 0.0f;
+        size_t less_in = 0;
+        for (size_t j = 0; j < n; ++j) {
+            if (sc[j] < s_in) ++less_in;
+        }
+        *incoming_key_out = 0.5 * std::min(1.0, (double) less_in / den);
+    }
+    return true;
+}
+
+bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand, int gate_page) {
     size_t idx   = 0;
     bool   found = false;
     ListLoc from = ListLoc::None;
+    // hybrid bookkeeping: `hyb` = victim chosen by hybrid_pick_locked_.
+    bool   hyb      = false;
+    bool   nontail  = false;
+    double key_victim = 0.0;
+    double key_in     = 0.0;
+    const auto pick_hybrid = [&](const std::list<size_t> & list, ListLoc loc) {
+        if (!hybrid_pick_locked_(list, idx, key_victim, nontail, gate_page,
+                                 gate_page >= 0 ? &key_in : nullptr)) {
+            return false;
+        }
+        found = true;
+        from  = loc;
+        hyb   = true;
+        return true;
+    };
 
     // spec_protect_pct: a demand-driven eviction leaves the landed speculative
     // segment alone while it is within its protected size (see Config).
     const bool protect_spec = for_demand && cfg_.spec_protect_pct > 0 && scope == EvictScope::Any &&
         spec_bytes_ <= entries_.size() * (size_t) cfg_.spec_protect_pct / 100 * cfg_.entry_bytes;
     if (!protect_spec) {
-        for (size_t cand : spec_lru_) {
-            if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
+        if (cfg_.hybrid_eviction) {
+            pick_hybrid(spec_lru_, ListLoc::SpecLru);
+        } else {
+            for (size_t cand : spec_lru_) {
+                if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::SpecLru; break; }
+            }
         }
     }
     if (!found && scope != EvictScope::SpecOnly) {
@@ -374,6 +447,8 @@ bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand) {
                 if (++seen >= K) break;
             }
             if (found && idx != first_idx) ++evictions_lfu_nonfront_;
+        } else if (cfg_.hybrid_eviction) {
+            pick_hybrid(lru_, ListLoc::Lru);
         } else {
             for (size_t cand : lru_) {
                 if (entries_[cand].borrows == 0) { idx = cand; found = true; from = ListLoc::Lru; break; }
@@ -388,6 +463,13 @@ bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand) {
         }
     }
     if (!found) return false;
+    if (hyb && gate_page >= 0 && key_in < key_victim) {
+        // Admission gate: the incoming speculative page would be the lowest-
+        // keyed page of the sample, so it is dropped instead of evicting a
+        // page that scores higher. Demand reservations never pass gate_page.
+        ++admissions_dropped_hybrid_;
+        return false;
+    }
 
     Entry & e = entries_[idx];
     const int page_idx = e.page_idx;
@@ -411,6 +493,10 @@ bool HostArena::evict_one_locked_(EvictScope scope, bool for_demand) {
     } else {
         lru_.erase(e.lru_pos);
         ++evictions_lru_;
+    }
+    if (hyb) {
+        ++evictions_hybrid_;
+        if (nontail) ++evictions_hybrid_nontail_;
     }
     e.loc = ListLoc::None;
 
@@ -523,7 +609,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
         // spec_lru_ / is skipped in place, so if none is evictable we refuse
         // rather than touch the confirmed side.
         if (quar_n_ >= quar_cap_entries_()) {
-            if (!evict_one_locked_(EvictScope::SpecOnly)) {
+            if (!evict_one_locked_(EvictScope::SpecOnly, false, page_idx)) {
                 ++quar_skipped_full_;
                 ++begin_read_refusals_;
                 return false;
@@ -535,7 +621,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             free_.pop_back();
         } else if (evict_one_locked_(
                        (cfg_.freq_admission || cfg_.protect_demand_from_spec)
-                           ? EvictScope::SpecOrReject : EvictScope::Any)) {
+                           ? EvictScope::SpecOrReject : EvictScope::Any, false, page_idx)) {
             idx = free_.back();
             free_.pop_back();
         } else {
@@ -549,7 +635,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             // speculative side, regardless of whether a Free entry exists
             // elsewhere -- otherwise speculative occupancy could creep past
             // its cap by borrowing space intended for demand pages.
-            if (!evict_one_locked_(EvictScope::SpecOnly)) {
+            if (!evict_one_locked_(EvictScope::SpecOnly, false, page_idx)) {
                 ++begin_read_refusals_;
                 return false;
             }
@@ -560,7 +646,7 @@ bool HostArena::begin_read_locked_(int page_idx, bool speculative, void ** data_
             free_.pop_back();
         } else if (evict_one_locked_(
                        (cfg_.freq_admission || cfg_.protect_demand_from_spec)
-                           ? EvictScope::SpecOrReject : EvictScope::Any)) {
+                           ? EvictScope::SpecOrReject : EvictScope::Any, false, page_idx)) {
             // *** THE BUG THE LIVE 2026-09-25 RUN FOUND: n_host_hit=0 EVEN
             // WITH A TIER SIZED TO HOLD THE WHOLE WORKING SET. ***
             // admit_landed_locked_ only gates WHERE a demand page LANDS
@@ -958,6 +1044,9 @@ uint64_t HostArena::evictions_reject() const { std::lock_guard<std::mutex> lock(
 uint64_t HostArena::evictions_lru()    const { std::lock_guard<std::mutex> lock(mu_); return evictions_lru_; }
 uint64_t HostArena::sketch_period() const { std::lock_guard<std::mutex> lock(mu_); return sketch_period_; }
 uint64_t HostArena::evictions_lfu_nonfront() const { std::lock_guard<std::mutex> lock(mu_); return evictions_lfu_nonfront_; }
+uint64_t HostArena::evictions_hybrid() const { std::lock_guard<std::mutex> lock(mu_); return evictions_hybrid_; }
+uint64_t HostArena::evictions_hybrid_nontail() const { std::lock_guard<std::mutex> lock(mu_); return evictions_hybrid_nontail_; }
+uint64_t HostArena::admissions_dropped_hybrid() const { std::lock_guard<std::mutex> lock(mu_); return admissions_dropped_hybrid_; }
 uint64_t HostArena::reject_promotions() const { std::lock_guard<std::mutex> lock(mu_); return reject_promotions_; }
 uint64_t HostArena::spec_promotions_rejected() const { std::lock_guard<std::mutex> lock(mu_); return spec_promotions_rejected_; }
 uint64_t HostArena::lookups()     const { std::lock_guard<std::mutex> lock(mu_); return lookups_; }

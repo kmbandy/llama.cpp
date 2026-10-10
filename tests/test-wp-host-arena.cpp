@@ -1,6 +1,7 @@
 #include "../src/weight-pager/wp-host-arena.h"
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -607,6 +608,113 @@ static void test_lfu_evicts_low_frequency_not_lru_front() {
 // freq_admission=false (the default, unset in cfg()) must be exactly the
 // pre-existing behaviour: admission_cold_landed() stays 0 even under the
 // same pressure that exercises it above.
+// hybrid_eviction (WP_HOST_TIER_POLICY=hybrid). Three demand pages resident in
+// LRU order 0,1,2 (budget = 3 entries), then a 4th demand read forces one
+// victim choice. Scores are passed through a plain vector.
+static HostArena::Config hybrid_cfg(const std::vector<float> & scores, size_t sample = 16) {
+    HostArena::Config c = cfg(3, 3);
+    c.spec_frac_pct   = 100;   // spec cap never the binding constraint in these cases
+    c.hybrid_eviction = true;
+    c.hybrid_sample   = sample;
+    c.hybrid_score    = [&scores](int page) {
+        return page >= 0 && (size_t) page < scores.size() ? scores[page] : 0.0f;
+    };
+    return c;
+}
+
+// key(0)=0.5, key(1)=0.25 (oldest-middle, lowest score), key(2)=0.75.
+static void test_hybrid_evicts_lowest_key_not_lru_front() {
+    CountingAlloc a;
+    std::vector<float> sc = { 0.9f, 0.0f, 0.5f };
+    HostArena arena;
+    HostArena::Config c = hybrid_cfg(sc);
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    require(arena.entry_count() == 3, "three-entry arena");
+    read_page(arena, 0); read_page(arena, 1); read_page(arena, 2);
+    read_page(arena, 3);
+    require(arena.state_of(1) == HostArena::State::Free, "lowest-key page (score 0, not LRU front) evicted");
+    require(arena.state_of(0) == HostArena::State::Resident, "LRU front with high score kept");
+    require(arena.evictions_hybrid() == 1, "hybrid pick counted");
+    require(arena.evictions_hybrid_nontail() == 1, "pick that is not the LRU tail counted");
+    require(arena.admissions_dropped_hybrid() == 0, "demand reads are never gated");
+}
+
+// Flat (all-zero) scores and sample=1 both reduce to plain LRU.
+static void test_hybrid_flat_scores_and_sample1_are_lru() {
+    CountingAlloc a;
+    std::vector<float> flat = { 0.0f, 0.0f, 0.0f, 0.0f };
+    {
+        HostArena arena;
+        require(arena.init(hybrid_cfg(flat), a.alloc(), a.dealloc()), "init flat");
+        read_page(arena, 0); read_page(arena, 1); read_page(arena, 2);
+        read_page(arena, 3);
+        require(arena.state_of(0) == HostArena::State::Free, "flat scores evict the LRU front");
+        require(arena.evictions_hybrid_nontail() == 0, "flat scores: never a non-tail pick");
+    }
+    std::vector<float> sc = { 0.9f, 0.0f, 0.5f, 0.0f };
+    {
+        HostArena arena;
+        require(arena.init(hybrid_cfg(sc, /*sample=*/1), a.alloc(), a.dealloc()), "init sample1");
+        read_page(arena, 0); read_page(arena, 1); read_page(arena, 2);
+        read_page(arena, 3);
+        require(arena.state_of(0) == HostArena::State::Free, "sample=1 is LRU regardless of score");
+        require(arena.evictions_hybrid_nontail() == 0, "sample=1: never a non-tail pick");
+    }
+}
+
+// Admission gate: a speculative reservation whose key is below the victim's
+// is dropped (nothing evicted); one above it is admitted and evicts.
+static void test_hybrid_gate_drops_low_key_speculative() {
+    CountingAlloc a;
+    std::vector<float> sc = { 0.9f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.95f, 0.0f };
+    HostArena arena;
+    require(arena.init(hybrid_cfg(sc), a.alloc(), a.dealloc()), "init gate");
+    read_page(arena, 0); read_page(arena, 1); read_page(arena, 2);
+
+    void * data; HostArena::Handle h;
+    require(!arena.begin_read(9, /*speculative=*/true, &data, &h),
+            "speculative page below the victim's key is refused");
+    require(arena.state_of(1) == HostArena::State::Resident, "gated: victim stays resident");
+    require(arena.state_of(9) == HostArena::State::Free, "gated: incoming page not admitted");
+    require(arena.admissions_dropped_hybrid() == 1, "gate drop counted");
+    require(arena.evictions_hybrid() == 0, "a drop is not an eviction");
+
+    require(arena.begin_read(8, /*speculative=*/true, &data, &h),
+            "speculative page above the victim's key is admitted");
+    arena.finish_read(8, h, true, false, false);
+    require(arena.state_of(1) == HostArena::State::Free, "admitted: lowest-key victim evicted");
+    require(arena.admissions_dropped_hybrid() == 1, "no extra drop on admission");
+}
+
+// Pinned entries are not in the LRU lists, so the hybrid sample never sees
+// them even when they have the lowest score.
+static void test_hybrid_respects_pins() {
+    CountingAlloc a;
+    std::vector<float> sc = { 0.9f, 0.0f, 0.5f, 0.0f };
+    HostArena arena;
+    require(arena.init(hybrid_cfg(sc), a.alloc(), a.dealloc()), "init pins");
+    read_page(arena, 0); read_page(arena, 1); read_page(arena, 2);
+    require(arena.pin(1), "pin the lowest-score page");
+    read_page(arena, 3);
+    require(arena.state_of(1) == HostArena::State::Resident && arena.pinned_bytes() > 0,
+            "pinned page is never a hybrid victim");
+    require(arena.state_of(0) == HostArena::State::Free || arena.state_of(2) == HostArena::State::Free,
+            "one unpinned page was evicted");
+}
+
+// HostScoreTable: alpha = 1 - 2^(-1/halflife); halflife 1 gives alpha 0.5.
+static void test_host_score_table_ewma() {
+    wp::HostScoreTable t;
+    t.reset(4, 1.0);
+    const int page = 2;
+    const float one = 1.0f, zero = 0.0f;
+    t.update_layer(&page, &one, 1);
+    require(std::fabs(t.score(page) - 0.5f) < 1e-6f, "first update: (1-alpha)*x");
+    t.update_layer(&page, &zero, 1);
+    require(std::fabs(t.score(page) - 0.25f) < 1e-6f, "unlisted-this-step decays with x=0");
+    require(t.score(99) == 0.0f && t.score(-1) == 0.0f, "out-of-range pages score 0");
+}
+
 static void test_freq_admission_off_never_touches_admission_counters() {
     CountingAlloc a;
     HostArena::Config c = cfg(8);
@@ -1156,6 +1264,11 @@ int main() {
         test_freq_admission_off_speculative_can_still_evict_demand();
         test_freq_admission_off_never_touches_admission_counters();
         test_lfu_evicts_low_frequency_not_lru_front();
+        test_hybrid_evicts_lowest_key_not_lru_front();
+        test_hybrid_flat_scores_and_sample1_are_lru();
+        test_hybrid_gate_drops_low_key_speculative();
+        test_hybrid_respects_pins();
+        test_host_score_table_ewma();
         test_protect_demand_from_spec_speculative_never_evicts_demand();
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         test_mark_drop_frees_when_idle();

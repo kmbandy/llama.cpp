@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
@@ -142,6 +143,20 @@ public:
         // evictable, so this can never refuse a demand read that would have
         // succeeded. Only changes which RAM-arena page is resident.
         int    spec_protect_pct  = 0;
+        // WP_HOST_TIER_POLICY=hybrid in the worker. Default false: byte-for-
+        // byte the eviction order above. When true, every victim choice that
+        // would take the FRONT of spec_lru_ or lru_ instead samples the first
+        // hybrid_sample evictable entries from that list (LRU order) and
+        // evicts the lowest key = 0.5 * recency_rank + 0.5 * score_rank, where
+        // both ranks are percentiles within the sample (higher = keep;
+        // recency_rank = LRU position, score_rank = count of sampled entries
+        // with a strictly lower score). Ties keep the older entry, so a flat
+        // score table degrades exactly to LRU. reject_lru_ is unchanged.
+        // hybrid_score(page_idx) returns the router score for a page (higher
+        // = keep); null means every page scores 0 (pure LRU).
+        bool   hybrid_eviction = false;
+        size_t hybrid_sample   = 16;
+        std::function<float(int)> hybrid_score;
     };
     // alloc(bytes) returns 4096-aligned memory or nullptr; free(ptr, bytes).
     using Allocator   = std::function<void *(size_t)>;
@@ -304,6 +319,14 @@ public:
     // pick was NOT the LRU-front evictable entry (the policy actually
     // changed the choice). Always 0 when the policy is off.
     uint64_t evictions_lfu_nonfront() const;
+    // hybrid_eviction only (all 0 when off). ram_evictions_hybrid: victims
+    // chosen by the hybrid rule (spec_lru_ or lru_ front). _nontail: of
+    // those, victims that were not the oldest evictable entry in the list.
+    // admissions_dropped_hybrid: speculative reservations refused because the
+    // incoming page's key was below the victim's key.
+    uint64_t evictions_hybrid() const;
+    uint64_t evictions_hybrid_nontail() const;
+    uint64_t admissions_dropped_hybrid() const;
     // Sketch aging period in effect (0 when no sketch is allocated).
     uint64_t sketch_period() const;
     // freq_admission only: a demand hit promoted an entry out of
@@ -390,7 +413,17 @@ private:
     // list, and reject_lru_/spec_lru_ ahead of lru_ across lists.
     enum class EvictScope { Any, SpecOnly, SpecOrReject };
 
-    bool     evict_one_locked_(EvictScope scope, bool for_demand = false);
+    // gate_page >= 0 (a speculative reservation under hybrid_eviction): if the
+    // hybrid victim's key is above the incoming page's key, nothing is evicted,
+    // returns false and admissions_dropped_hybrid_ is bumped.
+    bool     evict_one_locked_(EvictScope scope, bool for_demand = false, int gate_page = -1);
+    // Caller holds mu_. Hybrid choice over the first hybrid_sample evictable
+    // entries of `list`. Fills idx/key of the victim; if incoming_page >= 0 also
+    // the incoming key (recency rank 0: a speculative page has no demand
+    // recency). Returns false if the list has no evictable entry.
+    bool     hybrid_pick_locked_(const std::list<size_t> & list, size_t & idx_out,
+                                 double & key_out, bool & nontail_out,
+                                 int incoming_page, double * incoming_key_out) const;
     void     trim_to_tier_cap_locked_();
     // Caller holds mu_. Frees a Resident, unborrowed, unpinned entry flagged
     // drop_when_idle; returns whether it did.
@@ -467,6 +500,9 @@ private:
     uint64_t evictions_reject_    = 0;
     uint64_t evictions_lru_       = 0;
     uint64_t evictions_lfu_nonfront_ = 0;
+    uint64_t evictions_hybrid_       = 0;
+    uint64_t evictions_hybrid_nontail_ = 0;
+    uint64_t admissions_dropped_hybrid_ = 0;
     uint64_t spec_evicted_unused_ = 0;
     uint64_t spec_promotions_     = 0;
     uint64_t reject_promotions_   = 0;
@@ -490,6 +526,41 @@ private:
     std::vector<uint8_t> sketch_;
     uint64_t             sketch_ops_    = 0;
     uint64_t             sketch_period_ = 0;   // halve all counters every this many records
+};
+
+// Per-page EWMA router score for WP_HOST_TIER_POLICY=hybrid. Indexed by the
+// arena page index (cache_id). update_layer() is called once per MoE layer per
+// decode step with that step's per-expert summary; alpha = 1 - 2^(-1/halflife)
+// so a score's weight halves every `halflife` updates of its layer. Pages
+// absent from a summary are passed explicitly with x = 0 so they still decay.
+// Thread-safe: score() is called under the arena lock, update_layer() from the
+// request path, and this lock is never held while calling into the arena.
+class HostScoreTable {
+public:
+    void reset(size_t n_pages, double halflife_steps) {
+        std::lock_guard<std::mutex> lock(mu_);
+        score_.assign(n_pages, 0.0f);
+        alpha_ = halflife_steps > 0.0 ? 1.0 - std::pow(2.0, -1.0 / halflife_steps) : 1.0;
+    }
+    // pages[i] receives x[i] (already normalised to [0,1]); n entries.
+    void update_layer(const int * pages, const float * x, size_t n) {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (size_t i = 0; i < n; ++i) {
+            const int p = pages[i];
+            if (p < 0 || (size_t) p >= score_.size()) continue;
+            score_[p] = (float) (alpha_ * score_[p] + (1.0 - alpha_) * x[i]);
+        }
+    }
+    float score(int page_idx) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (page_idx < 0 || (size_t) page_idx >= score_.size()) return 0.0f;
+        return score_[page_idx];
+    }
+    size_t size() const { std::lock_guard<std::mutex> lock(mu_); return score_.size(); }
+private:
+    mutable std::mutex mu_;
+    std::vector<float> score_;
+    double alpha_ = 1.0;
 };
 
 }  // namespace wp
