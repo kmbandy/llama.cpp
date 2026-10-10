@@ -81,6 +81,8 @@ add_library(${TARGET}
     server-router-policy.h
     server-router-probe.cpp
     server-router-probe.h
+    server-slot-store.cpp
+    server-slot-store.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
