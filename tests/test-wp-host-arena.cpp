@@ -768,6 +768,53 @@ static void test_host_score_table_ewma() {
     require(t.score(99) == 0.0f && t.score(-1) == 0.0f, "out-of-range pages score 0");
 }
 
+// WP_HOST_TIER_SCORE_FROM_REQ: request routing -> u8 summary -> the same
+// HostScoreTable update type 28 uses. Served experts 2..6 (cache ids 0..4).
+static void test_request_scores_sparse_routes_update_and_decay() {
+    // Expert 3 selected for 2 tokens (max 0.8), expert 5 for 2 tokens (max 0.4),
+    // expert 99 is not served by this range and must be ignored.
+    const float w3[2] = { 0.2f, 0.8f };
+    const float w5[2] = { 0.4f, 0.1f };
+    const float w99[2] = { 0.9f, 0.9f };
+    const wp::RouteAssignmentView routes[3] = {
+        { 3, w3, 2 }, { 5, w5, 2 }, { 99, w99, 2 },
+    };
+    const std::vector<uint8_t> s = wp::request_scores_from_routes(routes, 3, 2, 5);
+    require(s.size() == 5, "summary covers the served range");
+    require(s[0] == 0 && s[2] == 0 && s[4] == 0, "unselected served experts score 0");
+    require(s[1] == 255, "max-weight expert scores 255 (max over tokens)");
+    require(s[3] == 128, "half-max expert rounds 127.5 to 128");
+
+    // Feed the same way the worker does: cache_id = expert - expert_first.
+    wp::HostScoreTable t;
+    t.reset(5, 1.0);  // alpha 0.5
+    std::vector<int> pages(5);
+    std::vector<float> xs(5);
+    for (int i = 0; i < 5; ++i) { pages[i] = i; xs[i] = (float) s[i] / 255.0f; }
+    t.update_layer(pages.data(), xs.data(), pages.size());
+    require(std::fabs(t.score(1) - 0.5f) < 1e-6f, "selected expert: (1-alpha)*1.0");
+    require(std::fabs(t.score(3) - 0.5f * 128.0f / 255.0f) < 1e-6f, "half-weight expert: (1-alpha)*x");
+    require(t.score(0) == 0.0f && t.score(2) == 0.0f && t.score(4) == 0.0f, "unselected stay 0");
+
+    // Next request selects only expert 3 at weight 0.1: it is the max, so 255.
+    // Expert 5 is unlisted this step and must decay, not reset.
+    const float w3b[1] = { 0.1f };
+    const wp::RouteAssignmentView routes2[1] = { { 3, w3b, 1 } };
+    const std::vector<uint8_t> s2 = wp::request_scores_from_routes(routes2, 1, 2, 5);
+    require(s2[1] == 255 && s2[3] == 0, "single selected expert is the max");
+    for (int i = 0; i < 5; ++i) { xs[i] = (float) s2[i] / 255.0f; }
+    t.update_layer(pages.data(), xs.data(), pages.size());
+    require(std::fabs(t.score(1) - 0.75f) < 1e-6f, "EWMA over two steps");
+    require(std::fabs(t.score(3) - 0.25f * 128.0f / 255.0f) < 1e-6f, "unlisted expert decays");
+
+    // Empty / all-zero request: nothing selected with positive weight -> all 0.
+    const float z[1] = { 0.0f };
+    const wp::RouteAssignmentView zr[1] = { { 2, z, 1 } };
+    const std::vector<uint8_t> sz = wp::request_scores_from_routes(zr, 1, 2, 5);
+    require(sz.size() == 5 && sz[0] == 0 && sz[1] == 0, "all-zero weights give all-zero scores");
+    require(wp::request_scores_from_routes(nullptr, 0, 2, 5)[4] == 0, "no routes gives zeros");
+}
+
 static void test_freq_admission_off_never_touches_admission_counters() {
     CountingAlloc a;
     HostArena::Config c = cfg(8);
@@ -1323,6 +1370,7 @@ int main() {
         test_hybrid_gate_drops_low_key_speculative();
         test_hybrid_respects_pins();
         test_host_score_table_ewma();
+        test_request_scores_sparse_routes_update_and_decay();
         test_protect_demand_from_spec_speculative_never_evicts_demand();
         test_protect_demand_from_spec_concurrent_wait_does_not_evict_demand();
         test_mark_drop_frees_when_idle();

@@ -41,6 +41,7 @@ bool ggml_cuda_expert_wire_pack_ml8_4_device(const float * src, void * dst, int6
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -2164,11 +2165,13 @@ public:
     // Host arena snapshot, taken at record time: predicted hints landed as
     // speculative entries, resident/pinned bytes, and LRU evictions.
     void set_ram_hybrid_stats(uint64_t evictions_hybrid, uint64_t evictions_hybrid_nontail,
-                              uint64_t admissions_dropped_hybrid, uint64_t score_summary_frames) {
+                              uint64_t admissions_dropped_hybrid, uint64_t score_summary_frames,
+                              uint64_t score_req_updates) {
         ram_evictions_hybrid_          = evictions_hybrid;
         ram_evictions_hybrid_nontail_  = evictions_hybrid_nontail;
         ram_admissions_dropped_hybrid_ = admissions_dropped_hybrid;
         ram_score_summary_frames_      = score_summary_frames;
+        ram_score_req_updates_         = score_req_updates;
     }
     void set_ram_stats(uint64_t spec_landed, uint64_t resident_bytes,
                        uint64_t pinned_bytes, uint64_t evictions,
@@ -2485,6 +2488,7 @@ private:
                   << " ram_evictions_hybrid_nontail=" << ram_evictions_hybrid_nontail_
                   << " ram_admissions_dropped_hybrid=" << ram_admissions_dropped_hybrid_
                   << " score_summary_frames=" << ram_score_summary_frames_
+                  << " score_req_updates=" << ram_score_req_updates_
                   << " ram_admission_cold_landed=" << ram_admission_cold_landed_
                   << " ram_reject_promotions=" << ram_reject_promotions_
                   << " ram_spec_promotions_rejected=" << ram_spec_promotions_rejected_
@@ -2751,6 +2755,7 @@ private:
     uint64_t           ram_evictions_hybrid_nontail_  = 0;
     uint64_t           ram_admissions_dropped_hybrid_ = 0;
     uint64_t           ram_score_summary_frames_      = 0;
+    uint64_t           ram_score_req_updates_         = 0;
     uint64_t           ram_reject_promotions_ = 0;
     uint64_t           ram_spec_promotions_rejected_ = 0;
     uint64_t          n_host_hit_ = 0;
@@ -12561,6 +12566,22 @@ void attach_weight(
 // WP_SCORE_SUMMARY diagnostic: PIPE_EXPERT_SCORE_SUMMARY frames this worker
 // process has received (reported with the hybrid RAM counters).
 static std::atomic<uint64_t> g_score_summary_frames{ 0 };
+// WP_HOST_TIER_SCORE_FROM_REQ: dispatch requests whose routing weights were
+// fed into the hybrid score table (reported as score_req_updates=).
+static std::atomic<uint64_t> g_score_req_updates{ 0 };
+
+// WP_HOST_TIER_SCORE_FROM_REQ: read once. Unset -> ON iff
+// WP_HOST_TIER_POLICY=hybrid; set -> ON unless the value is "0".
+static bool score_from_req_enabled() {
+    static const bool on = [] {
+        if (const char * e = std::getenv("WP_HOST_TIER_SCORE_FROM_REQ")) {
+            return e[0] != '0';
+        }
+        const char * p = std::getenv("WP_HOST_TIER_POLICY");
+        return p != nullptr && std::strcmp(p, "hybrid") == 0;
+    }();
+    return on;
+}
 
 class DeviceWorker {
 public:
@@ -15726,7 +15747,8 @@ public:
                                  arena.evictions_lfu_nonfront());
             stats_.set_ram_hybrid_stats(arena.evictions_hybrid(), arena.evictions_hybrid_nontail(),
                                         arena.admissions_dropped_hybrid(),
-                                        g_score_summary_frames.load(std::memory_order_relaxed));
+                                        g_score_summary_frames.load(std::memory_order_relaxed),
+                                        g_score_req_updates.load(std::memory_order_relaxed));
             stats_.set_victim_stats(pool_.n_victim_demoted(), pool_.n_victim_skipped(),
                                     pool_.ns_victim_demote(), arena.drops(), pool_.ns_victim_wait());
         }
@@ -24278,6 +24300,44 @@ public:
                       << " expert_first=" << summary.expert_first
                       << " n=" << summary.scores.size() << std::endl;
         }
+        apply_score_summary(summary);
+    }
+
+    // WP_HOST_TIER_SCORE_FROM_REQ: the same per-layer u8 summary built from a
+    // dispatch request's routing weights (see wp::request_scores_from_routes),
+    // fed through apply_score_summary -- the exact update type 28 uses.
+    // Covers every expert this worker serves for the layer (the catalog's
+    // contiguous range for that layer); unselected ones get 0.
+    void note_request_scores(int32_t layer, const std::vector<pipe_expert_assignment> & assignments,
+                             uint32_t n_tokens) {
+        if (!score_from_req_enabled() || host_score_.size() == 0 || assignments.empty()) {
+            return;
+        }
+        const auto first = catalog_.pages.lower_bound({ layer, std::numeric_limits<int>::min() });
+        const auto last  = catalog_.pages.upper_bound({ layer, std::numeric_limits<int>::max() });
+        if (first == last) {
+            return;
+        }
+        const int32_t expert_first = first->first.second;
+        const size_t  n_experts    = (size_t) (std::prev(last)->first.second - expert_first) + 1;
+        std::vector<wp::RouteAssignmentView> routes;
+        routes.reserve(assignments.size());
+        for (const pipe_expert_assignment & a : assignments) {
+            if (a.weights.size() != n_tokens) {
+                return;  // validated upstream; never feed a torn row
+            }
+            routes.push_back({ a.expert_id, a.weights.data(), a.weights.size() });
+        }
+        pipe_expert_score_summary summary;
+        summary.layer        = layer;
+        summary.expert_first = expert_first;
+        summary.scores       = wp::request_scores_from_routes(routes.data(), routes.size(),
+                                                              expert_first, n_experts);
+        apply_score_summary(summary);
+        g_score_req_updates.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void apply_score_summary(const pipe_expert_score_summary & summary) {
         if (host_score_.size() == 0) {
             return;
         }
@@ -27967,6 +28027,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         if (type == PIPE_EXPERT_DISPATCH_BEGIN) {
             try {
                 split_log_begin = pipe_decode_expert_dispatch_begin(payload.data(), payload.size());
+                // WP_HOST_TIER_SCORE_FROM_REQ: BEGIN carries the routing rows.
+                worker.note_request_scores(split_log_begin.layer, split_log_begin.assignments,
+                                           split_log_begin.n_tokens);
                 split_log_stats = RequestStats{};
                 split_log_started = req_log != nullptr ? std::chrono::steady_clock::now() :
                     std::chrono::steady_clock::time_point{};
@@ -28537,6 +28600,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - t_req_decode_start).count()
                 : 0;
+            // WP_HOST_TIER_SCORE_FROM_REQ: feed the hybrid score table from this
+            // request's routing weights (inline; a few hundred bytes of work).
+            worker.note_request_scores(request.layer, request.assignments, request.n_tokens);
             RequestStats request_stats;
             if (seg_trace) {
                 request_stats.ns_lock_wait =

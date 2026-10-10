@@ -34,6 +34,7 @@
 // almost never has to touch a page that actually won admission. Empty and
 // unused whenever freq_admission is false.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -562,5 +563,47 @@ private:
     std::vector<float> score_;
     double alpha_ = 1.0;
 };
+
+// WP_HOST_TIER_SCORE_FROM_REQ: the u8 per-expert summary for one layer, built
+// from one dispatch request's routing weights. Output index i is expert
+// (expert_first + i), covering n_experts experts. For each listed expert,
+// m_e = max over its tokens of the routing weight; score = round(m_e / M * 255)
+// where M = max m_e over the served experts in the request (negatives clamp to
+// 0). Experts outside [expert_first, expert_first + n_experts) are ignored
+// entirely (not in M, not in the output); unlisted experts are 0.
+// `weights[k]` points at n_tokens floats for assignment k.
+struct RouteAssignmentView {
+    int32_t             expert_id;
+    const float *       weights;
+    size_t              n_tokens;
+};
+inline std::vector<uint8_t> request_scores_from_routes(
+        const RouteAssignmentView * routes, size_t n_routes,
+        int32_t expert_first, size_t n_experts) {
+    std::vector<uint8_t> out(n_experts, 0);
+    std::vector<float> max_e(n_routes, 0.0f);
+    std::vector<int64_t> idx(n_routes, -1);
+    float max_all = 0.0f;
+    for (size_t k = 0; k < n_routes; ++k) {
+        const int64_t i = (int64_t) routes[k].expert_id - (int64_t) expert_first;
+        if (i < 0 || (size_t) i >= n_experts) continue;
+        float m = 0.0f;
+        for (size_t t = 0; t < routes[k].n_tokens; ++t) {
+            m = std::max(m, routes[k].weights[t]);
+        }
+        idx[k] = i;
+        max_e[k] = m;
+        max_all = std::max(max_all, m);
+    }
+    if (!(max_all > 0.0f)) {
+        return out;
+    }
+    for (size_t k = 0; k < n_routes; ++k) {
+        if (idx[k] < 0) continue;
+        const float s = std::round(max_e[k] / max_all * 255.0f);
+        out[(size_t) idx[k]] = (uint8_t) std::min(255.0f, std::max(0.0f, s));
+    }
+    return out;
+}
 
 }  // namespace wp
