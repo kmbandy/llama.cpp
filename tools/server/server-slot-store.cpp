@@ -58,8 +58,13 @@ bool is_regular_nofollow(const fs::path & p) {
     return !ec && fs::is_regular_file(st);
 }
 
-// Symlink itself (not its target), judged without following it.
-bool is_symlink_nofollow(const fs::path & p) {
+// Symlink itself (not its target), judged without following it. Trailing separators are
+// stripped first: symlink_status("link/") resolves the link and would report a directory.
+bool is_symlink_nofollow(const fs::path & path) {
+    fs::path p = path;
+    while (p.filename().empty() && p.parent_path() != p) {
+        p = p.parent_path();
+    }
     std::error_code ec;
     return fs::is_symlink(fs::symlink_status(p, ec));
 }

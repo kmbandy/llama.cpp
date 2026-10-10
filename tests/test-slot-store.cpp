@@ -207,6 +207,15 @@ int main() {
         assert(!fs::exists(outside / ".last_used"));
         assert(fs::is_symlink(r));
         assert(slot_store_list(r.string()).empty());
+
+        // trailing separators must not get past the symlink check
+        for (const std::string suffix : { std::string("/"), std::string("//") }) {
+            const std::string p = r.string() + suffix;
+            slot_store_touch(p);
+            assert(!fs::exists(outside / ".last_used"));
+            assert(slot_store_list(p).empty());
+        }
+        assert(fs::is_symlink(r));
     }
 
     // negative slot ids have no file name
