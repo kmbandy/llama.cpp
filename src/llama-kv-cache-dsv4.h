@@ -478,7 +478,8 @@ struct llama_dsv4_comp_plan_split {
 };
 
 // Returns false and sets *why (static string) when the split cannot run.
-// Overlap: state_size >= max(2*ratio, R). Non-overlap: state_size >= max(ratio, k, R-k).
+// Overlap: state_size >= max(2*ratio, R). Non-overlap: state_size >= ratio
+// (each group persists min(rows, state_size) slots, so S < k is allowed).
 bool llama_dsv4_split_supported(
         const llama_ubatch & ubatch,
         uint32_t ratio,

@@ -256,15 +256,22 @@ static long run_supported_checks() {
         expect(true, R, 4,   false, 4,   1, (R + 1)/2, "v41 ratio4 S4", none);
         expect(true, R, 128, false, 128, 1, (R + 1)/2, "v41 ratio128 S128", none);
     }
+    // DS4.1 real ratios 1 and 2 with state_size == ratio, every R and k = ceil(R/2).
+    for (uint32_t R = 4; R <= 8; ++R) {
+        expect(true, R, 1, false, 1, 1, (R + 1)/2, "v41 ratio1 S1", none);
+        expect(true, R, 2, false, 2, 1, (R + 1)/2, "v41 ratio2 S2", none);
+    }
     // Existing overlap configs.
     expect(true, 8, 4,   true,  8,   1, 4, "overlap ratio4 S8", none);
     expect(true, 8, 4,   true,  16,  1, 4, "overlap ratio4 S16", none);
     expect(true, 6, 128, false, 256, 1, 3, "non-overlap ratio128 S256", none);
+    // Non-overlap S < k and S < R-k are accepted: each group persists min(rows, S).
+    expect(true, 8, 2, false, 3, 1, 4, "non-overlap S < k", none);
+    expect(true, 8, 2, false, 4, 1, 2, "non-overlap S < R-k", none);
 
     // Rejections.
-    expect(false, 8, 2, false, 3, 1, 4, "S < k", none);
-    expect(false, 8, 2, false, 4, 1, 2, "S < R-k", none);
     expect(false, 8, 4, false, 2, 1, 4, "S < ratio", none);
+    expect(false, 8, 2, false, 1, 1, 4, "non-overlap S < ratio (ratio2 S1)", none);
     expect(false, 8, 4, true,  4, 1, 4, "overlap S < 2*ratio", none);
     expect(false, 8, 2, true,  4, 1, 4, "overlap S < R", none);
     expect(false, 8, 4, false, 4, 2, 4, "n_stream != 1", none);
@@ -308,6 +315,9 @@ int main() {
         // DS4.1 real configs: state_size == ratio, overlap=false.
         { 4,   false, 4,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } },
         { 128, false, 128, 8,   { 0, 1, 2, 124, 125, 126, 127, 128, 129, 130, 252, 253, 254, 255, 256, 257, 383 } },
+        // DS4.1 real ratios 1 and 2: state_size == ratio, overlap=false.
+        { 1,   false, 1,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 } },
+        { 2,   false, 2,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 } },
     };
 
     long n_cases = 0;
@@ -395,8 +405,8 @@ int main() {
             fail("config ran no cases");
         }
     }
-    // The new real configs must each be covered by the negative check too.
-    for (size_t ci = cfgs.size() - 2; ci < cfgs.size(); ++ci) {
+    // The DS4.1 real configs (the last four entries) must each be covered by the negative check too.
+    for (size_t ci = cfgs.size() - 4; ci < cfgs.size(); ++ci) {
         if (cfg_neg[ci] == 0) {
             fail("negative check is blind for a DS4.1 config");
         }

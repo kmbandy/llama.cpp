@@ -166,6 +166,9 @@ int main() {
         // DS4.1 real configs: state_size == ratio, overlap=false.
         { 4,   false, 4,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } },
         { 128, false, 128, 8,   { 0, 1, 2, 124, 125, 126, 127, 128, 129, 130, 252, 253, 254, 255, 256, 257, 383 } },
+        // DS4.1 real ratios 1 and 2: state_size == ratio, overlap=false.
+        { 1,   false, 1,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 } },
+        { 2,   false, 2,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 } },
     };
 
     long n_cases = 0;

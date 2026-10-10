@@ -1002,10 +1002,11 @@ bool llama_dsv4_split_supported(
         }
     }
     // Overlap reads a 2*ratio window and needs one slot per token. Non-overlap
-    // reads ratio rows; each group persists at most min(rows, S) slots.
+    // reads ratio rows; each group persists at most min(rows, S) slots, so
+    // S < k or S < R-k is fine (real DS4.1 ratios 1/2 have S == ratio).
     const bool state_ok = overlap
         ? (state_size >= 2*ratio && state_size >= R)
-        : (state_size >= ratio && state_size >= k && state_size >= R - k);
+        : (state_size >= ratio);
     if (!state_ok) {
         *out = "state-too-small";
         return false;
