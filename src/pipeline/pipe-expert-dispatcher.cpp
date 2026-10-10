@@ -3723,6 +3723,46 @@ struct dispatcher::impl {
         return sent;
     }
 
+    // WP_SCORE_SUMMARY=1 only: one PIPE_EXPERT_SCORE_SUMMARY frame per worker,
+    // covering that worker's own expert range, for `layer`. Sent after the
+    // layer's request, through the same FIFO writer queue as hints, so it is
+    // not subject to the hint in-flight guard. Synchronous-issue mode has no
+    // writer queue and skips the frame (counted as skipped), so it never
+    // interleaves bytes with an outstanding request.
+    size_t send_score_summary(int32_t layer, const std::vector<uint8_t> & scores_by_expert) {
+        if (poisoned || !async_issue || scores_by_expert.empty()) {
+            return 0;
+        }
+        size_t sent = 0;
+        for (worker & value : workers) {
+            if (!value.socket || value.info.expert_first < 0 ||
+                value.info.expert_last < value.info.expert_first) {
+                continue;
+            }
+            const size_t first = (size_t) value.info.expert_first;
+            const size_t last  = std::min(scores_by_expert.size() - 1, (size_t) value.info.expert_last);
+            if (first > last) {
+                continue;
+            }
+            pipe_expert_score_summary summary;
+            summary.layer        = layer;
+            summary.expert_first = (int32_t) first;
+            summary.scores.assign(scores_by_expert.begin() + (ptrdiff_t) first,
+                                  scores_by_expert.begin() + (ptrdiff_t) last + 1);
+            wire_frame frame;
+            frame.type    = PIPE_EXPERT_SCORE_SUMMARY;
+            frame.seq_id  = 0;
+            frame.payload = pipe_encode_expert_score_summary(summary);
+            try {
+                enqueue_frame(value, std::move(frame));
+            } catch (...) {
+                continue;
+            }
+            ++sent;
+        }
+        return sent;
+    }
+
     // WP_DISPATCH_DEDUP_ACTIVATIONS. `requests` is plan_requests()'s IMMEDIATE
     // output for one layer -- one entry per worker with a non-empty
     // assignment. Group requests by machine; for every machine with >= 2
@@ -5636,6 +5676,10 @@ layer_trace_stats dispatcher::layer_trace(int32_t layer) const {
 size_t dispatcher::send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts,
                                        uint32_t provenance, uint32_t n_tokens) {
     return pimpl->send_prefetch_hints(layer, experts, provenance, n_tokens);
+}
+
+size_t dispatcher::send_score_summary(int32_t layer, const std::vector<uint8_t> & scores_by_expert) {
+    return pimpl->send_score_summary(layer, scores_by_expert);
 }
 
 const prefetch_hint_stats & dispatcher::get_prefetch_hint_stats() const {

@@ -1868,6 +1868,47 @@ std::vector<uint8_t> pipe_encode_expert_prefetch_hint(
     return out;
 }
 
+std::vector<uint8_t> pipe_encode_expert_score_summary(const pipe_expert_score_summary & p) {
+    if (p.layer < 0 || p.expert_first < 0 || p.scores.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert score summary needs a layer, a range and scores");
+    }
+    const uint64_t total = 12ull + (uint64_t) p.scores.size();
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert score summary encode size %llu exceeds max payload",
+             (unsigned long long) total);
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_i32(w, p.layer);
+    wr_i32(w, p.expert_first);
+    wr_u32(w, (uint32_t) p.scores.size());
+    if (!p.scores.empty()) {
+        std::memcpy(w, p.scores.data(), p.scores.size());
+    }
+    return out;
+}
+
+pipe_expert_score_summary pipe_decode_expert_score_summary(const uint8_t * buf, size_t len) {
+    if (len < 12) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert score summary payload is too small");
+    }
+    const uint8_t * p = buf;
+    pipe_expert_score_summary r;
+    r.layer        = rd_i32(p);
+    r.expert_first = rd_i32(p);
+    const uint32_t n = rd_u32(p);
+    if (r.layer < 0 || r.expert_first < 0 || n == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert score summary has invalid dimensions");
+    }
+    if ((uint64_t) (buf + len - p) != (uint64_t) n) {
+        fail(PIPE_ERR_BAD_FRAME,
+             "pipe: expert score summary payload bytes %lld do not match n %u",
+             (long long) (buf + len - p), n);
+    }
+    r.scores.assign(p, p + n);
+    return r;
+}
+
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
         const uint8_t * buf, size_t len) {
     if (len < 12) {

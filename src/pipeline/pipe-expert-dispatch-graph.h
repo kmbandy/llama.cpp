@@ -68,6 +68,13 @@ class graph_dispatcher {
     // is the join; wait's compute does not read shexp (GGML_UNUSED).
     // after_issue the shexp INPUT, not the output: pinning the output left
     // the FFN in an earlier GPU split that finished before wait.
+    // WP_SCORE_SUMMARY=1 only: read once per layer by llama-graph before the
+    // non-chunked decode issue is built (n_tokens <= 16). Consumed by build_issue.
+    bool score_summary_enabled() const;
+    void set_score_probs(int32_t layer, ggml_tensor * probs);
+    // True iff `t` is an issue op built with the score-probs source.
+    bool is_score_issue_tensor(const ggml_tensor * t) const;
+
     ggml_tensor * build_issue(ggml_context * ctx,
                               ggml_tensor *  activations,
                               ggml_tensor *  selected_experts,
@@ -304,6 +311,9 @@ class graph_dispatcher {
 
   private:
     struct op_context;
+    int32_t              score_probs_layer_ = -1;
+    ggml_tensor *        score_probs_       = nullptr;
+    const ggml_tensor *  score_issue_tensor_ = nullptr;
 
     struct router_layer {
         std::vector<float> w;   // [n_expert][n_embd], expert-major
@@ -422,6 +432,20 @@ class graph_dispatcher {
                               int                 ith,
                               int                 nth,
                               void *              userdata);
+    // WP_SCORE_SUMMARY only: compute_issue with the router probs as a fourth
+    // input (score_probs may be null). compute_issue() forwards with null, so
+    // the default issue path is unchanged.
+    static void compute_issue_impl(ggml_tensor *       dst,
+                                   const ggml_tensor * activations,
+                                   const ggml_tensor * selected_experts,
+                                   const ggml_tensor * weights,
+                                   int                 ith,
+                                   int                 nth,
+                                   void *              userdata,
+                                   const ggml_tensor * score_probs);
+    // ggml_custom_4d entry point: inputs are dst->src[0..3] = activations,
+    // selected experts, weights, unbiased router probs.
+    static void compute_issue_scored(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void compute_wait(ggml_tensor *       dst,
                              const ggml_tensor * issued,
                              const ggml_tensor * shexp,

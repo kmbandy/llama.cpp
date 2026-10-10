@@ -24261,6 +24261,28 @@ public:
         }
     }
 
+    // PIPE_EXPERT_SCORE_SUMMARY (WP_SCORE_SUMMARY on the spine): feeds the
+    // RAM-tier hybrid score EWMA. Advisory and response-free; a no-op unless
+    // WP_HOST_TIER_POLICY=hybrid has sized host_score_.
+    void note_score_summary(const pipe_expert_score_summary & summary) {
+        if (host_score_.size() == 0) {
+            return;
+        }
+        std::vector<int> pages;
+        std::vector<float> xs;
+        pages.reserve(summary.scores.size());
+        xs.reserve(summary.scores.size());
+        for (size_t i = 0; i < summary.scores.size(); ++i) {
+            const auto it = catalog_.pages.find({ summary.layer, summary.expert_first + (int32_t) i });
+            if (it == catalog_.pages.end() || it->second.cache_id < 0) {
+                continue;
+            }
+            pages.push_back(it->second.cache_id);
+            xs.push_back((float) summary.scores[i] / 255.0f);
+        }
+        host_score_.update_layer(pages.data(), xs.data(), pages.size());
+    }
+
     void note_prefetch_hint(const pipe_expert_prefetch_hint & hint) {
         std::vector<std::vector<int32_t>> ids(devices_.size());
         for (const int32_t expert : hint.expert_ids) {
@@ -27885,6 +27907,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         // A hint gets NO response frame, so it must not fall through to the
         // dispatch path's reply, and a malformed one must not kill the session:
         // it is advisory, and the request stream is untouched by dropping it.
+        // PIPE_EXPERT_SCORE_SUMMARY (type 28): response-free, like the hint.
+        if (type == PIPE_EXPERT_SCORE_SUMMARY) {
+            try {
+                worker.note_score_summary(
+                    pipe_decode_expert_score_summary(payload.data(), payload.size()));
+            } catch (const pipe_protocol_error & error) {
+                std::fprintf(stderr, "wp-expert-worker: ignoring malformed score summary: %s\n",
+                             error.what());
+            }
+            continue;
+        }
         if (type == PIPE_EXPERT_PREFETCH_HINT) {
             try {
                 const pipe_expert_prefetch_hint hint =

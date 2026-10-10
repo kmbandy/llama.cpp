@@ -2750,6 +2750,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     cur, selected_experts, weights, n_first);
                 moe_out = ggml_concat(ctx0, issue_a, issue_b, 1);
             } else {
+                // WP_SCORE_SUMMARY=1 only (decode, unchunked): hand the unbiased router
+                // probs to the issue op as an extra read-only source.
+                if (n_tokens <= 16 && expert_dispatch->score_summary_enabled()) {
+                    expert_dispatch->set_score_probs(il, probs);
+                }
                 moe_out = expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il,
                                                        dispatch_swiglu_clamp);
             }
@@ -2759,7 +2764,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
-        if (moe_out->op == GGML_OP_MAP_CUSTOM3) {
+        if (moe_out->op == GGML_OP_MAP_CUSTOM3 || expert_dispatch->is_score_issue_tensor(moe_out)) {
             expert_dispatch->mark_issue_tensor(moe_out, il, 0);
         }
         return moe_out;

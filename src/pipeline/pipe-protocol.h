@@ -260,6 +260,10 @@ enum pipe_frame_type : uint32_t {
     // WP_DISPATCH_STREAM: payload has the same five-u32 prefix, followed by a
     // regular f32 pipe_expert_partial payload.
     PIPE_EXPERT_PARTIAL_CHUNK         = 27,
+    // Spine -> worker, FIRE AND FORGET (no response), sent after a layer's
+    // request frames only when WP_SCORE_SUMMARY=1 on the spine. An older worker
+    // rejects this unknown type, so the knob must stay off until workers are rebuilt.
+    PIPE_EXPERT_SCORE_SUMMARY         = 28,
 };
 
 enum pipe_role : uint32_t {
@@ -1012,6 +1016,20 @@ pipe_expert_dispatch_acts_ref pipe_decode_expert_dispatch_acts_ref(
     const uint8_t * buf, size_t len);
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
+
+// PIPE_EXPERT_SCORE_SUMMARY payload (type 28):
+//   i32 layer
+//   i32 expert_first        global id of scores[0]; the worker's range start
+//   u32 n                   number of experts covered (>= 1)
+//   u8  scores[n]           per-expert router score, 0..255, relative to the
+//                           layer's max (rank signal only)
+struct pipe_expert_score_summary {
+    int32_t              layer        = -1;
+    int32_t              expert_first = -1;
+    std::vector<uint8_t> scores;
+};
+std::vector<uint8_t> pipe_encode_expert_score_summary(const pipe_expert_score_summary & p);
+pipe_expert_score_summary pipe_decode_expert_score_summary(const uint8_t * buf, size_t len);
 // keep_ml8_4_packed=true (WP_EXPERT_WIRE_GPU_UNPACK's decode side): when the
 // frame's dtype is PIPE_HIDDEN_ML8_4, skip the CPU dequant and return the raw
 // 18-byte-per-32-value blocks in `wire_bytes` instead, with `dtype` left at

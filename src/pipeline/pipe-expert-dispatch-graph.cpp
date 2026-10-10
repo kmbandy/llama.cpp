@@ -799,8 +799,20 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
     context->full_activations    = full_activations;
     context->full_selected_experts = full_selected_experts;
     context->full_weights        = full_weights;
-    ggml_tensor * issued =
-        ggml_map_custom3(ctx, activations, selected_experts, weights, compute_issue, 1, context.get());
+    ggml_tensor * issued = nullptr;
+    if (score_probs_ != nullptr && score_probs_layer_ == layer && chunk_count == 1) {
+        // WP_SCORE_SUMMARY=1 only: the same issue op with the router probs as a
+        // fourth, read-only source (adds a dependency, nothing else).
+        ggml_tensor * args[4] = { activations, selected_experts, weights, score_probs_ };
+        issued = ggml_custom_4d(ctx, activations->type, activations->ne[0], activations->ne[1],
+                                activations->ne[2], activations->ne[3], args, 4,
+                                compute_issue_scored, 1, context.get());
+        score_issue_tensor_ = issued;
+    } else {
+        issued = ggml_map_custom3(ctx, activations, selected_experts, weights, compute_issue, 1, context.get());
+    }
+    score_probs_       = nullptr;
+    score_probs_layer_ = -1;
     mark_issue_tensor(issued, layer, chunk_index);
     context->issued = issued;
     return issued;
@@ -2999,6 +3011,38 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                      int                 ith,
                                      int                 nth,
                                      void *              userdata) {
+    compute_issue_impl(dst, activations, selected_experts, weights, ith, nth, userdata, nullptr);
+}
+
+void graph_dispatcher::compute_issue_scored(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    compute_issue_impl(dst, dst->src[0], dst->src[1], dst->src[2], ith, nth, userdata, dst->src[3]);
+}
+
+bool graph_dispatcher::score_summary_enabled() const {
+    static const bool enabled = [] {
+        const char * e = std::getenv("WP_SCORE_SUMMARY");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+void graph_dispatcher::set_score_probs(int32_t layer, ggml_tensor * probs) {
+    score_probs_layer_ = layer;
+    score_probs_       = probs;
+}
+
+bool graph_dispatcher::is_score_issue_tensor(const ggml_tensor * t) const {
+    return t != nullptr && t == score_issue_tensor_;
+}
+
+void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
+                                          const ggml_tensor * activations,
+                                          const ggml_tensor * selected_experts,
+                                          const ggml_tensor * weights,
+                                          int                 ith,
+                                          int                 nth,
+                                          void *              userdata,
+                                          const ggml_tensor * score_probs) {
     graph_dispatcher * owner = nullptr;
     try {
         // The op is registered with n_tasks=1, but ggml_graph_plan sizes the
@@ -3286,6 +3330,35 @@ void graph_dispatcher::compute_issue(ggml_tensor *       dst,
                                                        (uint32_t) context->chunk_index, layer_assignments,
                                                        layer_n_tokens, "graph_dispatcher::compute_issue");
         wp_issue_trace::add(wp_issue_trace::PH_BEGIN_DISPATCH, it_bd);
+        // WP_SCORE_SUMMARY=1 only: per-worker score summary, queued AFTER this
+        // layer's request on the same writer FIFO (see send_score_summary).
+        // Decode only (n_tokens <= 16), unchunked. The probs are read-only.
+        if (score_probs != nullptr && context->chunk_count == 1 && n_tokens <= 16 &&
+                score_probs->type == GGML_TYPE_F32 && score_probs->ne[0] > 0 && score_probs->ne[1] > 0 &&
+                score_probs->data != nullptr) {
+            const int64_t n_e = score_probs->ne[0];
+            const int64_t n_t = std::min<int64_t>(score_probs->ne[1], (int64_t) n_tokens);
+            std::vector<float> row_max((size_t) n_e, 0.0f);
+            for (int64_t t = 0; t < n_t; ++t) {
+                for (int64_t e = 0; e < n_e; ++e) {
+                    const float p = *(const float *) ((const char *) score_probs->data +
+                                                      e * score_probs->nb[0] + t * score_probs->nb[1]);
+                    const float c = std::isfinite(p) ? std::min(1.0f, std::max(0.0f, p)) : 0.0f;
+                    row_max[(size_t) e] = std::max(row_max[(size_t) e], c);
+                }
+            }
+            float layer_max = 0.0f;
+            for (float v : row_max) {
+                layer_max = std::max(layer_max, v);
+            }
+            std::vector<uint8_t> scores((size_t) n_e, 0);
+            if (layer_max > 0.0f) {
+                for (size_t e = 0; e < scores.size(); ++e) {
+                    scores[e] = (uint8_t) std::lround(255.0f * row_max[e] / layer_max);
+                }
+            }
+            owner->remote.send_score_summary(context->layer, scores);
+        }
         if (post_send_hints) {
             post_send_hints();
         }

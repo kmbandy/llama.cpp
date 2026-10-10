@@ -1562,6 +1562,32 @@ static void test_expert_prefetch_hint_roundtrip() {
     CHECK(pipe_decode_expert_prefetch_hint(zenc.data(), zenc.size()).layer == 0);
 }
 
+static void test_expert_score_summary_roundtrip() {
+    pipe_expert_score_summary s;
+    s.layer        = 5;
+    s.expert_first = 256;
+    s.scores       = { 0, 1, 128, 255 };
+
+    const std::vector<uint8_t> enc = pipe_encode_expert_score_summary(s);
+    CHECK(enc.size() == 12 + 4);
+    const pipe_expert_score_summary d =
+        pipe_decode_expert_score_summary(enc.data(), enc.size());
+    CHECK(d.layer == s.layer);
+    CHECK(d.expert_first == s.expert_first);
+    CHECK(d.scores == s.scores);
+
+    // A count that does not match the payload must be rejected.
+    std::vector<uint8_t> bad = enc;
+    bad.pop_back();
+    bool threw = false;
+    try {
+        (void) pipe_decode_expert_score_summary(bad.data(), bad.size());
+    } catch (const pipe_protocol_error &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 static void test_expert_prefetch_hint_rejects() {
     // Encode side: the caller must not manufacture a frame the worker will
     // reject, because a hint has no response and the failure would be silent.
@@ -2023,6 +2049,7 @@ int main(int argc, char ** argv) {
     test_endianness_explicit();
     test_hello_mismatch_matrix();
     test_expert_prefetch_hint_roundtrip();
+    test_expert_score_summary_roundtrip();
     test_expert_prefetch_hint_rejects();
     test_segment_roundtrip();
 

@@ -274,6 +274,11 @@ class dispatcher {
                                uint32_t provenance = PIPE_HINT_CERTAIN,
                                uint32_t n_tokens = 0);
 
+    // WP_SCORE_SUMMARY=1 only: per-worker PIPE_EXPERT_SCORE_SUMMARY frames for
+    // `layer`; scores_by_expert holds one u8 per global expert (0..n_expert-1).
+    // Returns frames enqueued.
+    size_t send_score_summary(int32_t layer, const std::vector<uint8_t> & scores_by_expert);
+
     const prefetch_hint_stats & get_prefetch_hint_stats() const;
 
     int32_t                          n_embd() const;
