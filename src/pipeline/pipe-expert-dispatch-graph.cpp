@@ -3335,7 +3335,14 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
         // WP_SCORE_SUMMARY=1 only: per-worker score summary, queued AFTER this
         // layer's request on the same writer FIFO (see send_score_summary).
         // Decode only (n_tokens <= 16), unchunked. The probs are read-only.
-        if (score_probs != nullptr && context->chunk_count == 1 && n_tokens <= 16 &&
+        // WP_SCORE_SUMMARY_NOSEND=1 (debug only): keep the scored issue op in the
+        // graph but skip the frame send, to isolate "graph change" from "frame send"
+        // in determinism investigations.
+        static const bool score_summary_nosend = [] {
+            const char * e = std::getenv("WP_SCORE_SUMMARY_NOSEND");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (!score_summary_nosend && score_probs != nullptr && context->chunk_count == 1 && n_tokens <= 16 &&
                 score_probs->type == GGML_TYPE_F32 && score_probs->ne[0] > 0 && score_probs->ne[1] > 0 &&
                 score_probs->data != nullptr) {
             const int64_t n_e = score_probs->ne[0];
