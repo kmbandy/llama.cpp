@@ -434,6 +434,8 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option(ROUTER_ARG_MACHINE);
     preset.unset_option(ROUTER_ARG_STARTUP_TIMEOUT);
     preset.unset_option(ROUTER_ARG_WORKER_PORT);
+    preset.unset_option(ROUTER_ARG_KV_PRESERVE);
+    preset.unset_option(ROUTER_ARG_KV_PRESERVE_MB);
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -533,6 +535,12 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
+    // kv-preserve: the flags are not presets of their own (to_args() renders none of them), so
+    // they are appended here, for a local or a remote child alike
+    if (kv_preserve_applies()) {
+        const auto kv_args = router_kv_preserve_child_args(kv_preserve_root, name, kv_preserve_mb);
+        args.insert(args.end(), kv_args.begin(), kv_args.end());
+    }
 
     // unified binary dispatches by subcommand, re-inject it right after the
     // binary path so the child starts as 'llama serve ...' not 'llama ...'
@@ -1284,6 +1292,8 @@ void server_models::parse_model_placement(server_model_meta & meta) {
         meta.slot_autosave     = sec.slot_autosave;
         meta.startup_timeout_s = sec.startup_timeout_s;
         meta.worker_port       = sec.worker_port;
+        meta.kv_preserve_root  = sec.kv_preserve_root;
+        meta.kv_preserve_mb    = sec.kv_preserve_mb;
     }
 
     std::string gpu;
@@ -3420,7 +3430,8 @@ void server_models::load_models() {
     auto apply_stop_timeout = [&]() {
         for (auto & [name, inst] : mapping) {
             std::string val;
-            if (inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val)) {
+            const bool has_explicit = inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val);
+            if (has_explicit) {
                 try {
                     inst.meta.stop_timeout = std::stoi(val);
                 } catch (...) {
@@ -3429,6 +3440,9 @@ void server_models::load_models() {
                     inst.meta.stop_timeout = DEFAULT_STOP_TIMEOUT;
                 }
             }
+            // kv-preserve: a multi-slot save needs longer than the default before it may be SIGKILLed
+            inst.meta.stop_timeout = router_stop_timeout_floor(
+                inst.meta.stop_timeout, has_explicit, inst.meta.kv_preserve_applies());
         }
     };
     // Log only — do NOT re-parse here. parse_model_placement() already set

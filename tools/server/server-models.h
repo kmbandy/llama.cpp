@@ -169,6 +169,10 @@ struct server_model_meta {
     std::string              slot_autosave;
     int                      startup_timeout_s = 300;
     int                      worker_port = 0; // worker: preset worker-port, 0 = read it off launch
+    // kv-preserve (captured at placement-parse time, stripped by update_args()): the root the
+    // child's slot autosave lives under, and its MiB budget (0 = none)
+    std::string              kv_preserve_root;
+    uint64_t                 kv_preserve_mb = 0;
 
     // spine of a group: the group's status (workers, stop-snapshot lines). Filled into the
     // copies get_meta()/get_all_meta() hand out, never kept in the registry.
@@ -205,6 +209,11 @@ struct server_model_meta {
 
     bool is_external() const {
         return kind == ROUTER_KIND_EXTERNAL;
+    }
+
+    // kv-preserve flags go to a model child only (a group's spine, never its workers)
+    bool kv_preserve_applies() const {
+        return !kv_preserve_root.empty() && !is_external();
     }
 
     bool is_ready() const {
