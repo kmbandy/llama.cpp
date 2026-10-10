@@ -27559,6 +27559,9 @@ struct WpPipelineFrame {
     // regardless of which thread paid for it. 0 when decode_chunk decode
     // never ran here (knob off, wrong type, or time_recv false).
     uint64_t               ns_req_decode_ahead = 0;
+    // WP_WORKER_TWO_IN_FLIGHT: reader-assigned, 0,1,2,... per connection. Unique
+    // per frame even when two requests share a seq_id (imm/deferred pairs).
+    uint64_t               ord = 0;
 };
 
 // One response frame handed from the compute loop to the writer.
@@ -27602,6 +27605,18 @@ public:
         }
         lock.unlock();
         not_empty_.notify_one();
+    }
+
+    // Consumer only. Points at the front item without popping it. The pointer
+    // stays valid until the consumer's next pop(): the producer only push_backs
+    // onto a std::deque, which never invalidates existing elements.
+    bool peek(const T *& out) {
+        auto lock = wp_lock_timed(mu_);
+        if (items_.empty()) {
+            return false;
+        }
+        out = &items_.front().item;
+        return true;
     }
 
     // Returns false once the queue is closed AND drained -- exactly the
@@ -27671,8 +27686,10 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
                                       WpPipelineQueue<WpPipelineFrame> & frames,
                                       bool act_pool_enabled, WpActivationPool * act_pool) {
     WpThreadScope wp_thread(WP_ROLE_PIPE_READER);
+    uint64_t next_ord = 0;
     for (;;) {
         WpPipelineFrame f;
+        f.ord = next_ord++;
         uint64_t hdr_done_ns = 0;
         wp_state(WP_S_IDLE, -1, 0);
         f.ok = pipe_recv_frame(socket, f.type, f.seq_id, f.payload,
@@ -28307,7 +28324,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // than only under `if (pipeline_on)`.
     const bool act_pool_enabled = wp_worker_act_pool_enabled();
     WpActivationPool activation_pool;
-    WpPipelineQueue<WpPipelineFrame>    pipeline_frames(WP_WORKER_PIPELINE_QUEUE_DEPTH);
+    // WP_WORKER_TWO_IN_FLIGHT: one more frame of read-ahead so N+2 can sit in the
+    // queue while N+1 is prepared. Default depth otherwise.
+    const size_t frame_queue_depth = (pipeline_on && wp_worker_two_in_flight_enabled())
+        ? WP_WORKER_PIPELINE_QUEUE_DEPTH + 1 : WP_WORKER_PIPELINE_QUEUE_DEPTH;
+    WpPipelineQueue<WpPipelineFrame>    pipeline_frames(frame_queue_depth);
     WpPipelineQueue<WpPipelineResponse> pipeline_responses(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     pipeline_frames.set_byte_cap(WP_WORKER_PIPELINE_MAX_QUEUED_BYTES);
     std::atomic<bool> pipeline_write_failed{ false };
