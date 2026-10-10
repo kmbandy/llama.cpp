@@ -208,6 +208,43 @@ static void test_inflight_cap_and_pinned_cap() {
     require(arena.spec_promotions() == 1, "pin-promotion counted");
 }
 
+// WP_WORKER_TWO_IN_FLIGHT (S4) premise: a lookahead (try-only) reservation is
+// a single begin_read/borrow that returns at once and changes nothing when it
+// is refused. Refusal happens for an inflight-cap refusal, a Reading page, and
+// an arena whose every entry is borrowed (unevictable). Never blocks.
+static void test_try_only_refusal_is_nonblocking_and_mutates_nothing() {
+    CountingAlloc a;
+    HostArena::Config c = cfg(4);
+    c.read_inflight_max = 2;
+    HostArena arena;
+    require(arena.init(c, a.alloc(), a.dealloc()), "init");
+    void * data = nullptr;
+    HostArena::Handle h0 = 0, h1 = 0, h2 = 0, hb = 0;
+    require(arena.begin_read(0, false, &data, &h0), "reading 0");
+    require(arena.begin_read(1, false, &data, &h1), "reading 1");
+    const auto t0 = std::chrono::steady_clock::now();
+    require(!arena.begin_read(2, false, &data, &h2), "inflight cap refuses try-only");
+    require(!arena.borrow(0, nullptr, &hb, true, false, nullptr), "a Reading page is not borrowable");
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    require(waited < std::chrono::milliseconds(500), "try-only refusal must not wait");
+    require(arena.state_of(2) == HostArena::State::Free, "refused page stays Free (nothing reserved)");
+    require(arena.state_of(0) == HostArena::State::Reading, "refusal leaves Reading entries alone");
+    arena.finish_read(0, h0, true, /*keep_borrowed=*/true, false);
+    arena.finish_read(1, h1, true, /*keep_borrowed=*/true, false);
+    // Fill the 4-entry arena with borrowed (unevictable) entries 0-3, then refuse a fresh page 4.
+    require(arena.begin_read(2, false, &data, &h2), "read 2 after cap frees");
+    arena.finish_read(2, h2, true, /*keep_borrowed=*/true, false);
+    require(arena.begin_read(3, false, &data, &h1), "read 3");
+    arena.finish_read(3, h1, true, /*keep_borrowed=*/true, false);
+    const auto t1 = std::chrono::steady_clock::now();
+    require(!arena.begin_read(4, false, &data, &h2), "all entries borrowed: no victim, refused");
+    require(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(500),
+            "borrowed-only arena refusal must not wait");
+    require(arena.state_of(0) == HostArena::State::Resident, "borrowed entry 0 never evicted");
+    require(arena.state_of(2) == HostArena::State::Resident, "borrowed entry 2 never evicted");
+    require(arena.state_of(4) == HostArena::State::Free, "refused page 4 stays Free");
+}
+
 static void test_stale_handle_is_noop() {
     CountingAlloc a;
     HostArena arena;
@@ -1346,6 +1383,7 @@ int main() {
         test_lru_never_evicts_reading_borrowed_or_pinned();
         test_speculative_drained_first_and_promoted_on_demand_hit();
         test_inflight_cap_and_pinned_cap();
+        test_try_only_refusal_is_nonblocking_and_mutates_nothing();
         test_stale_handle_is_noop();
         test_finish_read_keep_borrowed();
         test_tier_cap_zero_frees_on_release();

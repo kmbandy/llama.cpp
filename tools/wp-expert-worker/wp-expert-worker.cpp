@@ -6148,10 +6148,10 @@ private:
     // Stripe-parallel counterpart to reserve_arena_for_pagein: several
     // threads may pull different stripes of the SAME page concurrently, but
     // the reservation must happen exactly once. See PageShared::reserve_state.
-    bool ensure_arena_reserved(PageShared & shared, PageIn & pagein, int conn_index) {
+    bool ensure_arena_reserved(PageShared & shared, PageIn & pagein, int conn_index, bool try_only = false) {
         int expected = 0;
         if (shared.reserve_state.compare_exchange_strong(expected, 1)) {
-            const bool ok = reserve_arena_for_pagein(pagein, conn_index);
+            const bool ok = reserve_arena_for_pagein(pagein, conn_index, try_only);
             {
                 auto lock = wp_lock_timed(shared.reserve_mu);
                 shared.reserve_ok = ok;
@@ -6170,6 +6170,14 @@ private:
     struct BatchState {
         int                                      span_layer = -1;  // WP_WORKER_SPAN_TRACE request layer
         std::vector<PageIn>                       pageins;
+        // WP_WORKER_TWO_IN_FLIGHT (S4): lookahead batch. Every arena reservation
+        // is try-only (no wait); a failure fails the page-in with
+        // "lookahead arena busy" and the caller declines (ARENA_BUSY).
+        bool                                     try_only = false;
+        // WP_WORKER_TWO_IN_FLIGHT (S4): set by complete_batch once every reader
+        // thread is joined, i.e. every arena reservation of this batch is made.
+        // The lookahead gate reads it without blocking.
+        std::atomic<bool>                        reservations_done{ false };
         uint32_t                                span_seq = 0;   // WP_WORKER_SPAN_TRACE request tag
         std::atomic<size_t>                     next{0};
         // Which connection's transaction this batch belongs to (-1 = none:
@@ -7077,7 +7085,8 @@ public:
             std::unique_lock<std::mutex> * gpu_lock = nullptr,
             bool count_demand = true,
             bool spec_call = false,
-            bool spec_call_is_layer_ahead = false) {
+            bool spec_call_is_layer_ahead = false,
+            bool lookahead = false) {
         const bool protect_this_call = spec_call && spec_protect_layerahead_evict_;
         // WP_DEMAND_LOG: arrival stamp, and which demanded pages a speculative
         // (VRAM) read was already in flight for -> src W if the demand waits.
@@ -7422,6 +7431,7 @@ public:
             }
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->conn_index = conn_index;
+            batch.state_->try_only = lookahead;
             batch.state_->span_seq = wp_span_ctx_seq;
             batch.state_->span_layer = wp_span_ctx_layer;
             batch.copy_event_ = new_copy_event();
@@ -9047,12 +9057,14 @@ private:
 
     size_t select_victim_impl(
             const ExpertPage & page, bool skip_shielded, bool * shielded_seen,
-            bool protect_layerahead = false) const {
+            bool protect_layerahead = false,
+            const std::vector<char> * excluded = nullptr) const {
         const uint64_t page_size = page.size;
         const bool wants_reserved = std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
         size_t victim = slots_.size();
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
+            if (excluded != nullptr && (*excluded)[i] != 0) { continue; }
             if (slot.pinned || slot.pin_count != 0 || slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
@@ -9077,6 +9089,7 @@ private:
         if (wants_reserved) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
+                if (excluded != nullptr && (*excluded)[i] != 0) { continue; }
                 if (slot.pinned || slot.pin_count != 0 || slot.valid ||
                     slot.reserved || page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
@@ -9092,6 +9105,7 @@ private:
 
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
+            if (excluded != nullptr && (*excluded)[i] != 0) { continue; }
             if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
                 (!wants_reserved && slot.reserved) ||
                 (wants_reserved && !slot.reserved) ||
@@ -9124,6 +9138,7 @@ private:
         if (wants_reserved && victim == slots_.size()) {
             for (size_t i = 0; i < slots_.size(); ++i) {
                 const Slot & slot = slots_[i];
+                if (excluded != nullptr && (*excluded)[i] != 0) { continue; }
                 if (slot.pinned || slot.pin_count != 0 || !slot.valid ||
                     page_size > slot.capacity) continue;
                 if (skip_shielded && hint_shielded(slot)) {
@@ -9164,6 +9179,108 @@ private:
             ++n_shield_exhausted_;
         }
         return fallback;
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S4) slot headroom dry run. Non-mutating mirror of
+    // select_victim(page, false) given `excluded` (slots already consumed by this
+    // dry run or pinned by the batch's hits). Same two-pass shield order.
+    size_t select_victim_dry(const ExpertPage & page, const std::vector<char> & excluded) const {
+        if (hint_shield_depth_ == 0) {
+            return select_victim_impl(page, false, nullptr, false, &excluded);
+        }
+        const size_t victim = select_victim_impl(page, true, nullptr, false, &excluded);
+        if (victim != slots_.size()) {
+            return victim;
+        }
+        return select_victim_impl(page, false, nullptr, false, &excluded);
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S4): true iff ensure_batch(pages) would find a
+    // victim for every page that needs a slot. Conservative: every resident-
+    // slot hit is treated as pinned (the real planner pins only the hits that
+    // are not CPU-tier), so a true result implies the real plan cannot throw
+    // "no expert slot can hold requested page" (victim choice is greedy and
+    // monotone in the excluded set). Mutates nothing (no tick_, uses,
+    // cpu_tier_refs_, shadow_), so a false result leaves the pool as it was.
+    bool lookahead_slots_ok(const std::vector<const ExpertPage *> & pages) const {
+        std::vector<char> excluded(slots_.size(), 0);
+        for (const ExpertPage * page : pages) {
+            const size_t s = find_slot(*page);
+            if (s != slots_.size()) {
+                excluded[s] = 1;
+            }
+        }
+        for (const ExpertPage * page : pages) {
+            if (page->is_resident || find_slot(*page) != slots_.size()) {
+                continue;
+            }
+            const size_t v = select_victim_dry(*page, excluded);
+            if (v == slots_.size()) {
+                return false;
+            }
+            excluded[v] = 1;
+        }
+        return true;
+    }
+
+public:
+    // WP_WORKER_TWO_IN_FLIGHT (S4): true once every arena reservation of this
+    // batch has been made, i.e. its reader threads are joined (complete_batch).
+    // Non-blocking.
+    bool arena_reservations_done(const Batch & batch) const {
+        return batch.state_ == nullptr || batch.state_->reservations_done.load(std::memory_order_acquire);
+    }
+private:
+
+    // WP_WORKER_TWO_IN_FLIGHT (S4): non-blocking drain-quota acquire for a
+    // lookahead page-in. False (nothing taken) when the quota is full.
+    bool try_acquire_drain_quota(PageIn & pagein, int conn_index) {
+        (void) conn_index;
+        if (pagein.quota_held || pagein.reader_h2d || pagein.cpu_direct) {
+            return true;
+        }
+        auto lock = wp_lock_timed(drain_quota_mu_);
+        if (drain_quota_cap_ == 0) {
+            return true;
+        }
+        const bool   spec = pagein.spec;
+        const size_t cap  = spec ? drain_quota_spec_cap_ : drain_quota_cap_;
+        size_t & held = drain_quota_held_[spec ? kDrainQuotaSpecKey : conn_index];
+        if (held >= cap) {
+            return false;
+        }
+        ++held;
+        pagein.quota_held = true;
+        pagein.quota_spec = spec;
+        return true;
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S4): try-only twin of reserve_arena_for_pagein for
+    // a lookahead page-in. Never waits on the arena: one borrow (RAM hit) or one
+    // begin_read (miss); anything else returns false with nothing held, and the
+    // caller declines the lookahead (ARENA_BUSY).
+    bool reserve_arena_try_only(PageIn & pagein, int conn_index) {
+        if (!try_acquire_drain_quota(pagein, conn_index)) {
+            return false;
+        }
+        const void * src = nullptr;
+        int promoted_tag = -1;
+        if (arena_.borrow(pagein.page->cache_id, &src, &pagein.arena_handle,
+                          /*demand=*/true, pagein.prefill, &promoted_tag)) {
+            pagein.ram_hit    = true;
+            pagein.arena_data = const_cast<void *>(src);
+            pagein.hold_released = false;
+            return true;
+        }
+        void * data = nullptr;
+        if (arena_.begin_read(pagein.page->cache_id, /*speculative=*/false, &data, &pagein.arena_handle)) {
+            pagein.ram_hit    = false;
+            pagein.arena_data = data;
+            pagein.hold_released = false;
+            return true;
+        }
+        release_drain_quota(pagein, conn_index);
+        return false;
     }
 
     // Stripe-claiming reader (WP_EXPERT_STRIPE_PARALLEL=1). Work unit = one
@@ -9705,7 +9822,19 @@ private:
     // measures it from entry, across every retry), after which the page-in
     // fails with "host arena exhausted" -- only reachable when every entry
     // stays Reading/borrowed/pinned with zero progress process-wide.
-    bool reserve_arena_for_pagein(PageIn & pagein, int conn_index) {
+    bool reserve_arena_for_pagein(PageIn & pagein, int conn_index, bool try_only = false) {
+        // WP_WORKER_TWO_IN_FLIGHT (S4): a lookahead page-in never waits on the
+        // arena (see reserve_arena_try_only). Demote/ticket waits are not
+        // try-only, so a lookahead page-in that owes one declines instead.
+        if (try_only) {
+            if (pagein.cpu_direct) {
+                return true;
+            }
+            if (pagein.demote_page != nullptr || pagein.demote_ticket) {
+                return false;
+            }
+            return reserve_arena_try_only(pagein, conn_index);
+        }
         // Paths that write the slot before drain_one_read must demote here;
         // otherwise drain_one_read demotes right before the page's first
         // upload, off the reader threads (measured ~9-14 ms per D2H with 16
@@ -9895,8 +10024,8 @@ private:
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
             try {
-                if (!ensure_arena_reserved(shared, pagein, state->conn_index)) {
-                    throw std::runtime_error("host arena exhausted");
+                if (!ensure_arena_reserved(shared, pagein, state->conn_index, state->try_only)) {
+                    throw std::runtime_error(state->try_only ? "lookahead arena busy" : "host arena exhausted");
                 }
                 const bool page_direct = pagein.cpu_direct &&
                     pagein.raw != nullptr && pagein.raw->data != nullptr;
@@ -9919,8 +10048,8 @@ private:
                         auto lock = wp_lock_timed(shared.reserve_mu);
                         if (pagein.arena_data == nullptr) {
                             pagein.cpu_direct = false;
-                            if (!reserve_arena_for_pagein(pagein, state->conn_index)) {
-                                throw std::runtime_error("host arena exhausted");
+                            if (!reserve_arena_for_pagein(pagein, state->conn_index, state->try_only)) {
+                                throw std::runtime_error(state->try_only ? "lookahead arena busy" : "host arena exhausted");
                             }
                         }
                     }
@@ -10084,7 +10213,7 @@ private:
             if (count_demand) {
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (!reserve_arena_for_pagein(pagein, state->conn_index)) {
+            if (!reserve_arena_for_pagein(pagein, state->conn_index, state->try_only)) {
                 // Bounded wait exhausted: the arena is genuinely starved
                 // (every entry Reading/borrowed/pinned for a full 60s with
                 // no progress anywhere in the process). Fail this page-in
@@ -10095,7 +10224,7 @@ private:
                 result->pagein_indexb = pagein_indexb;
                 result->last = true;
                 try {
-                    throw std::runtime_error("host arena exhausted");
+                    throw std::runtime_error(state->try_only ? "lookahead arena busy" : "host arena exhausted");
                 } catch (...) {
                     result->error = std::current_exception();
                 }
@@ -10162,8 +10291,8 @@ private:
                         // and let the drain copy it like any other page-in.
                         if (pagein.arena_data == nullptr) {
                             pagein.cpu_direct = false;
-                            if (!reserve_arena_for_pagein(pagein, state->conn_index)) {
-                                throw std::runtime_error("host arena exhausted");
+                            if (!reserve_arena_for_pagein(pagein, state->conn_index, state->try_only)) {
+                                throw std::runtime_error(state->try_only ? "lookahead arena busy" : "host arena exhausted");
                             }
                         }
                         dst = (char *) pagein.arena_data + result->offset;
@@ -10699,6 +10828,9 @@ private:
             wp_join(WP_S_READ_WAIT, worker);
         }
         batch.workers_.clear();
+        // WP_WORKER_TWO_IN_FLIGHT (S4): every reader is joined, so every arena
+        // reservation of this batch has been made.
+        batch.state_->reservations_done.store(true, std::memory_order_release);
         batch.completed_ = true;
         if (!wp_copy_stream_events_enabled() &&
                 batch.copy_event_ != nullptr && !record_copy_event(batch.copy_event_)) {
@@ -19408,6 +19540,42 @@ private:
         const uint64_t def = hw >= 16 ? 8 : 4;
         return (int) std::min<uint64_t>(
             ExpertSlotPool::cpu_tier_env_u64("WP_EXPERT_CPU_TIER_THREADS", def), hw);
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S4): ORDERING GATE for lookahead prepare of
+    // request N+1. Returns true only when request N has completed ALL of its
+    // arena reservations: (a) every page-in reservation (reserve_arena_for_pagein
+    // on the reader threads) -- signalled by complete_batch joining those threads
+    // (ExpertSlotPool::arena_reservations_done) -- and (b) every CPU-tier IO
+    // reservation of N (acquire_host_page inside cpu_tier_io_loop) -- signalled by
+    // cpu_tier_settle counting every page of the job (n_settled == index.size()).
+    // Non-blocking: it reads two counters and never waits on N.
+    //
+    // NO-CYCLE ARGUMENT (why this is the only wait-free ordering we need):
+    //  1. After the gate opens, N holds no pending arena reservation, so N never
+    //     waits on an entry that N+1 could hold. N's own readers and CPU IO
+    //     threads have finished reserving; N only waits on its already-held
+    //     entries being drained/released, which needs no further reservation.
+    //  2. N+1's acquisitions are try-only (reserve_arena_try_only, borrow,
+    //     begin_read non-blocking, try_acquire_drain_quota; lookahead CPU IO
+    //     uses the same rule). A refusal releases what N+1 took and declines with
+    //     ARENA_BUSY; N+1 then runs serially as today. N+1 never blocks on an
+    //     entry, so there is no hold-and-wait edge from N+1 to anything.
+    //  3. The remaining readers of the system (spec/prefetch readers and CPU-tier
+    //     speculative landings) only ever take entries opportunistically and
+    //     finish independently of N and N+1; nothing waits on them while holding
+    //     an entry. Therefore the wait-for graph {N -> entries, N+1 -> nothing
+    //     blocking} has no cycle. The sole blocking waits left (reserve_wait in the
+    //     knob-off path) are never reached by a lookahead batch.
+    bool lookahead_gate_open(const ExpertSlotPool::Batch & cur, CpuTierJob * cur_cpu) {
+        if (!pool_.arena_reservations_done(cur)) {
+            return false;
+        }
+        if (cur_cpu == nullptr) {
+            return true;
+        }
+        auto lock = wp_lock_timed(cur_cpu->m);
+        return cur_cpu->n_settled == cur_cpu->index.size();
     }
 
     // The job's request pointer is set later (queue_cpu_tier_compute): the IO
