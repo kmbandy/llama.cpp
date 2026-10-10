@@ -124,6 +124,10 @@ enum wp_span_kind : uint8_t {
     WP_SPAN_SEND,            // response frame send (aux = part index for streamed)
     WP_SPAN_NVME_READ,       // one pread of an expert range (aux: bytes | origin<<48)
     WP_SPAN_H2D,             // host->device copy (aux = bytes)
+    // WP_WORKER_TWO_IN_FLIGHT lookahead (not thread-state kinds: state map returns 0).
+    WP_SPAN_LOOKAHEAD_PREP,  // prepare of request N+1 (seq = N+1, aux = seq of N)
+    WP_SPAN_LOOKAHEAD_DECLINE, // lookahead declined (seq = N+1, aux = WpLookaheadDecline)
+    WP_SPAN_LOOKAHEAD_WAIT,  // N+1 prepared -> consumed (overlap window; aux = ns hidden)
     // ---- thread state records (tiling). Kinds >= 32.
     WP_S_IDLE = 32,          // waiting for work: queue pop, cv wait, poll, sleep, idle recv
     WP_S_READ,               // inside pread / read path of a file (state-level)
@@ -186,6 +190,9 @@ inline const char * wp_span_kind_name(uint8_t k) {
         case WP_SPAN_SEND:           return "SEND";
         case WP_SPAN_NVME_READ:      return "NVME_READ";
         case WP_SPAN_H2D:            return "H2D";
+        case WP_SPAN_LOOKAHEAD_PREP:    return "LOOKAHEAD_PREP";
+        case WP_SPAN_LOOKAHEAD_DECLINE: return "LOOKAHEAD_DECLINE";
+        case WP_SPAN_LOOKAHEAD_WAIT:    return "LOOKAHEAD_WAIT";
         case WP_S_IDLE:              return "S_IDLE";
         case WP_S_READ:              return "S_READ";
         case WP_S_READ_WAIT:         return "S_READ_WAIT";
