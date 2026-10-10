@@ -786,6 +786,27 @@ void HostArena::finish_read(int page_idx, Handle handle, bool ok, bool keep_borr
 bool HostArena::borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand,
                        bool prefill_hint, int * promoted_tag_out) {
     std::lock_guard<std::mutex> lock(mu_);
+    return borrow_locked_(page_idx, src_out, handle_out, demand, prefill_hint, promoted_tag_out);
+}
+
+HostArena::TryAcquire HostArena::try_acquire_nonblocking(int page_idx, const void ** src_out,
+                                                         void ** data_out, Handle * handle_out,
+                                                         int * promoted_tag_out) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (borrow_locked_(page_idx, src_out, handle_out, /*demand=*/true, /*prefill_hint=*/false,
+                       promoted_tag_out)) {
+        return TryAcquire::Hit;
+    }
+    // Same refusal rules as begin_read(): a Reading/Resident page, the inflight
+    // cap, or nothing evictable all return false here without waiting.
+    if (begin_read_locked_(page_idx, /*speculative=*/false, data_out, handle_out)) {
+        return TryAcquire::Reserved;
+    }
+    return TryAcquire::Refused;
+}
+
+bool HostArena::borrow_locked_(int page_idx, const void ** src_out, Handle * handle_out, bool demand,
+                               bool prefill_hint, int * promoted_tag_out) {
     if (promoted_tag_out != nullptr) { *promoted_tag_out = -1; }
     ++lookups_;   // unconditional: proves the lookup path is even reached (see .h comment)
     auto it = by_page_.find(page_idx);

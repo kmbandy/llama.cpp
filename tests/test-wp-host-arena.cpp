@@ -245,6 +245,127 @@ static void test_try_only_refusal_is_nonblocking_and_mutates_nothing() {
     require(arena.state_of(4) == HostArena::State::Free, "refused page 4 stays Free");
 }
 
+// WP_WORKER_TWO_IN_FLIGHT (S5): try_acquire_nonblocking is the lookahead CPU-tier
+// acquire. Hit borrows; Reserved reserves a Reading entry that lands kept-borrowed;
+// Refused (inflight cap, page already Reading, nothing evictable) returns at once,
+// reserves nothing and changes no residency state.
+static void test_try_acquire_nonblocking_contract() {
+    struct Snap {
+        size_t resident, reading, resident_bytes, spec_bytes, pinned_bytes;
+    };
+    const auto snap = [](const HostArena & a) {
+        return Snap{a.resident_count(), a.reading_count(), a.resident_bytes(),
+                    a.spec_bytes(), a.pinned_bytes()};
+    };
+    const auto same = [](const Snap & x, const Snap & y) {
+        return x.resident == y.resident && x.reading == y.reading &&
+               x.resident_bytes == y.resident_bytes && x.spec_bytes == y.spec_bytes &&
+               x.pinned_bytes == y.pinned_bytes;
+    };
+    using TA = HostArena::TryAcquire;
+
+    // Hit: a resident page is borrowed, not re-read; the borrow holds it.
+    {
+        CountingAlloc a;
+        HostArena arena;
+        require(arena.init(cfg(4), a.alloc(), a.dealloc()), "init hit");
+        void * data = nullptr; HostArena::Handle h = 0;
+        require(arena.begin_read(0, false, &data, &h), "hit: read 0");
+        std::memset(data, 0x5C, ENTRY);
+        arena.finish_read(0, h, true);
+        const Snap before = snap(arena);
+        const void * src = nullptr; void * d2 = nullptr; HostArena::Handle hb = 0;
+        require(arena.try_acquire_nonblocking(0, &src, &d2, &hb) == TA::Hit, "hit: resident page");
+        require(((const unsigned char *) src)[0] == 0x5C, "hit: bytes match");
+        require(snap(arena).reading == before.reading && arena.resident_count() == before.resident,
+                "hit: no read started");
+        // The hit's borrow pins the entry against eviction: fill the rest, then
+        // one more landing must evict something other than page 0.
+        for (int p = 1; p <= 4; ++p) {
+            require(arena.begin_read(p, false, &data, &h), "hit: fill");
+            arena.finish_read(p, h, true);
+        }
+        require(arena.state_of(0) == HostArena::State::Resident, "hit: borrowed page 0 survives");
+        arena.release(0, hb);
+    }
+
+    // Reserved: a miss reserves a Reading entry; landing it keep_borrowed keeps it.
+    {
+        CountingAlloc a;
+        HostArena arena;
+        require(arena.init(cfg(4), a.alloc(), a.dealloc()), "init reserved");
+        const void * src = nullptr; void * data = nullptr; HostArena::Handle h = 0;
+        require(arena.try_acquire_nonblocking(1, &src, &data, &h) == TA::Reserved, "reserved: miss");
+        require(data != nullptr && h != HostArena::kInvalidHandle, "reserved: data + handle");
+        require(arena.state_of(1) == HostArena::State::Reading, "reserved: Reading");
+        require(arena.reading_count() == 1, "reserved: reading_count 1");
+        std::memset(data, 0x7E, ENTRY);
+        arena.finish_read(1, h, true, /*keep_borrowed=*/true);
+        require(arena.state_of(1) == HostArena::State::Resident, "reserved: landed Resident");
+        // Borrowed page 1 is never the victim while others are evictable.
+        for (int p = 2; p <= 6; ++p) {
+            require(arena.begin_read(p, false, &data, &h), "reserved: pressure read");
+            arena.finish_read(p, h, true);
+        }
+        require(arena.state_of(1) == HostArena::State::Resident, "reserved: kept-borrowed page survives");
+        const void * bsrc = nullptr; HostArena::Handle bh = 0;
+        require(arena.borrow(1, &bsrc, &bh), "reserved: still resident for a borrow");
+        require(((const unsigned char *) bsrc)[0] == 0x7E, "reserved: landed bytes intact");
+        arena.release(1, bh);
+        arena.release(1, h);   // the keep_borrowed token from finish_read
+    }
+
+    // Refused by the inflight cap: returns at once, reserves nothing, touches nothing.
+    {
+        CountingAlloc a;
+        HostArena::Config c = cfg(4);
+        c.read_inflight_max = 2;
+        HostArena arena;
+        require(arena.init(c, a.alloc(), a.dealloc()), "init cap");
+        void * data = nullptr; HostArena::Handle h10 = 0, h11 = 0;
+        require(arena.begin_read(10, false, &data, &h10), "cap: reading 10");
+        require(arena.begin_read(11, false, &data, &h11), "cap: reading 11");
+        const Snap before = snap(arena);
+        const void * src = nullptr; void * d = nullptr; HostArena::Handle hx = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        require(arena.try_acquire_nonblocking(12, &src, &d, &hx) == TA::Refused, "cap: refused");
+        // A page that is already Reading is refused too (not a hit: nothing landed).
+        require(arena.try_acquire_nonblocking(10, &src, &d, &hx) == TA::Refused, "cap: Reading page refused");
+        require(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500),
+                "cap: refusal must not wait");
+        require(same(before, snap(arena)), "cap: refusal changes no counts");
+        require(arena.state_of(12) == HostArena::State::Free, "cap: refused page stays Free");
+        require(arena.state_of(10) == HostArena::State::Reading, "cap: Reading 10 untouched");
+        require(arena.reading_count() == 2, "cap: reading_count unchanged");
+        arena.finish_read(10, h10, true);
+        arena.finish_read(11, h11, true);
+    }
+
+    // Refused because nothing is evictable: every resident entry is borrowed.
+    {
+        CountingAlloc a;
+        HostArena arena;
+        require(arena.init(cfg(2), a.alloc(), a.dealloc()), "init full");
+        void * data = nullptr; HostArena::Handle h0 = 0, h1 = 0;
+        require(arena.begin_read(0, false, &data, &h0), "full: read 0");
+        arena.finish_read(0, h0, true, /*keep_borrowed=*/true);
+        require(arena.begin_read(1, false, &data, &h1), "full: read 1");
+        arena.finish_read(1, h1, true, /*keep_borrowed=*/true);
+        const Snap before = snap(arena);
+        const void * src = nullptr; void * d = nullptr; HostArena::Handle hx = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        require(arena.try_acquire_nonblocking(2, &src, &d, &hx) == TA::Refused, "full: refused");
+        require(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500),
+                "full: refusal must not wait");
+        require(same(before, snap(arena)), "full: refusal changes no counts");
+        require(arena.state_of(2) == HostArena::State::Free, "full: refused page stays Free");
+        require(arena.state_of(0) == HostArena::State::Resident &&
+                arena.state_of(1) == HostArena::State::Resident, "full: borrowed entries untouched");
+        arena.release(0, h0);
+        arena.release(1, h1);
+    }
+}
+
 static void test_stale_handle_is_noop() {
     CountingAlloc a;
     HostArena arena;
@@ -1384,6 +1505,7 @@ int main() {
         test_speculative_drained_first_and_promoted_on_demand_hit();
         test_inflight_cap_and_pinned_cap();
         test_try_only_refusal_is_nonblocking_and_mutates_nothing();
+        test_try_acquire_nonblocking_contract();
         test_stale_handle_is_noop();
         test_finish_read_keep_borrowed();
         test_tier_cap_zero_frees_on_release();

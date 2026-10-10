@@ -9601,6 +9601,43 @@ private:
         return true;
     }
 
+    // WP_WORKER_TWO_IN_FLIGHT (S5): non-blocking acquire for a LOOKAHEAD CPU-tier
+    // page. Hit: borrow, as try_borrow_host_page. Miss with a free entry: read the
+    // page on this IO thread into the reserved entry and land it kept borrowed
+    // (acquire_host_page's reserve branch without the wait). Refused (inflight
+    // cap, nothing evictable, or page Reading elsewhere): returns false with
+    // nothing held and no attribution; the caller declines the lookahead.
+    bool try_acquire_host_page(const ExpertPage & page, int fd, HostPage & hp, uint32_t rows = 0) {
+        const void * src = nullptr;
+        void * data = nullptr;
+        int promoted_tag = -1;
+        const wp::HostArena::TryAcquire r = arena_.try_acquire_nonblocking(
+            page.cache_id, &src, &data, &hp.handle, &promoted_tag);
+        if (r == wp::HostArena::TryAcquire::Refused) {
+            return false;
+        }
+        if (r == wp::HostArena::TryAcquire::Hit) {
+            note_host_src(page, hp, promoted_tag, /*first_try=*/true, /*pf_live=*/false);
+            attr_note_hit(page, rows);
+            hp.data    = src;
+            hp.ram_hit = true;
+            return true;
+        }
+        const uint8_t st = attr_note_pagein(page, rows);
+        const bool pf_live = st == kAttrQueued || st == kAttrReading;
+        try {
+            read_page_range(page, fd, data, 0, (size_t) page.size);
+        } catch (...) {
+            arena_.finish_read(page.cache_id, hp.handle, /*ok=*/false);
+            throw;
+        }
+        arena_.finish_read(page.cache_id, hp.handle, /*ok=*/true,
+                           /*keep_borrowed=*/true, /*prefill_hint=*/false);
+        hp.data = data;
+        hp.src  = pf_live ? 'W' : 'N';
+        return true;
+    }
+
     // Chunked variant of acquire_host_page, step 1: borrow on a RAM hit
     // (returns true, hp filled) or reserve an arena entry (returns false,
     // hp.handle + *data filled; the caller MUST read the page with
@@ -19524,6 +19561,15 @@ private:
         };
         std::vector<std::unique_ptr<PageRead>> reads;
         bool                                   compute_queued = false;   // dispatch thread only
+        // WP_WORKER_TWO_IN_FLIGHT (S5): a LOOKAHEAD job acquires its pages
+        // try-only (cpu_tier_try_io): it never waits on the arena or on another
+        // job. `pred` is request N's CPU-tier job; no page of this job is
+        // acquired until N's pages have all settled. `declined` (guarded by m)
+        // is set when a page was refused: the job then fails fast, its landed
+        // pages are released by the compute thread, and request N+1 runs serially.
+        bool                                   try_only = false;
+        std::shared_ptr<CpuTierJob>            pred;
+        bool                                   declined = false;
     };
 
     // One IO-thread task: chunk < 0 acquires page k (borrow or reserve, then
@@ -19584,8 +19630,12 @@ private:
     std::shared_ptr<CpuTierJob> submit_cpu_tier_io(
             const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
-            const pipe_expert_dispatch_req & request) {
+            const pipe_expert_dispatch_req & request,
+            bool try_only = false,
+            std::shared_ptr<CpuTierJob> pred = nullptr) {
         auto job = std::make_shared<CpuTierJob>();
+        job->try_only = try_only;
+        job->pred     = std::move(pred);
         for (size_t i = 0; i < request.assignments.size(); ++i) {
             if (batch.is_cpu_tier(i)) {
                 job->index.push_back(i);
@@ -19865,6 +19915,53 @@ private:
         return { off, std::min(part, size - off) };
     }
 
+    // WP_WORKER_TWO_IN_FLIGHT (S5): IO-thread step of page k of a LOOKAHEAD job.
+    // Never waits: a refused acquire, a job already declined or failed, or an
+    // unsettled pred settles page k as refused at once, so a lookahead job cannot
+    // park an IO thread that request N's tasks are queued behind. Only the
+    // (bounded) disk read of an accepted miss takes time, as on the normal path.
+    // A refusal sets job->declined and settles with the ARENA_BUSY error.
+    void cpu_tier_try_io(const std::shared_ptr<CpuTierJob> & job, size_t k) {
+        bool go = false;
+        {
+            auto lock = wp_lock_timed(job->m);
+            go = !job->declined && !job->error;
+        }
+        if (go && job->pred) {
+            auto lock = wp_lock_timed(job->pred->m);
+            go = job->pred->n_settled == job->pred->index.size();
+        }
+        ExpertSlotPool::HostPage hp;
+        bool got = false;
+        std::exception_ptr err;
+        if (go) {
+            try {
+                got = pool_.try_acquire_host_page(*job->pages[k], job->fds[k], hp, job->n_tokens);
+            } catch (...) {
+                err = std::current_exception();
+            }
+        }
+        if (got) {
+            if (job->demand_rec) { job->demand_rec->src[job->index[k]] = hp.src; }
+            {
+                auto lock = wp_lock_timed(job->m);
+                job->holds[k] = hp;
+            }
+            cpu_tier_settle(*job, k, true, hp.ram_hit, nullptr);
+            return;
+        }
+        if (!err) {
+            auto lock = wp_lock_timed(job->m);
+            job->declined = true;
+            err = lookahead_arena_busy_error();
+        }
+        cpu_tier_settle(*job, k, false, false, err);
+    }
+
+    static std::exception_ptr lookahead_arena_busy_error() {
+        return std::make_exception_ptr(std::runtime_error("lookahead arena busy"));
+    }
+
     void cpu_tier_io_loop() {
         WpThreadScope wp_thread(WP_ROLE_CPU_TIER_IO);
         WpReadOriginScope rd_origin(WP_RD_CPUTIER);
@@ -19890,6 +19987,10 @@ private:
                 const size_t size = (size_t) job->pages[k]->size;
                 const auto r = cpu_tier_chunk_range(size, (size_t) task.chunk);
                 cpu_tier_read_chunk(job, k, (size_t) task.chunk, r.first, r.second);
+                continue;
+            }
+            if (job->try_only) {
+                cpu_tier_try_io(job, k);
                 continue;
             }
             try {
