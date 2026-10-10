@@ -499,6 +499,13 @@ target_link_libraries(test-dsv4-comp-plan-split PRIVATE llama)
 target_compile_features(test-dsv4-comp-plan-split PRIVATE cxx_std_17)
 llama_test(test-dsv4-comp-plan-split)
 
+# WP_SPINE_ROW_GROUPS: per-group DSv4 graph inputs equal row slices of the whole fill (CPU only)
+add_executable(test-dsv4-rowgroup-inputs test-dsv4-rowgroup-inputs.cpp)
+target_include_directories(test-dsv4-rowgroup-inputs PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-inputs PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-inputs PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-inputs)
+
 # cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
 add_executable(
     test-tp-rank-window

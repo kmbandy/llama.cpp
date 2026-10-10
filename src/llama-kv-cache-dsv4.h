@@ -413,6 +413,11 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    // WP_SPINE_ROW_GROUPS: rollback rs_idx as consumed by the current ubatch
+    // (the value dsv4_build_comp_plans passed to llama_dsv4_build_comp_plan
+    // for it). Needed to rebuild the group split plans for the live ubatch.
+    const std::vector<uint32_t> & get_rs_idx_ubatch() const;
+
 private:
     size_t i_next = 0;
 
@@ -421,6 +426,7 @@ private:
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;
     std::vector<comp_plan> plans_lid;
+    std::vector<std::vector<uint32_t>> rs_idx_ubatches;
 
     const std::unique_ptr<llama_kv_cache_dsv4_raw_context> ctx_raw;
     const llama_memory_context_ptr ctx_csa_mem;

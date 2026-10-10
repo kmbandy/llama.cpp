@@ -1120,6 +1120,29 @@ llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
     return res;
 }
 
+// rs_idx as seen by each ubatch in dsv4_build_comp_plans: the first ubatch
+// touching a seq consumes its rollback restore.
+static std::vector<std::vector<uint32_t>> dsv4_rs_idx_per_ubatch(
+        const std::vector<llama_ubatch> & ubatches,
+        const std::vector<uint32_t> & rs_idx) {
+    std::vector<std::vector<uint32_t>> res;
+    res.reserve(ubatches.size());
+
+    std::vector<uint32_t> rs(rs_idx);
+    for (const llama_ubatch & ubatch : ubatches) {
+        res.push_back(rs);
+
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            if (seq_id >= 0 && (size_t) seq_id < rs.size()) {
+                rs[seq_id] = 0;
+            }
+        }
+    }
+
+    return res;
+}
+
 static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans(
         const std::vector<llama_ubatch> & ubatches,
         uint32_t ratio,
@@ -2633,10 +2656,18 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()) {
+    rs_idx_ubatches = dsv4_rs_idx_per_ubatch(this->ubatches, kv->get_rs_idx());
     kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
+
+const std::vector<uint32_t> & llama_kv_cache_dsv4_context::get_rs_idx_ubatch() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    assert(i_next < rs_idx_ubatches.size());
+
+    return rs_idx_ubatches[i_next];
+}
 
 bool llama_kv_cache_dsv4_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
