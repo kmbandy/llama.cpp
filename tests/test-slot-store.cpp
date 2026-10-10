@@ -30,12 +30,12 @@ static void mark_used(const fs::path & dir, fs::file_time_type t) {
 }
 
 int main() {
-    const fs::path g_root = fs::temp_directory_path() /
+    const fs::path root_base = fs::temp_directory_path() /
         ("slot-store-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
-    fs::remove_all(g_root, ec);
-    fs::create_directories(g_root);
-    const fs::path root = g_root / "root";
+    fs::remove_all(root_base, ec);
+    fs::create_directories(root_base);
+    const fs::path root = root_base / "root";
     fs::create_directories(root);
 
     const fs::file_time_type base = fs::file_time_type::clock::now();
@@ -134,7 +134,7 @@ int main() {
     // symlinks: a symlink to a dir outside root is neither followed nor deleted, and its
     // target's bytes are not counted. Only the 1000-byte alias dir is freed.
     {
-        const fs::path outside = g_root / "outside";
+        const fs::path outside = root_base / "outside";
         write_bytes(outside / "victim.bin", 5000);
 
         const fs::path r = root / "sym";
@@ -149,6 +149,25 @@ int main() {
         assert(fs::exists(outside / "victim.bin"));
     }
 
-    fs::remove_all(g_root, ec);
+    // symlinked alias dir: touch refuses and writes nothing outside root; list returns {}
+    {
+        const fs::path outside = root_base / "outside-alias";
+        fs::create_directories(outside);
+        write_bytes(outside / "slot-0.wpslot", 10);
+
+        const fs::path r = root / "alias-link";
+        fs::create_directories(root);
+        fs::create_directory_symlink(outside, r);
+
+        slot_store_touch(r.string());
+        assert(!fs::exists(outside / ".last_used"));
+        assert(fs::is_symlink(r));
+        assert(slot_store_list(r.string()).empty());
+    }
+
+    // negative slot ids have no file name
+    assert(slot_store_file("/x/alias", -1).empty());
+
+    fs::remove_all(root_base, ec);
     return 0;
 }

@@ -58,6 +58,12 @@ bool is_regular_nofollow(const fs::path & p) {
     return !ec && fs::is_regular_file(st);
 }
 
+// Symlink itself (not its target), judged without following it.
+bool is_symlink_nofollow(const fs::path & p) {
+    std::error_code ec;
+    return fs::is_symlink(fs::symlink_status(p, ec));
+}
+
 // Real directory, judged without following a symlink.
 bool is_dir_nofollow(const fs::path & p) {
     std::error_code ec;
@@ -120,11 +126,18 @@ fs::path canon(const fs::path & p) {
 } // namespace
 
 std::string slot_store_file(const std::string & dir, int slot_id) {
+    if (slot_id < 0) {
+        return "";
+    }
     return (fs::path(dir) / (std::string(SLOT_PREFIX) + std::to_string(slot_id) + SLOT_SUFFIX)).string();
 }
 
 std::vector<int> slot_store_list(const std::string & dir) {
     std::vector<int> ids;
+    if (is_symlink_nofollow(fs::path(dir))) {
+        LOG_WRN("slot-store: refusing to list %s: alias dir is a symlink\n", dir.c_str());
+        return ids;
+    }
     try {
         std::error_code ec;
         fs::directory_iterator it(dir, ec);
@@ -153,8 +166,13 @@ std::vector<int> slot_store_list(const std::string & dir) {
 }
 
 void slot_store_touch(const std::string & dir) {
+    const fs::path d(dir);
+    // an alias dir that is a symlink could point outside root: refuse before any write
+    if (is_symlink_nofollow(d)) {
+        LOG_WRN("slot-store: refusing to touch %s: alias dir is a symlink\n", dir.c_str());
+        return;
+    }
     try {
-        const fs::path d(dir);
         std::error_code ec;
         fs::create_directories(d, ec);
         if (ec) {

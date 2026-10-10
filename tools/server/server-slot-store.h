@@ -8,15 +8,18 @@
 #include <string>
 #include <vector>
 
-// Path of one slot's file in an alias directory: <dir>/slot-<id>.wpslot
+// Path of one slot's file in an alias directory: <dir>/slot-<id>.wpslot.
+// A negative slot_id has no valid file name and yields "".
 std::string slot_store_file(const std::string & dir, int slot_id);
 
 // Slot ids that have a regular file slot-<id>.wpslot in dir, ascending. Anything else
-// (*.tmp, symlinks, directories, non-canonical ids, junk) is ignored. A missing dir yields {}.
+// (*.tmp, symlinks, directories, non-canonical ids, junk) is ignored. A missing dir, or a dir
+// that is itself a symlink, yields {}.
 std::vector<int> slot_store_list(const std::string & dir);
 
 // Marks dir as recently used: creates dir if needed and (re)writes dir/.last_used,
-// whose mtime is the LRU key.
+// whose mtime is the LRU key. Refuses (logs, writes nothing) when dir is a symlink, so an
+// alias dir can never redirect writes outside root.
 void slot_store_touch(const std::string & dir);
 
 // Deletes whole alias directories directly under root, least recently used first, until
