@@ -87,9 +87,10 @@ class graph_dispatcher {
                               ggml_tensor *  full_activations = nullptr,
                               ggml_tensor *  full_selected_experts = nullptr,
                               ggml_tensor *  full_weights = nullptr,
-                              int64_t        token_offset = 0);
-    ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
-    ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
+                              int64_t        token_offset = 0,
+                              int32_t        group = -1);
+    ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer, int32_t group = -1);
+    ggml_tensor * build_wait(ggml_context * ctx, int32_t layer, int32_t group = -1);
 
     // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (both default OFF): build the join of
     // the shared-expert output with the remote partial as one GGML_OP_WAIT_ADD
@@ -108,9 +109,11 @@ class graph_dispatcher {
     // `wait` is the CPU wait node (mode 1) or nullptr (mode 2).
     ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
 
+    // group = -1: legacy per-layer order check. group 0/1: independent check
+    // per row group (WP_SPINE_ROW_GROUPS), so A(l) and B(l) may interleave.
     void begin_graph_build(ggml_context * ctx);
-    bool begin_issue_build(ggml_context * ctx, int32_t layer);
-    void note_wait_expanded(ggml_context * ctx, int32_t layer);
+    bool begin_issue_build(ggml_context * ctx, int32_t layer, int32_t group = -1);
+    void note_wait_expanded(ggml_context * ctx, int32_t layer, int32_t group = -1);
 
     // ---- hash-layer prefetch ------------------------------------------------
     //
@@ -284,8 +287,8 @@ class graph_dispatcher {
     void spine_profile_begin(std::chrono::steady_clock::time_point begin) noexcept;
     spine_profile_stats spine_profile_end(std::chrono::steady_clock::time_point end) noexcept;
 
-    void mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept;
-    void mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept;
+    void mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index, int32_t group = -1) noexcept;
+    void mark_wait_tensor(ggml_tensor * tensor, int32_t layer, int32_t group = -1) noexcept;
 
     void spine_layer_profile_begin(uint64_t ubatch_index,
                                    uint32_t n_tokens,
@@ -336,7 +339,8 @@ class graph_dispatcher {
         int64_t      n_tokens = 0;
     };
     // 0 = legacy, 1 = zerocopy, 2 = gpu flag; also resolves the slot.
-    int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out);
+    // Row-group contexts (group >= 0) always use the legacy wait.
+    int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out, int32_t group = -1);
     wait_slot * wait_slot_for(int32_t layer, int64_t n_floats, bool create);
     // Body shared by compute_wait (host blocking; dst is the CPU wait node) and the
     // background job (dst == nullptr, bg == true). zc_out != nullptr redirects the
@@ -703,6 +707,9 @@ class graph_dispatcher {
     ggml_context *                                 graph_build_ctx_ = nullptr;
     int32_t                                         last_issue_layer_ = -1;
     int32_t                                         last_expanded_wait_layer_ = -1;
+    // Per row group (0 = A, 1 = B) copies of the two order-check fields above.
+    int32_t                                         last_group_issue_layer_[2] = { -1, -1 };
+    int32_t                                         last_group_wait_layer_[2] = { -1, -1 };
     std::atomic<bool>                              failed_{ false };
     mutable std::mutex                             failure_mutex_;
     std::string                                    failure_message_;

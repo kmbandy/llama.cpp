@@ -208,6 +208,8 @@ struct graph_dispatcher::op_context {
     int32_t            layer = -1;
     int32_t            chunk_index = 0;
     int32_t            chunk_count = 1;
+    // -1 = whole layer; 0/1 = row group A/B (key layer*2+group, chunk_index 0).
+    int32_t            group = -1;
     int64_t            token_offset = 0;
     // hparams.swiglu_clamp_exp[layer]; <= 0 means no clamp. See the note on
     // pipe_expert_dispatch_req::swiglu_clamp -- the spine's own clamped SwiGLU
@@ -447,14 +449,19 @@ void graph_dispatcher::spine_profile_wait_end(dispatch_clock::time_point time) n
     spine_profile_.issue_active = false;
 }
 
-void graph_dispatcher::mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept {
-    if (tensor != nullptr) {
+void graph_dispatcher::mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index,
+                                         int32_t group) noexcept {
+    if (tensor != nullptr && group >= 0) {
+        ggml_format_name(tensor, "wp_spine_dispatch_issue-%d-g%d", layer, group);
+    } else if (tensor != nullptr) {
         ggml_format_name(tensor, "wp_spine_dispatch_issue-%d-%d", layer, chunk_index);
     }
 }
 
-void graph_dispatcher::mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept {
-    if (tensor != nullptr) {
+void graph_dispatcher::mark_wait_tensor(ggml_tensor * tensor, int32_t layer, int32_t group) noexcept {
+    if (tensor != nullptr && group >= 0) {
+        ggml_format_name(tensor, "wp_spine_dispatch_wait-%d-g%d", layer, group);
+    } else if (tensor != nullptr) {
         ggml_format_name(tensor, "wp_spine_dispatch_wait-%d", layer);
     }
 }
@@ -740,6 +747,7 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
     }
     context->chunk_index = 0;
     context->chunk_count = 1;
+    context->group = -1;
     context->token_offset = 0;
     context->full_activations = nullptr;
     context->full_selected_experts = nullptr;
@@ -763,9 +771,18 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
                                             ggml_tensor *  full_activations,
                                             ggml_tensor *  full_selected_experts,
                                             ggml_tensor *  full_weights,
-                                            int64_t        token_offset) {
+                                            int64_t        token_offset,
+                                            int32_t        group) {
     if (layer < 0) {
         throw std::invalid_argument("expert dispatch requires a non-negative layer");
+    }
+    if (group >= 0) {
+        if (group > 1 || chunk_index != 0 || chunk_count != 1) {
+            throw std::invalid_argument("expert dispatch row group must be 0 or 1 and unchunked");
+        }
+        if (remote.dispatch_chunks() != 1) {
+            throw std::invalid_argument("expert dispatch row groups need WP_DISPATCH_CHUNKS=1");
+        }
     }
     if (activations->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 ||
         weights->type != GGML_TYPE_F32) {
@@ -787,20 +804,21 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
             weights = ggml_add(ctx, weights, gate);
         }
     }
-    const int32_t key = layer * 2 + chunk_index;
+    const int32_t key = group >= 0 ? layer * 2 + group : layer * 2 + chunk_index;
     auto & context = op_contexts[key];
     if (!context) {
         context.reset(new op_context{ this, layer });
     }
     context->chunk_index         = chunk_index;
     context->chunk_count         = chunk_count;
+    context->group               = group;
     context->token_offset        = token_offset;
     context->swiglu_clamp = swiglu_clamp;
     context->full_activations    = full_activations;
     context->full_selected_experts = full_selected_experts;
     context->full_weights        = full_weights;
     ggml_tensor * issued = nullptr;
-    if (score_probs_ != nullptr && score_probs_layer_ == layer && chunk_count == 1) {
+    if (score_probs_ != nullptr && score_probs_layer_ == layer && chunk_count == 1 && group < 0) {
         // WP_SCORE_SUMMARY=1 only: the same issue op with the router probs as a
         // fourth, read-only source (adds a dependency, nothing else).
         ggml_tensor * args[4] = { activations, selected_experts, weights, score_probs_ };
@@ -813,16 +831,16 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
     }
     score_probs_       = nullptr;
     score_probs_layer_ = -1;
-    mark_issue_tensor(issued, layer, chunk_index);
+    mark_issue_tensor(issued, layer, chunk_index, group);
     context->issued = issued;
     return issued;
 }
 
-ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer) {
+ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer, int32_t group) {
     if (tensor == nullptr) {
         throw std::invalid_argument("after_issue requires a tensor");
     }
-    const auto it = op_contexts.find(layer * 2);
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
     }
@@ -842,8 +860,8 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     return ggml_acc_inplace(ctx, tensor, zero, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
 }
 
-ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
-    const auto it = op_contexts.find(layer * 2);
+ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer, int32_t group) {
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("build_wait has no issue node for layer " + std::to_string(layer));
     }
@@ -854,7 +872,7 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     ggml_tensor * wait = nullptr;
     if (it->second->chunk_count == 1) {
         wait = ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
-        mark_wait_tensor(wait, layer);
+        mark_wait_tensor(wait, layer, group);
     } else {
         const auto next = op_contexts.find(layer * 2 + 1);
         if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
@@ -868,7 +886,10 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
         mark_wait_tensor(wait_b, layer);
         wait = ggml_concat(ctx, wait_a, wait_b, 1);
     }
-    wait_tensors_[layer] = wait;
+    // Row-group waits are not read back by build_issue (chunk gate only).
+    if (group < 0) {
+        wait_tensors_[layer] = wait;
+    }
     return wait;
 }
 
@@ -939,9 +960,10 @@ graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int
     return &wait_slots_.emplace(layer, slot).first->second;
 }
 
-int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out) {
+int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out,
+                                int32_t group) {
     const int mode = wait_knob_mode();
-    if (mode == 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
+    if (mode == 0 || group >= 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
         n_tokens > wait_slot_tokens()) {
         return 0;
     }
@@ -1080,14 +1102,28 @@ void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
     wait_tensors_.clear();
     last_issue_layer_ = -1;
     last_expanded_wait_layer_ = -1;
+    last_group_issue_layer_[0] = last_group_issue_layer_[1] = -1;
+    last_group_wait_layer_[0]  = last_group_wait_layer_[1]  = -1;
 }
 
-bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer) {
+bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer, int32_t group) {
     if (graph_build_ctx_ != ctx) {
         begin_graph_build(ctx);
     }
 
     const int32_t previous_layer = layer - 1;
+    if (group >= 0) {
+        // Group g issues layer l only after its own wait l-1 was expanded.
+        const bool ordered = last_group_issue_layer_[group] != previous_layer ||
+                             last_group_wait_layer_[group] >= previous_layer;
+        if (!ordered) {
+            std::fprintf(stderr,
+                         "expert dispatch graph order: layer %d group %d issue created before its wait %d expanded\n",
+                         layer, group, previous_layer);
+        }
+        last_group_issue_layer_[group] = layer;
+        return ordered;
+    }
     const bool ordered = last_issue_layer_ != previous_layer ||
                          last_expanded_wait_layer_ >= previous_layer;
     if (!ordered) {
@@ -1099,9 +1135,13 @@ bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer) {
     return ordered;
 }
 
-void graph_dispatcher::note_wait_expanded(ggml_context * ctx, int32_t layer) {
+void graph_dispatcher::note_wait_expanded(ggml_context * ctx, int32_t layer, int32_t group) {
     if (graph_build_ctx_ != ctx) {
         begin_graph_build(ctx);
+    }
+    if (group >= 0) {
+        last_group_wait_layer_[group] = std::max(last_group_wait_layer_[group], layer);
+        return;
     }
     last_expanded_wait_layer_ = std::max(last_expanded_wait_layer_, layer);
 }
@@ -3076,7 +3116,8 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
         // (the consuming kernel is already queued or about to be): armed here,
         // disarmed right before the real fold job is queued at the end of the try.
         wait_slot * gf_slot = nullptr;
-        const int   gf_mode = owner->wait_mode(context->layer, activations->ne[1], context->chunk_count, &gf_slot);
+        const int   gf_mode = owner->wait_mode(context->layer, activations->ne[1], context->chunk_count, &gf_slot,
+                                               context->group);
         struct gf_guard_t {
             graph_dispatcher * o;
             wait_slot *        slot;
@@ -3467,7 +3508,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
     // WP_WAIT_ZEROCOPY: fold into the persistent pinned slot instead of dst->data;
     // the GPU consumes the slot directly (GGML_OP_WAIT_ADD), no H2D copy.
     wait_slot * slot = nullptr;
-    const int   mode = context->owner->wait_mode(context->layer, dst->ne[1], context->chunk_count, &slot);
+    const int   mode = context->owner->wait_mode(context->layer, dst->ne[1], context->chunk_count, &slot,
+                                                 context->group);
     context->owner->wait_core(context, dst, mode == 1 ? slot->data : nullptr, dst->ne[1], false);
 }
 
