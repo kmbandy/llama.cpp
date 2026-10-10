@@ -5622,6 +5622,21 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env("LLAMA_ARG_ROUTER_WORKER_PORT").set_preset_only());
 
     args.push_back(common_arg(
+        {"kv-preserve"}, "DIR",
+        "in server router mode, root directory for this model's slot KV autosave: the child gets\n"
+        "--slot-autosave-dir DIR/<model> (a replica gets its own subdirectory). Cannot be combined\n"
+        "with slot-autosave. Unless stop-timeout is set, the stop-timeout is raised to 60 seconds.",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KV_PRESERVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"kv-preserve-mb"}, "N",
+        "in server router mode, budget in MiB for the kv-preserve directory (the child gets\n"
+        "--slot-autosave-budget-mb N). Needs kv-preserve. 0 = no budget (default).",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KV_PRESERVE_MB").set_preset_only());
+
+    args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",
         "in server router mode, per-model environment for THIS model's child process only.\n"
         "Comma-separated. 'K=V' sets K, and a leading '-' ('-K') REMOVES K from the child's\n"
