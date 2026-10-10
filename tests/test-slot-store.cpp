@@ -183,6 +183,7 @@ int main() {
 
         const fs::path r = root / "sym";
         write_bytes(r / "s" / "slot-0.wpslot", 1000);
+        mark_used(r / "s", base);
         fs::create_directory_symlink(outside, r / "s" / "link");
         fs::create_directory_symlink(outside, r / "evil");
 
@@ -216,6 +217,40 @@ int main() {
             assert(slot_store_list(p).empty());
         }
         assert(fs::is_symlink(r));
+    }
+
+    // foreign dirs (unmarked, not only slot files) are never deleted nor counted
+    {
+        const fs::path r = root / "foreign-mix";
+        write_bytes(r / "old" / "slot-0.wpslot", 1000);
+        mark_used(r / "old", base);
+        write_bytes(r / "foreign" / "slot-0.wpslot", 1000);
+        write_bytes(r / "foreign" / "notes.txt", 1000);
+        fs::create_directories(r / "empty");
+
+        // "old" alone is the slot-store total (1000); budget 500 evicts it and stops
+        const uint64_t freed = slot_store_prune(r.string(), (r / "none").string(), 500);
+        assert(freed == 1000);
+        assert(!fs::exists(r / "old"));
+        assert(fs::exists(r / "foreign" / "notes.txt"));
+        assert(fs::exists(r / "empty"));
+    }
+    {
+        // only a foreign dir over budget: nothing is deleted
+        const fs::path r = root / "foreign-only";
+        write_bytes(r / "foreign" / "slot-0.wpslot", 1000);
+        write_bytes(r / "foreign" / "notes.txt", 1000);
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 0);
+        assert(fs::exists(r / "foreign" / "notes.txt"));
+    }
+    {
+        // unmarked dir holding only slot files is a slot store and is pruned
+        const fs::path r = root / "unmarked";
+        write_bytes(r / "u" / "slot-0.wpslot", 1000);
+
+        assert(slot_store_prune(r.string(), (r / "none").string(), 1) == 1000);
+        assert(!fs::exists(r / "u"));
     }
 
     // negative slot ids have no file name

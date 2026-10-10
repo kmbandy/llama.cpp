@@ -122,6 +122,47 @@ bool older_first(const alias_dir & a, const alias_dir & b) {
     return a.path.filename() < b.path.filename();
 }
 
+// A slot store is a dir with a .last_used marker, or a dir whose entries are all regular
+// files named slot-<id>.wpslot or *.tmp (at least one). Anything else is foreign.
+bool is_slot_store_dir(const fs::path & p, bool & marked, fs::file_time_type & last_used) {
+    marked = false;
+    const fs::path mark = p / LAST_USED;
+    if (is_regular_nofollow(mark)) {
+        std::error_code mec;
+        const fs::file_time_type t = fs::last_write_time(mark, mec);
+        if (!mec) {
+            marked = true;
+            last_used = t;
+            return true;
+        }
+    }
+
+    size_t slot_files = 0;
+    std::error_code ec;
+    fs::directory_iterator it(p, ec);
+    if (ec) {
+        return false;
+    }
+    const fs::directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            return false;
+        }
+        const fs::path e = it->path();
+        if (!is_regular_nofollow(e)) {
+            return false;
+        }
+        const std::string name = e.filename().string();
+        int id = 0;
+        const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
+        if (!parse_slot_name(name, id) && !is_tmp) {
+            return false;
+        }
+        slot_files++;
+    }
+    return slot_files > 0;
+}
+
 fs::path canon(const fs::path & p) {
     std::error_code ec;
     fs::path c = fs::weakly_canonical(p, ec);
@@ -225,11 +266,8 @@ uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir
             return 0;
         }
 
-        uint64_t total = tree_bytes(r);
-        if (total <= budget_bytes) {
-            return 0;
-        }
-
+        // Only slot-store dirs are candidates; foreign dirs are never deleted and never
+        // counted, so the budget applies to slot-store bytes only.
         std::vector<alias_dir> dirs;
         fs::directory_iterator it(r, ec);
         const fs::directory_iterator end;
@@ -249,17 +287,20 @@ uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir
 
             alias_dir a;
             a.path = p;
-            const fs::path mark = p / LAST_USED;
-            if (is_regular_nofollow(mark)) {
-                std::error_code mec;
-                const fs::file_time_type t = fs::last_write_time(mark, mec);
-                if (!mec) {
-                    a.has_mark = true;
-                    a.last_used = t;
-                }
+            if (!is_slot_store_dir(p, a.has_mark, a.last_used)) {
+                LOG_WRN("slot-store: skipping %s: not a slot store\n", p.string().c_str());
+                continue;
             }
             a.bytes = tree_bytes(p);
             dirs.push_back(std::move(a));
+        }
+
+        uint64_t total = 0;
+        for (const alias_dir & a : dirs) {
+            total += a.bytes;
+        }
+        if (total <= budget_bytes) {
+            return 0;
         }
 
         std::sort(dirs.begin(), dirs.end(), older_first);

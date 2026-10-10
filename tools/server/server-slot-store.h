@@ -22,8 +22,10 @@ std::vector<int> slot_store_list(const std::string & dir);
 // alias dir can never redirect writes outside root.
 void slot_store_touch(const std::string & dir);
 
-// Deletes whole alias directories directly under root, least recently used first, until
-// the bytes of regular files under root are <= budget_bytes. A directory without .last_used
-// counts as oldest. Symlinks are never followed or deleted. keep_dir is never deleted.
+// Deletes slot-store dirs directly under root, least recently used first, until the bytes of
+// slot-store dirs under root are <= budget_bytes. A slot-store dir has a .last_used marker, or
+// holds only regular files named slot-<id>.wpslot / *.tmp (at least one). Any other dir is
+// foreign: never deleted and not counted (logged as skipped). An unmarked slot-store dir counts
+// as oldest. Symlinks are never followed or deleted. keep_dir is never deleted.
 // budget_bytes == 0 means unlimited (no-op). Returns the bytes freed.
 uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir, uint64_t budget_bytes);
