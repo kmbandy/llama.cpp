@@ -977,8 +977,8 @@ int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count
     return mode;
 }
 
-int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer) {
-    if (wait_knob_mode() == 0 || shexp == nullptr) {
+int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group) {
+    if (wait_knob_mode() == 0 || shexp == nullptr || group >= 0) {
         return 0;
     }
     const auto it = op_contexts.find(layer * 2);

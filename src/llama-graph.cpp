@@ -1532,6 +1532,13 @@ bool llm_graph_input_dsv4_rowgroup::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
+    // the split plans assume consecutive positions; allow_reuse() does not compare them
+    const llama_ubatch & ub = params.ubatch;
+    res &= ub.pos != nullptr;
+    for (uint32_t i = 1; res && i < ub.n_tokens; ++i) {
+        res &= ub.pos[i] == ub.pos[0] + (llama_pos) i;
+    }
+
     if (inp_pos && inp_pos->buffer) {
         res &= inp_pos->ne[0] == (int64_t) width;
     }
@@ -2134,6 +2141,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
+        if (row_group_idx >= 0) {
+            // WP_SPINE_ROW_GROUPS: tag group-emitted names, e.g. ffn_moe_issued_gA-12
+            const std::string tagged = std::string(name) + (row_group_idx == 0 ? "_gA" : "_gB");
+            cb_func(ubatch, cur, tagged.c_str(), il);
+            return;
+        }
         cb_func(ubatch, cur, name, il);
     }
 }
@@ -2163,7 +2176,7 @@ ggml_tensor * llm_graph_context::shexp_after_issue(ggml_tensor * cur, int il) {
         cb(gated, "ffn_shexp_in", il);
         return gated;
     }
-    gated = expert_dispatch->after_issue(ctx0, gated, il);
+    gated = expert_dispatch->after_issue(ctx0, gated, il, row_group_idx);
     cb(gated, "ffn_shexp_in", il);
     return gated;
 }
@@ -2175,19 +2188,19 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (default off -> mode 0 -> unchanged
         // path below). GGML_OP_WAIT_ADD computes shexp + partial in ONE fp32 add,
         // the same arithmetic and operand order as the ggml_add(shexp, wait) below.
-        const int wait_mode = expert_dispatch->wait_add_mode(shexp, il);
+        const int wait_mode = expert_dispatch->wait_add_mode(shexp, il, row_group_idx);
         if (wait_mode != 0) {
             ggml_tensor * wait = nullptr;
             if (wait_mode == 1) {
                 // Host still blocks and folds, but into the pinned slot; the GPU op
                 // only keeps an ordering edge to this node (never copied).
-                wait = expert_dispatch->build_wait(ctx0, il);
+                wait = expert_dispatch->build_wait(ctx0, il, row_group_idx);
                 ggml_backend_sched_set_tensor_backend(sched, wait, backend_cpu);
                 cb(wait, "ffn_moe_out", il);
-                expert_dispatch->mark_wait_tensor(wait, il);
+                expert_dispatch->mark_wait_tensor(wait, il, row_group_idx);
             }
             ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il);
-            expert_dispatch->note_wait_expanded(ctx0, il);
+            expert_dispatch->note_wait_expanded(ctx0, il, row_group_idx);
             cb(joined, "ffn_out", il);
             return joined;
         }
@@ -2195,11 +2208,11 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         // input. Do NOT after_issue the shexp *output* — that made the GPU
         // FFN a split that finished before wait, so skip-sync only overlapped
         // a 1-element acc with recv.
-        moe_or_issued = expert_dispatch->build_wait(ctx0, il);
+        moe_or_issued = expert_dispatch->build_wait(ctx0, il, row_group_idx);
         ggml_backend_sched_set_tensor_backend(sched, moe_or_issued, backend_cpu);
         cb(moe_or_issued, "ffn_moe_out", il);
-        expert_dispatch->mark_wait_tensor(moe_or_issued, il);
-        expert_dispatch->note_wait_expanded(ctx0, il);
+        expert_dispatch->mark_wait_tensor(moe_or_issued, il, row_group_idx);
+        expert_dispatch->note_wait_expanded(ctx0, il, row_group_idx);
     }
     // shexp first so expand visits the GPU FFN split before CPU wait. The
     // scheduler leaves MAP_CUSTOM2 wait splits unsynced against the previous
@@ -2959,8 +2972,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (n_tokens <= 16 && expert_dispatch->score_summary_enabled()) {
                     expert_dispatch->set_score_probs(il, probs_2d);
                 }
+                // row_group_idx >= 0 (WP_SPINE_ROW_GROUPS): keyed layer*2+group, chunk 0 of 1.
                 moe_out = expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il,
-                                                       dispatch_swiglu_clamp);
+                                                       dispatch_swiglu_clamp, 0, 1, nullptr, nullptr, nullptr,
+                                                       nullptr, 0, row_group_idx);
             }
         } else {
             moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp,
@@ -2969,7 +2984,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
         if (moe_out->op == GGML_OP_MAP_CUSTOM3 || expert_dispatch->is_score_issue_tensor(moe_out)) {
-            expert_dispatch->mark_issue_tensor(moe_out, il, 0);
+            expert_dispatch->mark_issue_tensor(moe_out, il, 0, row_group_idx);
         }
         return moe_out;
     }

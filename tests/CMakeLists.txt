@@ -513,6 +513,13 @@ target_link_libraries(test-dsv4-rowgroup-state PRIVATE llama)
 target_compile_features(test-dsv4-rowgroup-state PRIVATE cxx_std_17)
 llama_test(test-dsv4-rowgroup-state)
 
+# WP_SPINE_ROW_GROUPS (S5): ping-pong emission order, executed on the ggml CPU backend with fake dispatch ops
+add_executable(test-dsv4-rowgroup-order test-dsv4-rowgroup-order.cpp)
+target_include_directories(test-dsv4-rowgroup-order PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-order PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-order PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-order)
+
 # cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
 add_executable(
     test-tp-rank-window

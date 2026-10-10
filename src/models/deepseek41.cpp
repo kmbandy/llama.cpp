@@ -6,7 +6,9 @@
 #include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
+#include "dsv41-row-group-schedule.h"
 #include "llama-mmap.h"
+#include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <atomic>
 #include <algorithm>
@@ -3318,7 +3320,237 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * pre_mix = identity_pre_mix();
     cb(pre_mix, "hc_pre_mix_init", -1);
 
-    for (int il = 0; il < n_layer; ++il) {
+    // WP_SPINE_ROW_GROUPS=2 (S5): two-lane ping-pong trunk. Default off; every
+    // gate below must pass or the single-lane loop runs exactly as before.
+    // Eligibility is a pure function of (env, ubatch shape, graph state), so a
+    // reused graph sees the same decision (the row-group inputs also re-check
+    // their shape in can_reuse).
+    uint32_t rg_k = 0;
+    bool row_groups_active = false;
+    {
+        const char * e = std::getenv("WP_SPINE_ROW_GROUPS");
+        if (e != nullptr && std::strcmp(e, "2") == 0) {
+            uint32_t min_rows = 2;
+            if (const char * m = std::getenv("WP_SPINE_ROW_GROUPS_MIN_ROWS")) {
+                min_rows = (uint32_t) std::max(1, std::atoi(m));
+            }
+            const uint32_t R = (uint32_t) n_tokens;
+            const char * why = nullptr;
+            const auto * rmctx = dynamic_cast<const llama_kv_cache_dsv4_context *>(mctx);
+            const char * wz = std::getenv("WP_WAIT_ZEROCOPY");
+            const char * wg = std::getenv("WP_WAIT_GPU_FLAG");
+            bool consecutive = ubatch.pos != nullptr;
+            for (uint32_t i = 1; consecutive && i < R; ++i) {
+                consecutive = ubatch.pos[i] == ubatch.pos[0] + (llama_pos) i;
+            }
+            bool engram_present = false;
+            for (int il = 0; il < n_layer; ++il) {
+                engram_present |= static_cast<const llama_model_deepseek41 &>(model).engram_index(il) >= 0;
+            }
+            if (params.gtype != LLM_GRAPH_TYPE_DECODER) {
+                why = "not-decoder";
+            } else if (ubatch.embd != nullptr) {
+                why = "embd-ubatch";
+            } else if (ubatch.n_seqs != 1) {
+                why = "multi-seq";
+            } else if (hparams.n_pos_per_embd() != 1) {
+                why = "mrope";
+            } else if (!consecutive) {
+                why = "non-consecutive-pos";
+            } else if (R < 2 * min_rows || R > 16) {
+                why = "rows-out-of-range";
+            } else if (expert_dispatch == nullptr || !moe_dispatch_split_shexp) {
+                why = "no-split-dispatch";
+            } else if (expert_dispatch->dispatch_chunks() != 1) {
+                why = "dispatch-chunks";
+            } else if (expert_dispatch->score_summary_enabled()) {
+                why = "score-summary";
+            } else if (ced_trim || ced_skip_nonfinal) {
+                why = "ced";
+            } else if ((wz != nullptr && wz[0] != '\0' && wz[0] != '0') ||
+                       (wg != nullptr && wg[0] != '\0' && wg[0] != '0')) {
+                why = "wait-zerocopy-or-gpu-flag";
+            } else if (rmctx == nullptr || !rmctx->has_ubatch_state()) {
+                why = "no-ubatch-state (reserve/worst-case graph)";
+            } else if (rmctx->get_csa_plan(ubatch).n_stream != 1) {
+                why = "multi-stream";
+            } else if (engram_present) {
+                why = "engram-layer (S7 not implemented)";
+            }
+            row_groups_active = why == nullptr;
+            if (row_groups_active) {
+                rg_k = (R + 1) / 2;
+            }
+            if (std::getenv("WP_SPINE_ROW_GROUPS_LOG") != nullptr) {
+                static std::string last_reason;
+                const std::string reason = why ? why : "active";
+                if (reason != last_reason) {
+                    last_reason = reason;
+                    LLAMA_LOG_INFO("%s: WP_SPINE_ROW_GROUPS=2 %s R=%u k=%u n_layer=%d reason=%s\n", __func__,
+                            row_groups_active ? "active" : "fallback", R, rg_k, n_layer, reason.c_str());
+                }
+            }
+        }
+    }
+
+    if (row_groups_active) {
+        const uint32_t R = (uint32_t) n_tokens;
+        const uint32_t k = rg_k;
+
+        // Per-lane state. The stash lives in the lane-A slot (dsv41_row_group_state)
+        // and is read by lane B during its attention build.
+        struct rg_lane {
+            dsv41_row_group_state st;
+            llm_graph_input_dsv4_rowgroup * in = nullptr;
+            ggml_tensor * inpL    = nullptr;
+            ggml_tensor * pre_mix = nullptr;
+            // S_pre -> S_post hand-off
+            ggml_tensor * residual = nullptr;
+            ggml_tensor * post     = nullptr;
+            ggml_tensor * comb     = nullptr;
+            ggml_tensor * moe_out  = nullptr;
+            ggml_tensor * shexp    = nullptr;
+            // dsv41_shared_top_k / _src belong to a lane (the index source layer and
+            // the layers that reuse it are in the same lane)
+            ggml_tensor * top_k     = nullptr;
+            int           top_k_src = -1;
+        } lane[2];
+
+        for (int g = 0; g < 2; ++g) {
+            rg_lane & L = lane[g];
+            L.st.group = g;
+            L.st.stash.assign((size_t) n_layer, dsv4_state_tensors{ nullptr, nullptr });
+            L.in = build_inp_dsv4_rowgroup(inp_dsv4, g, k);
+            L.st.inp_pos = L.in->get_inp_pos();
+            const int64_t r0 = (int64_t) L.in->get_r0();
+            const int64_t w  = (int64_t) L.in->get_width();
+            L.inpL    = ggml_view_3d(ctx0, inpL, n_embd, hc, w, inpL->nb[1], inpL->nb[2], r0 * inpL->nb[2]);
+            L.pre_mix = ggml_view_2d(ctx0, pre_mix, pre_mix->ne[0], w, pre_mix->nb[1], r0 * pre_mix->nb[1]);
+        }
+
+        auto enter = [&](int g) {
+            row_group           = &lane[g].st;
+            dsv41_shared_top_k     = lane[g].top_k;
+            dsv41_shared_top_k_src = lane[g].top_k_src;
+            row_group_idx       = g;
+        };
+        auto leave = [&](int g) {
+            lane[g].top_k     = dsv41_shared_top_k;
+            lane[g].top_k_src = dsv41_shared_top_k_src;
+            row_group         = nullptr;
+            row_group_idx     = -1;
+        };
+
+        // S_pre(g,l): attention -> hc_post -> FFN mixes -> router -> issue(g,l) -> shared expert.
+        auto build_pre = [&](int g, int il) {
+            rg_lane & L = lane[g];
+            const auto & layer = model.layers[il];
+
+            ggml_tensor * residual = L.inpL;
+            ggml_tensor * attn_pre = nullptr;
+            ggml_tensor * post     = nullptr;
+            ggml_tensor * comb     = nullptr;
+
+            build_hc_mixes(L.inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+                    &attn_pre, &post, &comb, il);
+
+            ggml_tensor * cur = build_hc_pre(L.inpL, L.pre_mix, il);
+            cb(cur, "hc_attn_pre", il);
+
+            cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+
+            cur = build_attention_v41(model, L.in->facade.get(), cur, L.in->get_inp_pos(), il, nullptr, false);
+
+            L.inpL = build_hc_post(cur, residual, post, comb, il);
+            cb(L.inpL, "hc_attn_post", il);
+
+            residual = L.inpL;
+
+            build_hc_mixes(L.inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+                    &L.pre_mix, &post, &comb, il);
+
+            cur = build_hc_pre(L.inpL, attn_pre, il);
+            cb(cur, "hc_ffn_pre", il);
+
+            ggml_build_forward_expand(gf, residual);
+            ggml_build_forward_expand(gf, post);
+            ggml_build_forward_expand(gf, comb);
+
+            cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
+
+            ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+            if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+                exp_probs_b = layer.ffn_exp_probs_b_vl;
+            }
+
+            ggml_tensor * moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    exp_probs_b,
+                    n_expert, ds41_n_expert_used(hparams, il),
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+            cb(moe_out, "ffn_moe_out", il);
+
+            ggml_tensor * ffn_shexp = build_ffn(shexp_after_issue(cur, il),
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            ggml_build_forward_expand(gf, ffn_shexp);
+
+            L.residual = residual;
+            L.post     = post;
+            L.comb     = comb;
+            L.moe_out  = moe_out;
+            L.shexp    = ffn_shexp;
+        };
+
+        // S_post(g,l): wait(g,l) -> add -> hc_post -> cvec. This is the next layer's input.
+        auto build_post = [&](int g, int il) {
+            rg_lane & L = lane[g];
+            ggml_tensor * cur = complete_moe_dispatch(L.moe_out, L.shexp, il);
+            cb(cur, "ffn_out", il);
+
+            L.inpL = build_hc_post(cur, L.residual, L.post, L.comb, il);
+            L.inpL = build_cvec(L.inpL, il);
+            cb(L.inpL, "l_last", il);
+            ggml_build_forward_expand(gf, L.inpL);
+        };
+
+        for (const dsv41_rg_step & s : dsv41_row_group_schedule(n_layer)) {
+            // layer_inp tap for lane B's layer: A's and B's input rows, concatenated in row order
+            if (s.kind == dsv41_rg_kind::PRE && s.group == 1 &&
+                (size_t) s.layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[s.layer]) {
+                ggml_tensor * whole = ggml_concat(ctx0, lane[0].inpL, lane[1].inpL, 2);
+                res->t_layer_inp[s.layer] = dsv41_hc_mean(ctx0, whole);
+                cb(res->t_layer_inp[s.layer], "layer_inp", s.layer);
+                ggml_build_forward_expand(gf, res->t_layer_inp[s.layer]);
+            }
+
+            enter(s.group);
+            if (s.kind == dsv41_rg_kind::PRE) {
+                build_pre(s.group, s.layer);
+            } else {
+                build_post(s.group, s.layer);
+            }
+            leave(s.group);
+        }
+
+        // Rows back in order for the shared tail (out_ids, output norm, lm_head run once).
+        inpL    = ggml_concat(ctx0, lane[0].inpL, lane[1].inpL, 2);
+        pre_mix = ggml_concat(ctx0, lane[0].pre_mix, lane[1].pre_mix, 1);
+        GGML_ASSERT(inpL->ne[2] == (int64_t) R);
+    }
+
+    for (int il = 0; il < n_layer && !row_groups_active; ++il) {
         // CED prefill trim (WP_DSV41_CED_SKIP_NONFINAL): on a non-final
         // ubatch (nothing reads this graph's output), every decoder-range
         // layer past the seam contributes nothing at all -- whatever it

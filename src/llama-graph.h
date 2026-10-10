@@ -1452,6 +1452,10 @@ struct llm_graph_context {
     // building shexp (wait + add). DS4 and qwen4exp set this.
     bool moe_dispatch_split_shexp = false;
 
+    // WP_SPINE_ROW_GROUPS (S5/S6): row group (0 = A, 1 = B) being emitted by the trunk
+    // builder, or -1. Selects the group dispatch op keys and tags cb() names _gA/_gB.
+    mutable int32_t row_group_idx = -1;
+
     ggml_tensor * shexp_after_issue(ggml_tensor * cur, int il);
 
     ggml_tensor * complete_moe_dispatch(ggml_tensor * moe_or_issued,

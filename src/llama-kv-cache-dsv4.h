@@ -418,6 +418,10 @@ public:
     // for it). Needed to rebuild the group split plans for the live ubatch.
     const std::vector<uint32_t> & get_rs_idx_ubatch() const;
 
+    // WP_SPINE_ROW_GROUPS (S5): false for worst-case/reserve contexts that carry no
+    // per-ubatch state (get_rs_idx_ubatch() would assert). Gates the row-group path.
+    bool has_ubatch_state() const { return status == LLAMA_MEMORY_STATUS_SUCCESS && i_next < rs_idx_ubatches.size(); }
+
 private:
     size_t i_next = 0;
 

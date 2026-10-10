@@ -105,7 +105,8 @@ class graph_dispatcher {
     // build_wait + ggml_add. Decision depends only on (layer, n_tokens, env), so
     // it is reproduced identically by the compute callbacks at run time.
     // 0 = not eligible (use build_wait + ggml_add), 1 = zerocopy, 2 = gpu flag.
-    int           wait_add_mode(const ggml_tensor * shexp, int32_t layer);
+    // group >= 0 (row groups) always returns 0: the zerocopy/gpu-flag slots are per layer.
+    int           wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group = -1);
     // `wait` is the CPU wait node (mode 1) or nullptr (mode 2).
     ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
 
