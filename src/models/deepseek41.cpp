@@ -2467,7 +2467,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             if (row_group->group == 0) {
                 row_group->stash[il] = { state_kv, state_score };
             } else {
-                const dsv4_state_tensors & a = row_group->stash[il];
+                GGML_ASSERT(row_group->peer != nullptr && "row group B: peer (lane A) must be set");
+                const dsv4_state_tensors & a = row_group->peer->stash[il];
                 GGML_ASSERT(a.kv && a.score && "row group B: group A must build this layer's state first");
                 state_kv    = ggml_concat(ctx0, a.kv,    state_kv,    1);
                 state_score = ggml_concat(ctx0, a.score, state_score, 1);
@@ -3401,6 +3402,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             rg_lane & L = lane[g];
             L.st.group = g;
             L.st.stash.assign((size_t) n_layer, dsv4_state_tensors{ nullptr, nullptr });
+            if (g == 1) {
+                L.st.peer = &lane[0].st;
+            }
             L.in = build_inp_dsv4_rowgroup(inp_dsv4, g, k);
             L.st.inp_pos = L.in->get_inp_pos();
             const int64_t r0 = (int64_t) L.in->get_r0();

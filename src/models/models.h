@@ -1480,6 +1480,8 @@ struct dsv41_row_group_state {
     int group = 0;                        // 0 = A, 1 = B
     ggml_tensor * inp_pos = nullptr;      // group RoPE positions, [width]
     std::vector<dsv4_state_tensors> stash; // indexed by layer; written by A, read by B
+    // lane B only: the lane-A state whose stash B reads (A's own stays null)
+    dsv41_row_group_state * peer = nullptr;
 };
 
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
