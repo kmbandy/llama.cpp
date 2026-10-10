@@ -4239,9 +4239,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--slot-autosave"}, "PATH",
         "file to save slot 0 state (KV, draft KV, checkpoints) to on graceful shutdown and restore from at startup (default: disabled)",
         [](common_params & params, const std::string & value) {
+            if (!params.slot_autosave_dir.empty()) {
+                throw std::invalid_argument("--slot-autosave and --slot-autosave-dir are mutually exclusive");
+            }
             params.slot_autosave = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE"));
+    add_opt(common_arg(
+        {"--slot-autosave-dir"}, "DIR",
+        "directory of per-slot state files: every slot's state (KV, draft KV, checkpoints) is saved on graceful shutdown and restored at startup, one file per slot (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (!params.slot_autosave.empty()) {
+                throw std::invalid_argument("--slot-autosave and --slot-autosave-dir are mutually exclusive");
+            }
+            params.slot_autosave_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE_DIR"));
+    add_opt(common_arg(
+        {"--slot-autosave-budget-mb"}, "N",
+        "LRU budget in MiB for the slot autosave directories under the parent of --slot-autosave-dir (default: 0, unlimited)",
+        [](common_params & params, const std::string & value) {
+            // unsigned 64-bit whole MiB; capped so that MiB -> bytes cannot overflow uint64
+            const uint64_t max_mb = UINT64_MAX / (1024ull * 1024ull);
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("--slot-autosave-budget-mb must be a non-negative whole number of MiB");
+            }
+            uint64_t mb = 0;
+            for (const char c : value) {
+                const uint64_t d = (uint64_t) (c - '0');
+                if (mb > (max_mb - d) / 10) {
+                    throw std::invalid_argument("--slot-autosave-budget-mb is too large (max " + std::to_string(max_mb) + ")");
+                }
+                mb = mb * 10 + d;
+            }
+            params.slot_autosave_budget_mb = mb;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE_BUDGET_MB"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
@@ -5597,6 +5630,21 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, TCP port a kind=external worker listens on; only needed when it cannot be read from 'launch' (--listen HOST:PORT or --port N)",
         [](common_params &, int) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_WORKER_PORT").set_preset_only());
+
+    args.push_back(common_arg(
+        {"kv-preserve"}, "DIR",
+        "in server router mode, root directory for this model's slot KV autosave: the child gets\n"
+        "--slot-autosave-dir DIR/<model> (a replica gets its own subdirectory). Cannot be combined\n"
+        "with slot-autosave. Unless stop-timeout is set, the stop-timeout is raised to 60 seconds.",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KV_PRESERVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"kv-preserve-mb"}, "N",
+        "in server router mode, budget in MiB for the kv-preserve directory (the child gets\n"
+        "--slot-autosave-budget-mb N). Needs kv-preserve. 0 = no budget (default).",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_KV_PRESERVE_MB").set_preset_only());
 
     args.push_back(common_arg(
         {"env"}, "K=V[,K=V,-K]",

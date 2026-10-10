@@ -4,6 +4,7 @@
 #include "common.h"
 #include "preset.h"
 
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 
@@ -80,7 +81,85 @@ router_group_section router_group_parse_section(const common_preset & preset, co
         }
         s.worker_port = p;
     }
+    bool has_kv_preserve_mb = false;
+    if (preset.get_option(ROUTER_ARG_KV_PRESERVE_MB, val) && !string_strip(val).empty()) {
+        val = string_strip(val);
+        // the child parses this as uint64 whole MiB; the largest accepted value is the one whose
+        // MiB -> bytes conversion still fits in uint64 (ROUTER_KV_PRESERVE_MB_MAX)
+        bool ok = !val.empty();
+        uint64_t mb = 0;
+        for (char c : val) {
+            if (!ok) {
+                break;
+            }
+            if (c < '0' || c > '9') {
+                ok = false;
+                break;
+            }
+            const uint64_t d = (uint64_t) (c - '0');
+            if (mb > (ROUTER_KV_PRESERVE_MB_MAX - d) / 10) {
+                ok = false; // mb * 10 + d would exceed the cap
+                break;
+            }
+            mb = mb * 10 + d;
+        }
+        if (!ok) {
+            throw std::runtime_error(string_format(
+                "preset '%s': invalid kv-preserve-mb '%s' (must be a non-negative whole number of MiB, at most %llu)",
+                name.c_str(), val.c_str(), (unsigned long long) ROUTER_KV_PRESERVE_MB_MAX));
+        }
+        s.kv_preserve_mb = mb;
+        has_kv_preserve_mb = true;
+    }
+    if (preset.get_option(ROUTER_ARG_KV_PRESERVE, val)) {
+        s.kv_preserve_root = string_strip(val);
+    }
+    if (has_kv_preserve_mb && s.kv_preserve_root.empty()) {
+        throw std::runtime_error(string_format(
+            "preset '%s': kv-preserve-mb needs kv-preserve (a budget with no directory does nothing)",
+            name.c_str()));
+    }
+    if (!s.kv_preserve_root.empty() && !s.slot_autosave.empty()) {
+        throw std::runtime_error(string_format(
+            "preset '%s': kv-preserve and slot-autosave cannot be set together (use one of them)",
+            name.c_str()));
+    }
     return s;
+}
+
+std::string router_kv_preserve_dirname(const std::string & router_name) {
+    std::string out = router_name;
+    for (char & c : out) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '.' || c == '_' || c == '-';
+        if (!ok) {
+            c = '_';
+        }
+    }
+    if (out == "." || out == "..") {
+        out = "_";
+    }
+    return out;
+}
+
+std::vector<std::string> router_kv_preserve_child_args(const std::string & root, const std::string & router_name,
+                                                       uint64_t budget_mb) {
+    std::vector<std::string> args = {
+        CHILD_ARG_SLOT_AUTOSAVE_DIR,
+        root + "/" + router_kv_preserve_dirname(router_name),
+    };
+    if (budget_mb > 0) {
+        args.push_back(CHILD_ARG_SLOT_AUTOSAVE_BUDGET_MB);
+        args.push_back(std::to_string(budget_mb));
+    }
+    return args;
+}
+
+int router_stop_timeout_floor(int current_s, bool has_explicit, bool kv_preserve_applies) {
+    if (has_explicit || !kv_preserve_applies) {
+        return current_s;
+    }
+    return std::max(current_s, ROUTER_KV_PRESERVE_STOP_TIMEOUT_S);
 }
 
 std::map<std::string, std::string> router_groups_resolve(const std::vector<router_group_section> & sections) {
