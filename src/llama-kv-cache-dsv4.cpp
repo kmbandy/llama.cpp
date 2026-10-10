@@ -617,7 +617,8 @@ static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     return ss.str();
 }
 
-llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
+// Pre-padding plan: real entries first, then the overlap/HCA dummy blocks.
+static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan_unpadded(
         const llama_ubatch & ubatch,
         uint32_t ratio,
         bool overlap,
@@ -914,16 +915,30 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         }
     }
 
-    static const bool debug = []() {
-        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
-        return env && atoi(env) > 0;
-    }();
+    return plan;
+}
+
+llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq,
+        const std::vector<uint32_t> & rs_idx) {
+    llama_kv_cache_dsv4_context::comp_plan plan =
+        dsv4_build_comp_plan_unpadded(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx);
 
     const bool pad_compressor_write = ratio != DSV4_CSA_RATIO ||
             !dsv4_csa_lazy_state_enabled() || !plan.state_write_idxs.empty();
     dsv4_pad_live_plan_to_reserve_rank(
             plan, ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, pad_compressor_write);
 
+    static const bool debug = []() {
+        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
+        return env && atoi(env) > 0;
+    }();
     if (debug) {
         LLAMA_LOG_DEBUG("%s: ratio=%u, n_tokens=%u, n_seqs_unq=%u, state_persist_dst=%s, state_write_pos=%s\n",
                 __func__, ratio, ubatch.n_tokens, ubatch.n_seqs_unq,
@@ -938,6 +953,171 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
     }
 
     return plan;
+}
+
+llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq,
+        const std::vector<uint32_t> & rs_idx,
+        uint32_t k) {
+    using comp_plan = llama_kv_cache_dsv4_context::comp_plan;
+
+    const uint32_t R = ubatch.n_tokens;
+    GGML_ASSERT(ubatch.n_seqs_unq == 1 && !dsv4_ubatch_has_coupled(ubatch));
+    GGML_ASSERT(n_stream == 1);
+    GGML_ASSERT(ratio > 0 && k > 0 && k < R);
+    GGML_ASSERT(state_size >= 2*ratio && state_size >= R);
+    for (uint32_t i = 0; i < R; ++i) {
+        GGML_ASSERT(ubatch.pos[i] >= 0 && ubatch.pos[i] == ubatch.pos[0] + (llama_pos) i);
+    }
+
+    const int32_t S          = (int32_t) state_size;
+    const int32_t zero_row   = S + (int32_t) R;      // whole-plan zero sentinel
+    const int64_t scratch_off = (int64_t) S*(1 + n_rs_seq);
+
+    const comp_plan whole  = dsv4_build_comp_plan_unpadded(ubatch, ratio, overlap, state_size, kv_size, 1, n_rs_seq, rs_idx);
+    const comp_plan padded = llama_dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, 1, n_rs_seq, rs_idx);
+
+    llama_dsv4_comp_plan_split res;
+    comp_plan & A = res.a;
+    comp_plan & B = res.b;
+    A.n_stream = B.n_stream = whole.n_stream;
+    A.n_kv     = B.n_kv     = padded.n_kv;
+
+    GGML_ASSERT(whole.state_pos.size() == R && whole.n_visible.size() == R);
+    A.state_pos.assign(whole.state_pos.begin(), whole.state_pos.begin() + k);
+    B.state_pos.assign(whole.state_pos.begin() + k, whole.state_pos.end());
+    A.n_visible.assign(whole.n_visible.begin(), whole.n_visible.begin() + k);
+    B.n_visible.assign(whole.n_visible.begin() + k, whole.n_visible.end());
+
+    // Real blocks come first in the unpadded plan; dummies are dropped and
+    // re-created by the per-group padding below.
+    std::vector<uint32_t> block_row;
+    for (uint32_t i = 0; i < R; ++i) {
+        if ((ubatch.pos[i] + 1) % ratio == 0) {
+            block_row.push_back(i);
+        }
+    }
+    const size_t nb = block_row.size();
+    GGML_ASSERT(whole.state_write_idxs.size() >= nb);
+    const size_t n_half = overlap ? whole.state_read_idxs.size()/2 : 0;
+
+    struct block {
+        int64_t write_idx;
+        int32_t write_pos;
+        std::vector<int32_t> prev; // non-overlap: the only read group
+        std::vector<int32_t> cur;  // overlap only
+    };
+
+    // Map a whole-plan source row to the group's source view. Group A sees
+    // rows [0,k) only, so its zero sentinel moves to state_rows + k.
+    const auto remap = [&](int32_t idx, bool is_a) -> int32_t {
+        if (!is_a) {
+            return idx;
+        }
+        if (idx == zero_row) {
+            return S + (int32_t) k;
+        }
+        GGML_ASSERT(idx < S + (int32_t) k);
+        return idx;
+    };
+
+    std::vector<block> blocks_a;
+    std::vector<block> blocks_b;
+    for (size_t b = 0; b < nb; ++b) {
+        const bool is_a = block_row[b] < k;
+        block bl;
+        bl.write_idx = whole.state_write_idxs[b];
+        bl.write_pos = whole.state_write_pos[b];
+        for (uint32_t j = 0; j < ratio; ++j) {
+            bl.prev.push_back(remap(whole.state_read_idxs[b*ratio + j], is_a));
+        }
+        if (overlap) {
+            for (uint32_t j = 0; j < ratio; ++j) {
+                bl.cur.push_back(remap(whole.state_read_idxs[n_half + b*ratio + j], is_a));
+            }
+        }
+        (is_a ? blocks_a : blocks_b).push_back(bl);
+    }
+
+    const auto emit_blocks = [&](comp_plan & P, const std::vector<block> & real, uint32_t len) {
+        const size_t rank = (len + ratio - 1) / ratio;
+        std::vector<block> rows = real;
+        while (rows.size() < rank) {
+            if (real.empty()) {
+                // Dummy write to the masked last cache slot, zero reads.
+                block dummy;
+                dummy.write_idx = (int64_t) kv_size - 1;
+                dummy.write_pos = 0;
+                dummy.prev.assign(ratio, 0);
+                if (overlap) {
+                    dummy.cur.assign(ratio, 0);
+                }
+                rows.push_back(dummy);
+            } else {
+                rows.push_back(real.back()); // idempotent repeat of the last real block
+            }
+        }
+        for (const block & bl : rows) {
+            P.state_write_idxs.push_back(bl.write_idx);
+            P.state_write_pos.push_back(bl.write_pos);
+        }
+        // Overlap layout: [all prev groups | all cur groups].
+        for (const block & bl : rows) {
+            P.state_read_idxs.insert(P.state_read_idxs.end(), bl.prev.begin(), bl.prev.end());
+        }
+        if (overlap) {
+            for (const block & bl : rows) {
+                P.state_read_idxs.insert(P.state_read_idxs.end(), bl.cur.begin(), bl.cur.end());
+            }
+        }
+    };
+    emit_blocks(A, blocks_a, k);
+    emit_blocks(B, blocks_b, R - k);
+
+    // Persist: src is the token row. S >= R guarantees one slot per token.
+    for (size_t j = 0; j < whole.state_persist_dst_idxs.size(); ++j) {
+        comp_plan & P = whole.state_persist_src_idxs[j] < (int32_t) k ? A : B;
+        P.state_persist_src_idxs.push_back(whole.state_persist_src_idxs[j]);
+        P.state_persist_dst_idxs.push_back(whole.state_persist_dst_idxs[j]);
+    }
+    GGML_ASSERT(A.state_persist_dst_idxs.size() == k && B.state_persist_dst_idxs.size() == R - k);
+
+    // Restore runs once, at the start of group A.
+    A.state_restore_src_idxs = whole.state_restore_src_idxs;
+    A.state_restore_dst_idxs = whole.state_restore_dst_idxs;
+
+    // Snapshot: src in ring or A-scratch goes in the A phase (before A's
+    // persist); B-scratch src goes in the B phase. Each list is padded to the
+    // whole count with repeats, or self-copies if empty.
+    const size_t n_snap = whole.state_snapshot_dst_idxs.size();
+    for (size_t j = 0; j < n_snap; ++j) {
+        const int32_t src = whole.state_snapshot_src_idxs[j];
+        const bool is_a = src < scratch_off || src - scratch_off < (int64_t) k;
+        comp_plan & P = is_a ? A : B;
+        P.state_snapshot_src_idxs.push_back(src);
+        P.state_snapshot_dst_idxs.push_back(whole.state_snapshot_dst_idxs[j]);
+    }
+    for (comp_plan * P : { &A, &B }) {
+        if (n_snap == 0) {
+            break;
+        }
+        if (P->state_snapshot_dst_idxs.empty()) {
+            P->state_snapshot_src_idxs.push_back(S); // self-copy: plane 1, slot 0
+            P->state_snapshot_dst_idxs.push_back(S);
+        }
+        while (P->state_snapshot_dst_idxs.size() < n_snap) {
+            P->state_snapshot_src_idxs.push_back(P->state_snapshot_src_idxs.back());
+            P->state_snapshot_dst_idxs.push_back(P->state_snapshot_dst_idxs.back());
+        }
+    }
+
+    return res;
 }
 
 static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans(

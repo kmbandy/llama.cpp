@@ -458,3 +458,23 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         uint32_t n_stream,
         uint32_t n_rs_seq,
         const std::vector<uint32_t> & rs_idx);
+
+// WP_SPINE_ROW_GROUPS: split of one single-sequence verify ubatch into row
+// group A (rows [0,k)) and group B (rows [k,R)). Each group plan is padded to
+// its own fixed rank. Gated: n_seqs_unq == 1, consecutive pos >= 0,
+// state_size >= max(2*ratio, R), n_stream == 1.
+struct llama_dsv4_comp_plan_split {
+    llama_kv_cache_dsv4_context::comp_plan a;
+    llama_kv_cache_dsv4_context::comp_plan b;
+};
+
+llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq,
+        const std::vector<uint32_t> & rs_idx,
+        uint32_t k);

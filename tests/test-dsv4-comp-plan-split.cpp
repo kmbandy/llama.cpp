@@ -1,0 +1,313 @@
+// T1: WP_SPINE_ROW_GROUPS compressor-plan split. CPU only, no model.
+//
+// Integer-tagged simulation. Each state row carries a tag that names the
+// position it came from. Applying the whole padded plan (oracle) must give
+// the same ring, rollback planes and cache rows as applying the group A
+// plan then the group B plan, with B's commits reading the ring after A's
+// persist. Scratch rows of group B are poisoned until B is computed.
+
+#include "llama-batch.h"
+#include "llama-kv-cache-dsv4.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <vector>
+
+using Tag = int64_t;
+using comp_plan = llama_kv_cache_dsv4_context::comp_plan;
+
+static const Tag ZERO_TAG   = -2;
+static const Tag STALE_TAG  = -1;
+static const Tag POISON_TAG = -999;
+
+struct sim {
+    int32_t S = 0;
+    int32_t n_rs = 0;
+    int32_t R = 0;
+    std::vector<Tag> X;                       // [ring S | planes n_rs*S | scratch R]
+    std::vector<std::vector<Tag>> cache;      // one tuple per cache row
+
+    int64_t scratch_base() const { return (int64_t) S*(1 + n_rs); }
+};
+
+static void fail(const char * msg) {
+    std::fprintf(stderr, "FAIL: %s\n", msg);
+    std::exit(1);
+}
+
+static int64_t mod_pos(int64_t p, int32_t S) {
+    return ((p % S) + S) % S;
+}
+
+static sim make_sim(int32_t S, int32_t n_rs, int32_t R, int32_t kv_size, int64_t p0, bool poison_from_k, int32_t k) {
+    sim s;
+    s.S = S;
+    s.n_rs = n_rs;
+    s.R = R;
+    s.X.assign((size_t) S*(1 + n_rs) + R, 0);
+
+    // Ring: slot r holds the latest pre-ubatch position with pos % S == r.
+    for (int32_t r = 0; r < S; ++r) {
+        Tag t = 900000 + r;
+        for (int64_t q = p0 - 1; q >= 0 && q >= p0 - S; --q) {
+            if (mod_pos(q, S) == r) {
+                t = 1000000 + q;
+                break;
+            }
+        }
+        s.X[r] = t;
+    }
+    for (int32_t d = 1; d <= n_rs; ++d) {
+        for (int32_t r = 0; r < S; ++r) {
+            s.X[(size_t) S*d + r] = 3000000 + (Tag) d*100000 + r;
+        }
+    }
+    for (int32_t j = 0; j < R; ++j) {
+        const bool poisoned = poison_from_k && j >= k;
+        s.X[s.scratch_base() + j] = poisoned ? POISON_TAG : 2000000 + p0 + j;
+    }
+    s.cache.assign((size_t) kv_size, std::vector<Tag>{ STALE_TAG });
+    return s;
+}
+
+// Value of one source row. zero_idx is the group's zero sentinel.
+static Tag src_val(const sim & s, int32_t idx, int32_t zero_idx, int32_t n_scr) {
+    if (idx == zero_idx) {
+        return ZERO_TAG;
+    }
+    if (idx >= 0 && idx < s.S) {
+        return s.X[idx];
+    }
+    if (idx >= s.S && idx < s.S + n_scr) {
+        const Tag t = s.X[s.scratch_base() + (idx - s.S)];
+        if (t == POISON_TAG) {
+            fail("read of a scratch row that is not computed yet");
+        }
+        return t;
+    }
+    fail("source index out of the group's view");
+    return 0;
+}
+
+static void apply_restore(sim & s, const comp_plan & P) {
+    for (size_t j = 0; j < P.state_restore_dst_idxs.size(); ++j) {
+        s.X[P.state_restore_dst_idxs[j]] = s.X[P.state_restore_src_idxs[j]];
+    }
+}
+
+static void apply_commits(sim & s, const comp_plan & P, uint32_t ratio, bool overlap, int32_t n_scr, int32_t zero_idx) {
+    const size_t nb = P.state_write_idxs.size();
+    const size_t half = overlap ? P.state_read_idxs.size()/2 : 0;
+    for (size_t b = 0; b < nb; ++b) {
+        std::vector<Tag> tuple;
+        for (uint32_t j = 0; j < ratio; ++j) {
+            tuple.push_back(src_val(s, P.state_read_idxs[b*ratio + j], zero_idx, n_scr));
+        }
+        if (overlap) {
+            for (uint32_t j = 0; j < ratio; ++j) {
+                tuple.push_back(src_val(s, P.state_read_idxs[half + b*ratio + j], zero_idx, n_scr));
+            }
+        }
+        s.cache[P.state_write_idxs[b]] = tuple;
+    }
+}
+
+// only_src_ok: when non-null, snapshot entries with src >= scratch_off are
+// skipped unless the predicate allows them (used by the phase split).
+static void apply_snapshot(sim & s, const comp_plan & P, bool (*take)(int32_t src, int64_t scratch_off, int32_t k), int32_t k) {
+    for (size_t j = 0; j < P.state_snapshot_dst_idxs.size(); ++j) {
+        const int32_t src = P.state_snapshot_src_idxs[j];
+        if (take != nullptr && !take(src, s.scratch_base(), k)) {
+            continue;
+        }
+        s.X[P.state_snapshot_dst_idxs[j]] = s.X[src];
+    }
+}
+
+static void apply_persist(sim & s, const comp_plan & P, int32_t n_scr_base_tokens) {
+    (void) n_scr_base_tokens;
+    for (size_t j = 0; j < P.state_persist_dst_idxs.size(); ++j) {
+        s.X[P.state_persist_dst_idxs[j]] = s.X[s.scratch_base() + P.state_persist_src_idxs[j]];
+    }
+}
+
+static void apply_whole(sim & s, const comp_plan & P, uint32_t ratio, bool overlap) {
+    apply_restore(s, P);
+    apply_commits(s, P, ratio, overlap, s.R, s.S + s.R);
+    apply_snapshot(s, P, nullptr, 0);
+    apply_persist(s, P, s.R);
+}
+
+static bool take_a(int32_t src, int64_t scratch_off, int32_t k) {
+    return src < scratch_off || src - scratch_off < k;
+}
+static bool take_b(int32_t src, int64_t scratch_off, int32_t k) {
+    return src >= scratch_off && src - scratch_off >= k;
+}
+static bool take_all(int32_t, int64_t, int32_t) {
+    return true;
+}
+
+// Group A: rows [0,k) computed. Order: restore, commits, snapshot, persist.
+// bad_order = 1: persist before snapshot. bad_order = 2: snapshot takes all entries.
+static void apply_group_a(sim & s, const comp_plan & A, uint32_t ratio, bool overlap, int32_t k, int bad_order) {
+    apply_restore(s, A);
+    apply_commits(s, A, ratio, overlap, k, s.S + k);
+    if (bad_order == 1) {
+        apply_persist(s, A, s.R);
+        apply_snapshot(s, A, take_a, k);
+        return;
+    }
+    apply_snapshot(s, A, bad_order == 2 ? take_all : take_a, k);
+    apply_persist(s, A, s.R);
+}
+
+// Group B: rows [k,R) are computed by set_b_rows before this runs.
+static void apply_group_b(sim & s, const comp_plan & B, uint32_t ratio, bool overlap, int32_t k) {
+    apply_commits(s, B, ratio, overlap, s.R, s.S + s.R);
+    apply_snapshot(s, B, take_b, k);
+    apply_persist(s, B, s.R);
+}
+
+static void set_b_rows(sim & s, int64_t p0, int32_t k) {
+    for (int32_t j = k; j < s.R; ++j) {
+        s.X[s.scratch_base() + j] = 2000000 + p0 + j;
+    }
+}
+
+static void compare(const sim & want, const sim & got, const char * what) {
+    for (int32_t r = 0; r < want.S*(1 + want.n_rs); ++r) {
+        if (want.X[r] != got.X[r]) {
+            std::fprintf(stderr, "%s: state index %d differs (want %lld got %lld)\n", what, r,
+                         (long long) want.X[r], (long long) got.X[r]);
+            std::exit(1);
+        }
+    }
+    for (size_t c = 0; c + 1 < want.cache.size(); ++c) {  // last slot is the masked dummy
+        if (want.cache[c] != got.cache[c]) {
+            std::fprintf(stderr, "%s: cache row %zu differs\n", what, c);
+            std::exit(1);
+        }
+    }
+}
+
+static llama_ubatch make_ubatch(std::shared_ptr<llama_ubatch::data_t> & data, int32_t R, int64_t p0) {
+    data = std::make_shared<llama_ubatch::data_t>();
+    data->pos.resize(R);
+    data->n_seq_id.assign(R, 1);
+    data->seq_id_data.assign(R, 0);
+    data->seq_id.resize(R);
+    for (int32_t i = 0; i < R; ++i) {
+        data->pos[i] = (llama_pos) (p0 + i);
+        data->seq_id[i] = &data->seq_id_data[i];
+    }
+    data->seq_id_unq = { 0 };
+    data->seq_idx.assign(1, 0);
+    data->output.assign(R, 0);
+
+    llama_ubatch ub = {};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens = R;
+    ub.n_seq_tokens = R;
+    ub.n_seqs = 1;
+    ub.n_seqs_unq = 1;
+    ub.n_pos = 1;
+    ub.pos = data->pos.data();
+    ub.n_seq_id = data->n_seq_id.data();
+    ub.seq_id = data->seq_id.data();
+    ub.seq_id_unq = data->seq_id_unq.data();
+    ub.seq_idx = data->seq_idx.data();
+    ub.output = data->output.data();
+    ub.data = data;
+    return ub;
+}
+
+int main() {
+    struct cfg {
+        uint32_t ratio;
+        bool     overlap;
+        int32_t  S;
+        int32_t  kv;
+        std::vector<int64_t> p0s;
+    };
+    const std::vector<cfg> cfgs = {
+        { 4,   true,  8,   128, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100, 101, 102, 103, 104, 205 } },
+        { 4,   true,  16,  128, { 0, 3, 7, 101, 203 } },
+        { 128, false, 256, 8,   { 0, 1, 125, 126, 127, 128, 129, 130, 253, 254, 255, 256, 257, 300 } },
+    };
+
+    long n_cases = 0;
+    long n_order_neg = 0;
+
+    for (const cfg & c : cfgs) {
+        for (int32_t R = 4; R <= 8; ++R) {
+            const int32_t k = (R + 1) / 2;
+            // Persist-before-snapshot only shows up when d > R-k, so n_rs goes to 4.
+            for (int32_t n_rs : { 0, 2, 4 }) {
+                for (int32_t rb : { 0, 1, 2 }) {
+                    if (n_rs == 0 && rb > 0) {
+                        continue;
+                    }
+                    for (int64_t p0 : c.p0s) {
+                        std::shared_ptr<llama_ubatch::data_t> data;
+                        llama_ubatch ub = make_ubatch(data, R, p0);
+                        const std::vector<uint32_t> rs_idx = { (uint32_t) rb };
+
+                        const comp_plan whole = llama_dsv4_build_comp_plan(
+                                ub, c.ratio, c.overlap, c.S, c.kv, 1, n_rs, rs_idx);
+                        const llama_dsv4_comp_plan_split sp = llama_dsv4_split_comp_plan(
+                                ub, c.ratio, c.overlap, c.S, c.kv, 1, n_rs, rs_idx, k);
+
+                        sim want = make_sim(c.S, n_rs, R, c.kv, p0, false, k);
+                        apply_whole(want, whole, c.ratio, c.overlap);
+
+                        sim got = make_sim(c.S, n_rs, R, c.kv, p0, true, k);
+                        apply_group_a(got, sp.a, c.ratio, c.overlap, k, 0);
+                        set_b_rows(got, p0, k);
+                        apply_group_b(got, sp.b, c.ratio, c.overlap, k);
+                        compare(want, got, "partitioned vs whole");
+
+                        // Negative check: persist before snapshot must change the
+                        // planes for some case (aggregated below).
+                        if (n_rs > 0) {
+                            sim bad = make_sim(c.S, n_rs, R, c.kv, p0, true, k);
+                            apply_group_a(bad, sp.a, c.ratio, c.overlap, k, 1);
+                            set_b_rows(bad, p0, k);
+                            apply_group_b(bad, sp.b, c.ratio, c.overlap, k);
+                            for (int32_t r = 0; r < c.S*(1 + n_rs); ++r) {
+                                if (bad.X[r] != want.X[r]) {
+                                    ++n_order_neg;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Fixed rank per group: A has ceil(k/ratio) write blocks and k
+                        // persist rows; B has ceil((R-k)/ratio) and R-k.
+                        const size_t rank_a = (k + c.ratio - 1) / c.ratio;
+                        const size_t rank_b = (R - k + c.ratio - 1) / c.ratio;
+                        if (sp.a.state_write_idxs.size() != rank_a || sp.b.state_write_idxs.size() != rank_b) {
+                            fail("write rank is not the per-group reserve rank");
+                        }
+                        if (sp.a.state_pos.size() != (size_t) k || sp.b.state_pos.size() != (size_t) (R - k)) {
+                            fail("state_pos slice has the wrong size");
+                        }
+                        ++n_cases;
+                    }
+                }
+            }
+        }
+    }
+
+    if (n_cases == 0) {
+        fail("no cases ran");
+    }
+    if (n_order_neg == 0) {
+        fail("persist-before-snapshot never changed the planes: the negative check is blind");
+    }
+    std::printf("PASS: %ld partitioned-vs-whole cases; persist-before-snapshot detected in %ld cases\n",
+                n_cases, n_order_neg);
+    return 0;
+}
