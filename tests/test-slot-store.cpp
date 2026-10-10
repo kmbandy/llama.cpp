@@ -1,6 +1,8 @@
 // Tests for the per-alias slot store helper (tools/server/server-slot-store.cpp).
 
 #include "server-slot-store.h"
+#include "arg.h"
+#include "common.h"
 
 #undef NDEBUG
 #include <cassert>
@@ -29,7 +31,49 @@ static void mark_used(const fs::path & dir, fs::file_time_type t) {
     fs::last_write_time(m, t);
 }
 
+// parses server-example args (no model needed); returns the parser verdict
+static bool parse_server_args(const std::vector<std::string> & args, common_params & p) {
+    std::vector<std::string> argv = {"test-slot-store"};
+    argv.insert(argv.end(), args.begin(), args.end());
+    std::vector<char *> ptrs;
+    for (auto & a : argv) {
+        ptrs.push_back(a.data());
+    }
+    return common_params_parse((int) ptrs.size(), ptrs.data(), p, LLAMA_EXAMPLE_SERVER);
+}
+
+static void test_slot_autosave_dir_flags() {
+    {
+        common_params p;
+        assert(parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir"}, p));
+        assert(p.slot_autosave_dir == "/tmp/kvp-dir");
+        assert(p.slot_autosave.empty());
+        assert(p.slot_autosave_budget_mb == 0); // default: unlimited
+    }
+    {
+        common_params p;
+        assert(parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "64"}, p));
+        assert(p.slot_autosave_budget_mb == 64);
+    }
+    // mutually exclusive with --slot-autosave, in either order
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave", "/tmp/a.slot", "--slot-autosave-dir", "/tmp/kvp-dir"}, p));
+    }
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave", "/tmp/a.slot"}, p));
+    }
+    // negative budget is rejected
+    {
+        common_params p;
+        assert(!parse_server_args({"--slot-autosave-dir", "/tmp/kvp-dir", "--slot-autosave-budget-mb", "-1"}, p));
+    }
+}
+
 int main() {
+    test_slot_autosave_dir_flags();
+
     const fs::path root_base = fs::temp_directory_path() /
         ("slot-store-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;

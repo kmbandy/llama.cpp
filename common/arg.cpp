@@ -4239,9 +4239,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--slot-autosave"}, "PATH",
         "file to save slot 0 state (KV, draft KV, checkpoints) to on graceful shutdown and restore from at startup (default: disabled)",
         [](common_params & params, const std::string & value) {
+            if (!params.slot_autosave_dir.empty()) {
+                throw std::invalid_argument("--slot-autosave and --slot-autosave-dir are mutually exclusive");
+            }
             params.slot_autosave = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE"));
+    add_opt(common_arg(
+        {"--slot-autosave-dir"}, "DIR",
+        "directory of per-slot state files: every slot's state (KV, draft KV, checkpoints) is saved on graceful shutdown and restored at startup, one file per slot (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (!params.slot_autosave.empty()) {
+                throw std::invalid_argument("--slot-autosave and --slot-autosave-dir are mutually exclusive");
+            }
+            params.slot_autosave_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE_DIR"));
+    add_opt(common_arg(
+        {"--slot-autosave-budget-mb"}, "N",
+        "LRU budget in MiB for the slot autosave directories under the parent of --slot-autosave-dir (default: 0, unlimited)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-autosave-budget-mb must be >= 0");
+            }
+            params.slot_autosave_budget_mb = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_AUTOSAVE_BUDGET_MB"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",

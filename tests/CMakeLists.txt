@@ -209,6 +209,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-slot-store.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-slot-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-slot-store PRIVATE llama-server-impl)
+    target_link_libraries(test-slot-store PRIVATE llama-common)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)

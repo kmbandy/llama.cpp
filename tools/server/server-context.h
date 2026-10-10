@@ -102,6 +102,9 @@ struct server_context {
     // restore: after load_model(), before reporting ready. save: after start_loop() returned.
     void slot_autorestore();
     void slot_autosave();
+    // --slot-autosave-dir: one file per slot under params.slot_autosave_dir. same call points.
+    void slot_autorestore_all();
+    void slot_autosave_all();
 
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread

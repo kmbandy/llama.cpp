@@ -660,6 +660,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
 
         routes.update_meta(ctx_server);
         ctx_server.slot_autorestore(); // MAD-LAB: before is_ready, so the first request sees the restored slot
+        ctx_server.slot_autorestore_all(); // MAD-LAB: --slot-autosave-dir, no-op unless set
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
@@ -710,6 +711,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_server.start_loop();
 
         ctx_server.slot_autosave(); // MAD-LAB: queue is stopped, slots are quiescent
+        ctx_server.slot_autosave_all(); // MAD-LAB: --slot-autosave-dir, no-op unless set
 
         clean_up();
         ctx_http.join();
