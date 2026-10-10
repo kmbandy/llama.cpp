@@ -1,6 +1,7 @@
 #include "pipe-expert-dispatch-graph.h"
 #include "pipe-prefetch-hints.h"
 #include "pipe-issue-trace.h"
+#include "pipe-wait-slot-key.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -937,8 +938,10 @@ static int32_t wait_timeout_ms() {
     return v;
 }
 
-graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int64_t n_floats, bool create) {
-    const auto it = wait_slots_.find(layer);
+graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int32_t group, int64_t n_floats,
+                                                              bool create) {
+    const int32_t key = wait_slot_key(layer, group);
+    const auto it = wait_slots_.find(key);
     if (it != wait_slots_.end()) {
         return (size_t) n_floats <= it->second.cap_floats ? &it->second : nullptr;
     }
@@ -957,17 +960,19 @@ graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int
     slot.ctrl       = static_cast<ggml_wait_ctrl *>(mem);
     slot.data       = reinterpret_cast<float *>(static_cast<char *>(mem) + sizeof(ggml_wait_ctrl));
     slot.cap_floats = cap_floats;
-    return &wait_slots_.emplace(layer, slot).first->second;
+    slot.layer      = layer;
+    slot.group      = group;
+    return &wait_slots_.emplace(key, slot).first->second;
 }
 
 int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out,
                                 int32_t group) {
     const int mode = wait_knob_mode();
-    if (mode == 0 || group >= 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
+    if (mode == 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
         n_tokens > wait_slot_tokens()) {
         return 0;
     }
-    wait_slot * slot = wait_slot_for(layer, n_tokens * (int64_t) remote.n_embd(), false);
+    wait_slot * slot = wait_slot_for(layer, group, n_tokens * (int64_t) remote.n_embd(), false);
     if (slot == nullptr) {
         return 0;
     }
@@ -978,10 +983,10 @@ int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count
 }
 
 int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group) {
-    if (wait_knob_mode() == 0 || shexp == nullptr || group >= 0) {
+    if (wait_knob_mode() == 0 || shexp == nullptr) {
         return 0;
     }
-    const auto it = op_contexts.find(layer * 2);
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr ||
         it->second->chunk_count != 1) {
         return 0;
@@ -993,16 +998,16 @@ int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer, in
         return 0;
     }
     // Creates the slot (build time, dispatch thread); wait_mode() then resolves it.
-    if (wait_slot_for(layer, shexp->ne[0] * shexp->ne[1], true) == nullptr) {
+    if (wait_slot_for(layer, group, shexp->ne[0] * shexp->ne[1], true) == nullptr) {
         return 0;
     }
-    return wait_mode(layer, shexp->ne[1], 1, nullptr);
+    return wait_mode(layer, shexp->ne[1], 1, nullptr, group);
 }
 
 ggml_tensor * graph_dispatcher::build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait,
-                                               int32_t layer) {
+                                               int32_t layer, int32_t group) {
     wait_slot * slot = nullptr;
-    const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot);
+    const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot, group);
     GGML_ASSERT(mode != 0 && slot != nullptr);
     // mode 1: ctrl == nullptr (no device wait; the host already folded into the
     // slot before the consuming split runs) and `wait` is the ordering edge.
@@ -1090,7 +1095,9 @@ void graph_dispatcher::check_wait_gpu_failures() {
             __atomic_store_n(&ctrl->fail, (uint64_t) 0, __ATOMIC_RELEASE);
             const std::string message = "expert dispatch: GPU timed out (" + std::to_string(wait_timeout_ms()) +
                                         " ms) waiting for the remote partial of layer " +
-                                        std::to_string(entry.first) + " (WP_WAIT_GPU_FLAG); output is invalid";
+                                        std::to_string(entry.second.layer) +
+                                        (entry.second.group >= 0 ? " group " + std::to_string(entry.second.group) : std::string()) +
+                                        " (WP_WAIT_GPU_FLAG); output is invalid";
             std::fprintf(stderr, "%s\n", message.c_str());
             latch_failure(message.c_str());
         }

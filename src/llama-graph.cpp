@@ -2199,7 +2199,7 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
                 cb(wait, "ffn_moe_out", il);
                 expert_dispatch->mark_wait_tensor(wait, il, row_group_idx);
             }
-            ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il);
+            ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il, row_group_idx);
             expert_dispatch->note_wait_expanded(ctx0, il, row_group_idx);
             cb(joined, "ffn_out", il);
             return joined;

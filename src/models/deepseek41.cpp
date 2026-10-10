@@ -3299,7 +3299,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             const uint32_t R = (uint32_t) n_tokens;
             const char * why = nullptr;
             const auto * rmctx = dynamic_cast<const llama_kv_cache_dsv4_context *>(mctx);
-            const char * wz = std::getenv("WP_WAIT_ZEROCOPY");
+            // WP_WAIT_ZEROCOPY is supported per (layer, group) slot; WP_WAIT_GPU_FLAG
+            // (spin-on-flag, background fold) still falls back.
             const char * wg = std::getenv("WP_WAIT_GPU_FLAG");
             bool consecutive = ubatch.pos != nullptr;
             for (uint32_t i = 1; consecutive && i < R; ++i) {
@@ -3325,8 +3326,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 why = "score-summary";
             } else if (ced_trim || ced_skip_nonfinal) {
                 why = "ced";
-            } else if ((wz != nullptr && wz[0] != '\0' && wz[0] != '0') ||
-                       (wg != nullptr && wg[0] != '\0' && wg[0] != '0')) {
+            } else if (wg != nullptr && wg[0] != '\0' && wg[0] != '0') {
                 why = "wait-zerocopy-or-gpu-flag";
             } else if (rmctx == nullptr || !rmctx->has_ubatch_state()) {
                 why = "no-ubatch-state (reserve/worst-case graph)";

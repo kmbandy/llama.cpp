@@ -527,6 +527,12 @@ target_link_libraries(test-dsv4-rowgroup-engram PRIVATE llama)
 target_compile_features(test-dsv4-rowgroup-engram PRIVATE cxx_std_17)
 llama_test(test-dsv4-rowgroup-engram)
 
+# WP_WAIT_ZEROCOPY per-(layer, group) pinned wait-slot keys (pure keying logic).
+add_executable(test-dsv4-rowgroup-wait-slot test-dsv4-rowgroup-wait-slot.cpp)
+target_include_directories(test-dsv4-rowgroup-wait-slot PRIVATE ${CMAKE_SOURCE_DIR}/src/pipeline)
+target_compile_features(test-dsv4-rowgroup-wait-slot PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-wait-slot)
+
 # cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
 add_executable(
     test-tp-rank-window

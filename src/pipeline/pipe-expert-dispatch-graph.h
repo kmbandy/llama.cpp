@@ -105,10 +105,11 @@ class graph_dispatcher {
     // build_wait + ggml_add. Decision depends only on (layer, n_tokens, env), so
     // it is reproduced identically by the compute callbacks at run time.
     // 0 = not eligible (use build_wait + ggml_add), 1 = zerocopy, 2 = gpu flag.
-    // group >= 0 (row groups) always returns 0: the zerocopy/gpu-flag slots are per layer.
+    // group >= 0 (row groups) resolves the per-(layer, group) slot, see wait_slot_key().
     int           wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group = -1);
     // `wait` is the CPU wait node (mode 1) or nullptr (mode 2).
-    ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
+    ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer,
+                                 int32_t group = -1);
 
     // group = -1: legacy per-layer order check. group 0/1: independent check
     // per row group (WP_SPINE_ROW_GROUPS), so A(l) and B(l) may interleave.
@@ -331,6 +332,8 @@ class graph_dispatcher {
         float *            data = nullptr;   // n_embd * cap_tokens floats, mapped coherent pinned
         ggml_wait_ctrl *   ctrl = nullptr;   // 64 B handshake block, same allocation
         size_t             cap_floats = 0;
+        int32_t            layer = -1;       // for diagnostics
+        int32_t            group = -1;       // -1 = whole layer, 0/1 = row group
         uint64_t           seq = 0;          // epoch counter (dispatch thread only)
     };
     struct wait_job {
@@ -340,9 +343,9 @@ class graph_dispatcher {
         int64_t      n_tokens = 0;
     };
     // 0 = legacy, 1 = zerocopy, 2 = gpu flag; also resolves the slot.
-    // Row-group contexts (group >= 0) always use the legacy wait.
+    // Row groups resolve their own slot keyed by (layer, group) (wait_slot_key).
     int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out, int32_t group = -1);
-    wait_slot * wait_slot_for(int32_t layer, int64_t n_floats, bool create);
+    wait_slot * wait_slot_for(int32_t layer, int32_t group, int64_t n_floats, bool create);
     // Body shared by compute_wait (host blocking; dst is the CPU wait node) and the
     // background job (dst == nullptr, bg == true). zc_out != nullptr redirects the
     // folded result into the pinned slot instead of dst->data.
@@ -354,7 +357,7 @@ class graph_dispatcher {
     void wait_drain();                 // dispatch thread: block until every queued job is published+done
     void wait_stop_thread() noexcept;
     void check_wait_gpu_failures();    // dispatch thread: GPU spin timeouts -> latch_failure
-    std::map<int32_t, wait_slot>      wait_slots_;
+    std::map<int32_t, wait_slot>      wait_slots_;   // key = wait_slot_key(layer, group)
     std::thread                       wait_thread_;
     std::mutex                        wait_mu_;
     std::condition_variable           wait_cv_;
