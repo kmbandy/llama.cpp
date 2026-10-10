@@ -7,6 +7,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
 #include "dsv41-row-group-schedule.h"
+#include "dsv41-engram-mix.h"
 #include "llama-mmap.h"
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
@@ -1064,59 +1065,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
         return x;
     }
     const int64_t hc     = hparams.dsv4_hc_mult;
-    const int64_t hc_dim = hc*n_embd;
     const int64_t nt     = x->ne[2];
 
     // one projection makes a key per hc copy plus one value they all share
     ggml_tensor * kv = build_lora_mm(model.layers[il].engram_wkv, emb);
     cb(kv, "engram_kv", il);
 
-    // Built as [n_embd, hc, nt] tensors straight away, never through a reshape of an
-    // intermediate: gallocr only reuses a parent in place when it is not a view, and every
-    // [n_embd, hc, nt] f32 copy is 640 MiB at ubatch 8192.
-    ggml_tensor * key   = ggml_cont_3d(ctx0, ggml_view_2d(ctx0, kv, hc_dim, nt, kv->nb[1], 0), n_embd, hc, nt);
-    ggml_tensor * value = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[1], hc_dim*kv->nb[0]));
-    // Pin the order: both copies out of kv first so kv dies before the norms, and the gate
-    // before the value's repeat below, so at most three [n_embd, hc, nt] tensors are live.
-    ggml_build_forward_expand(gf, value);
-    ggml_build_forward_expand(gf, key);
-
-    // The gate scales reach ggml_mul, which takes only f32, and a file quantized before
-    // llama-quant.cpp learned to skip them carries them quantized. get_rows dequantizes.
-    auto as_f32 = [&](ggml_tensor * w) {
-        if (w->type == GGML_TYPE_F32) {
-            return w;
-        }
-        ggml_tensor * ids = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) w->ne[1], 1.0f), GGML_TYPE_I32);
-        return ggml_get_rows(ctx0, w, ids);
-    };
-
-    // normalized per (token, hc copy) over n_embd, not jointly over the copies. The reference
-    // keeps engram_q and engram_k apart but only ever uses their product, so applying one to each
-    // side of the dot product gives the same result.
-    auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
-        GGML_ASSERT(t->ne[0] == n_embd && t->ne[1] == hc && t->ne[2] == nt);
-        t = ggml_rms_norm(ctx0, t, norm_rms_eps);
-        return ggml_mul(ctx0, t, ggml_reshape_3d(ctx0, w, n_embd, hc, 1));
-    };
-
-    ggml_tensor * k = grouped_norm(key, as_f32(model.layers[il].engram_k));
-    ggml_tensor * q = grouped_norm(x,   as_f32(model.layers[il].engram_q));
-
-    ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
-    s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));
-
-    // signed square root before the sigmoid, matching the training kernel.
-    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
+    // the mix itself lives in dsv41-engram-mix.h (shared with test-dsv4-rowgroup-engram)
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * out = dsv41_engram_mix(ctx0, gf, x, kv,
+            model.layers[il].engram_k, model.layers[il].engram_q,
+            n_embd, hc, norm_rms_eps, &gate);
     cb(gate, "engram_gate", il);
-    ggml_build_forward_expand(gf, gate);
-
-    // the value is shared across the copies, only the gate differs
-    ggml_tensor * v = ggml_reshape_3d(ctx0, value, n_embd, 1, nt);
-    v = ggml_repeat_4d(ctx0, v, n_embd, hc, nt, 1);
-
-    return ggml_add(ctx0, x, ggml_mul(ctx0, v, gate));
+    GGML_ASSERT(out->ne[2] == nt);
+    return out;
 }
 
 // Rope settings for one layer. A layer that reads a compressed stream rotates with the
@@ -3343,10 +3305,6 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             for (uint32_t i = 1; consecutive && i < R; ++i) {
                 consecutive = ubatch.pos[i] == ubatch.pos[0] + (llama_pos) i;
             }
-            bool engram_present = false;
-            for (int il = 0; il < n_layer; ++il) {
-                engram_present |= static_cast<const llama_model_deepseek41 &>(model).engram_index(il) >= 0;
-            }
             if (params.gtype != LLM_GRAPH_TYPE_DECODER) {
                 why = "not-decoder";
             } else if (ubatch.embd != nullptr) {
@@ -3374,8 +3332,6 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 why = "no-ubatch-state (reserve/worst-case graph)";
             } else if (rmctx->get_csa_plan(ubatch).n_stream != 1) {
                 why = "multi-stream";
-            } else if (engram_present) {
-                why = "engram-layer (S7 not implemented)";
             }
             row_groups_active = why == nullptr;
             if (row_groups_active) {
@@ -3441,10 +3397,24 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             row_group_idx     = -1;
         };
 
+        // S7: engram lookup for all R rows of the current layer (built at PRE(A,il), read by PRE(B,il))
+        ggml_tensor * rg_engram_emb = nullptr;
         // S_pre(g,l): attention -> hc_post -> FFN mixes -> router -> issue(g,l) -> shared expert.
         auto build_pre = [&](int g, int il) {
             rg_lane & L = lane[g];
             const auto & layer = model.layers[il];
+
+            // S7: the engram sits before the block and writes into the stream. The gather was
+            // built once for all R rows at PRE(A,il); each lane mixes its own row slice in.
+            if (static_cast<const llama_model_deepseek41 &>(model).engram_index(il) >= 0) {
+                GGML_ASSERT(rg_engram_emb != nullptr);
+                const int64_t r0 = (int64_t) L.in->get_r0();
+                const int64_t w  = (int64_t) L.in->get_width();
+                ggml_tensor * emb_g = ggml_view_2d(ctx0, rg_engram_emb, rg_engram_emb->ne[0], w,
+                        rg_engram_emb->nb[1], r0 * rg_engram_emb->nb[1]);
+                L.inpL = build_engram(model, L.inpL, emb_g, il);
+                cb(L.inpL, "engram_out", il);
+            }
 
             ggml_tensor * residual = L.inpL;
             ggml_tensor * attn_pre = nullptr;
@@ -3525,11 +3495,22 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             ggml_build_forward_expand(gf, L.inpL);
         };
 
+        // the layer input of lane A, captured before PRE(A,il) overwrites lane[0].inpL
+        ggml_tensor * rg_tap_a = nullptr;
+
         for (const dsv41_rg_step & s : dsv41_row_group_schedule(n_layer)) {
-            // layer_inp tap for lane B's layer: A's and B's input rows, concatenated in row order
-            if (s.kind == dsv41_rg_kind::PRE && s.group == 1 &&
-                (size_t) s.layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[s.layer]) {
-                ggml_tensor * whole = ggml_concat(ctx0, lane[0].inpL, lane[1].inpL, 2);
+            const bool tap_layer = (size_t) s.layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[s.layer];
+            if (s.kind == dsv41_rg_kind::PRE && s.group == 0) {
+                if (tap_layer) {
+                    rg_tap_a = lane[0].inpL;
+                }
+                if (static_cast<const llama_model_deepseek41 &>(model).engram_index(s.layer) >= 0) {
+                    rg_engram_emb = build_inp_engram(model, s.layer);
+                }
+            }
+            // layer_inp tap for lane B's layer: A's and B's layer-input rows, concatenated in row order
+            if (s.kind == dsv41_rg_kind::PRE && s.group == 1 && tap_layer) {
+                ggml_tensor * whole = ggml_concat(ctx0, rg_tap_a, lane[1].inpL, 2);
                 res->t_layer_inp[s.layer] = dsv41_hc_mean(ctx0, whole);
                 cb(res->t_layer_inp[s.layer], "layer_inp", s.layer);
                 ggml_build_forward_expand(gf, res->t_layer_inp[s.layer]);
