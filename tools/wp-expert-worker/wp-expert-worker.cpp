@@ -28066,6 +28066,9 @@ void note_frame_residency(int type, uint64_t ns) {
 // blocks on a full queue rather than dropping a frame (dropping would break
 // FIFO ordering and silently desync the wire).
 constexpr size_t WP_WORKER_PIPELINE_QUEUE_DEPTH      = 2;
+// WP_WORKER_TWO_IN_FLIGHT only: frame queue depth (N+1 read-ahead plus room for
+// PREFETCH_HINT frames ahead of the REQ). Byte cap still applies.
+constexpr size_t WP_WORKER_TWO_IN_FLIGHT_QUEUE_DEPTH = 8;
 constexpr size_t WP_WORKER_PIPELINE_MAX_QUEUED_BYTES = 256ull * 1024 * 1024;
 
 // DEFAULT ON as of 2026-09-22 -- this is no longer a pure perf knob. Root
@@ -28387,6 +28390,24 @@ public:
         }
         out = &items_.front().item;
         return true;
+    }
+
+    // Consumer only. Like peek(), but skips leading items for which skip(item)
+    // is true, examining at most max_scan items from the front. On success `out`
+    // points at the first non-skipped item (valid until the next pop()). Nothing
+    // is moved or removed, so skipped items are still popped in queue order.
+    // Returns false if no non-skipped item lies within the scan window.
+    template <typename Pred>
+    bool peek_past(Pred skip, size_t max_scan, const T *& out) {
+        auto lock = wp_lock_timed(mu_);
+        const size_t n = items_.size() < max_scan ? items_.size() : max_scan;
+        for (size_t i = 0; i < n; ++i) {
+            if (!skip(items_[i].item)) {
+                out = &items_[i].item;
+                return true;
+            }
+        }
+        return false;
     }
 
     // Returns false once the queue is closed AND drained -- exactly the
@@ -29096,8 +29117,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     WpActivationPool activation_pool;
     // WP_WORKER_TWO_IN_FLIGHT: one more frame of read-ahead so N+2 can sit in the
     // queue while N+1 is prepared. Default depth otherwise.
+    // Under the knob the queue also carries PREFETCH_HINT frames, which can fill
+    // the depth ahead of the next DISPATCH_REQ; the lookahead peek skips them, so
+    // the depth is raised to WP_WORKER_TWO_IN_FLIGHT_QUEUE_DEPTH (knob only).
     const size_t frame_queue_depth = (pipeline_on && wp_worker_two_in_flight_enabled())
-        ? WP_WORKER_PIPELINE_QUEUE_DEPTH + 1 : WP_WORKER_PIPELINE_QUEUE_DEPTH;
+        ? WP_WORKER_TWO_IN_FLIGHT_QUEUE_DEPTH : WP_WORKER_PIPELINE_QUEUE_DEPTH;
     WpPipelineQueue<WpPipelineFrame>    pipeline_frames(frame_queue_depth);
     WpPipelineQueue<WpPipelineResponse> pipeline_responses(WP_WORKER_PIPELINE_QUEUE_DEPTH);
     pipeline_frames.set_byte_cap(WP_WORKER_PIPELINE_MAX_QUEUED_BYTES);
@@ -29250,8 +29274,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     if (lookahead_on) {
         worker.lookahead_install(
             [&pipeline_frames, &stream_dispatch](DeviceWorker::LookaheadPeek & pk) {
+                // Look past leading well-formed PREFETCH_HINT frames to the first
+                // frame that can be a lookahead candidate (the REQ). Hints are not
+                // consumed here; they are still processed in queue order when popped.
                 const WpPipelineFrame * f = nullptr;
-                if (!pipeline_frames.peek(f) || f == nullptr) {
+                const auto is_hint = [](const WpPipelineFrame & x) {
+                    return x.ok && x.type == PIPE_EXPERT_PREFETCH_HINT;
+                };
+                if (!pipeline_frames.peek_past(is_hint, WP_WORKER_TWO_IN_FLIGHT_QUEUE_DEPTH, f) ||
+                        f == nullptr) {
                     return;
                 }
                 pk.present     = true;
