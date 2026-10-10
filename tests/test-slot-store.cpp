@@ -376,6 +376,53 @@ int main() {
     // negative slot ids have no file name
     assert(slot_store_file("/x/alias", -1).empty());
 
+    // ensure_dir: creates a missing nested alias dir (save path runs before any touch)
+    {
+        const fs::path r = root / "ensure-nested";
+        const fs::path d = r / "a" / "b" / "alias";
+        assert(!fs::exists(d));
+        assert(slot_store_ensure_dir(d.string()));
+        assert(fs::is_directory(d) && !fs::is_symlink(d));
+        assert(fs::is_directory(d.parent_path()));
+    }
+
+    // ensure_dir: refuses a symlinked alias dir and creates nothing behind it
+    {
+        const fs::path outside = root_base / "ensure-link-target";
+        fs::create_directories(outside);
+        const fs::path r = root / "ensure-link";
+        fs::create_directories(r);
+        fs::create_directory_symlink(outside, r / "link");
+
+        assert(!slot_store_ensure_dir((r / "link").string()));
+        assert(!slot_store_ensure_dir((r / "link").string() + "/"));
+        assert(!slot_store_ensure_dir((r / "link").string() + "/."));
+        assert(fs::is_symlink(r / "link"));
+        assert(fs::is_empty(outside));
+    }
+
+    // ensure_dir: refuses the filesystem root and empty / "." names
+    {
+        assert(!slot_store_ensure_dir("/"));
+        assert(!slot_store_ensure_dir("//"));
+        assert(!slot_store_ensure_dir(""));
+        assert(!slot_store_ensure_dir("."));
+        assert(!fs::exists("/.last_used"));
+    }
+
+    // ensure_dir: idempotent on an existing plain dir, keeps its contents
+    {
+        const fs::path d = root / "ensure-existing" / "alias";
+        fs::create_directories(d);
+        write_bytes(d / "slot-0.wpslot", 10);
+
+        assert(slot_store_ensure_dir(d.string()));
+        assert(slot_store_ensure_dir(d.string()));
+        assert(slot_store_ensure_dir(d.string() + "/"));
+        assert(fs::is_regular_file(d / "slot-0.wpslot"));
+        assert(fs::is_directory(d));
+    }
+
     fs::remove_all(root_base, ec);
     return 0;
 }

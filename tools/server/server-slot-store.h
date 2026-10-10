@@ -29,6 +29,13 @@ void slot_store_touch(const std::string & dir);
 // is not a symlink. The save path refuses (logs, writes nothing) when this is false.
 bool slot_store_alias_dir_ok(const std::string & dir);
 
+// Makes dir exist as a plain directory before a save writes into it. Refuses (logs, creates
+// nothing) when slot_store_alias_dir_ok(dir) is false, creates the directory and all missing
+// parents, then re-runs the same check on the created dir in case a race planted a symlink.
+// Returns true only when dir is a plain directory afterwards. Idempotent on an existing dir.
+// Never throws.
+bool slot_store_ensure_dir(const std::string & dir);
+
 // Deletes slot-store dirs directly under root, least recently used first, until the bytes of
 // slot-store dirs under root are <= budget_bytes. A slot-store dir is one in which EVERY entry is
 // a regular file named .last_used, slot-<id>.wpslot or slot-<id>.wpslot.tmp, holding at least one

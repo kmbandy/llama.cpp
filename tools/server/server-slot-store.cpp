@@ -308,6 +308,37 @@ bool slot_store_alias_dir_ok(const std::string & dir) {
     return !is_symlink_nofollow(d);
 }
 
+bool slot_store_ensure_dir(const std::string & dir) {
+    try {
+        if (!slot_store_alias_dir_ok(dir)) {
+            LOG_WRN("slot-store: refusing to create %s: alias dir is a symlink, '/' or not a usable name\n", dir.c_str());
+            return false;
+        }
+        fs::path d;
+        if (!normalise_alias_dir(fs::path(dir), d)) {
+            return false;
+        }
+        std::error_code ec;
+        fs::create_directories(d, ec);
+        if (ec) {
+            LOG_WRN("slot-store: cannot create %s: %s\n", dir.c_str(), ec.message().c_str());
+            return false;
+        }
+        // re-check on the directory as it now exists: a race may have planted a symlink
+        if (!slot_store_alias_dir_ok(dir) || !is_dir_nofollow(d)) {
+            LOG_WRN("slot-store: refusing to use %s: not a plain directory after create\n", dir.c_str());
+            return false;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        LOG_WRN("slot-store: ensure of %s failed: %s\n", dir.c_str(), e.what());
+        return false;
+    } catch (...) {
+        LOG_WRN("slot-store: ensure of %s failed: unknown exception\n", dir.c_str());
+        return false;
+    }
+}
+
 uint64_t slot_store_prune(const std::string & root, const std::string & keep_dir, uint64_t budget_bytes) {
     if (budget_bytes == 0) {
         return 0;

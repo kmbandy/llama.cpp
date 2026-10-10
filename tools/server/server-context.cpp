@@ -3615,6 +3615,12 @@ private:
             SRV_WRN("slot autosave-dir: refusing to save into '%s' (symlink, '/' or not a plain dir); nothing saved\n", dir.c_str());
             return;
         }
+        // the alias dir does not exist until the first save: create it (and re-check it) before
+        // any slot writes, otherwise every slot fails to open its .tmp file
+        if (!slot_store_ensure_dir(dir)) {
+            SRV_WRN("slot autosave-dir: cannot prepare '%s'; nothing saved\n", dir.c_str());
+            return;
+        }
 
         for (server_slot & slot : slots) {
             const std::string path = slot_store_file(dir, slot.id);
