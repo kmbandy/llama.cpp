@@ -252,6 +252,15 @@ public:
     // borrow promoted a still-speculative (prefetched, unused) entry.
     bool borrow(int page_idx, const void ** src_out, Handle * handle_out, bool demand = true,
                bool prefill_hint = false, int * promoted_tag_out = nullptr);
+    // WP_WORKER_TWO_IN_FLIGHT (S5): one-lock, never-waiting borrow-or-reserve
+    // for a lookahead acquisition. Hit: a demand borrow (handle = borrow token,
+    // same accounting as borrow()). Reserved: the entry is Reading and owned by
+    // the caller exactly as begin_read() (finish_read(keep_borrowed) hands back
+    // one borrow). Refused: nothing reserved or borrowed, nothing waited on; the
+    // caller declines. Only the existing lookup/refusal counters can tick.
+    enum class TryAcquire : uint8_t { Hit, Reserved, Refused };
+    TryAcquire try_acquire_nonblocking(int page_idx, const void ** src_out, void ** data_out,
+                                       Handle * handle_out, int * promoted_tag_out = nullptr);
     void release(int page_idx, Handle handle);
 
     // --- exclusive victim tier (WP_HOST_TIER_VICTIM in the worker) ---
@@ -431,6 +440,8 @@ private:
     bool     drop_if_idle_locked_(size_t idx);
     // Caller holds mu_. Shared body of begin_read()/begin_read_wait().
     bool     begin_read_locked_(int page_idx, bool speculative, void ** data_out, Handle * handle_out);
+    bool     borrow_locked_(int page_idx, const void ** src_out, Handle * handle_out, bool demand,
+                            bool prefill_hint, int * promoted_tag_out);
     void     remove_from_list_locked_(size_t idx);
     void     insert_mru_locked_(size_t idx, ListLoc loc);
     void     touch_locked_(size_t idx);
