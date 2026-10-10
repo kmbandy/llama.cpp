@@ -9202,6 +9202,7 @@ private:
     // "no expert slot can hold requested page" (victim choice is greedy and
     // monotone in the excluded set). Mutates nothing (no tick_, uses,
     // cpu_tier_refs_, shadow_), so a false result leaves the pool as it was.
+public:
     bool lookahead_slots_ok(const std::vector<const ExpertPage *> & pages) const {
         std::vector<char> excluded(slots_.size(), 0);
         for (const ExpertPage * page : pages) {
@@ -9229,6 +9230,17 @@ public:
     // Non-blocking.
     bool arena_reservations_done(const Batch & batch) const {
         return batch.state_ == nullptr || batch.state_->reservations_done.load(std::memory_order_acquire);
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S6): entries the host arena can still hand out
+    // without evicting anything in use: total minus Reading minus pinned
+    // (borrowed) entries. Advisory headroom for the ARENA decline; non-blocking.
+    size_t lookahead_arena_free_entries() const {
+        const size_t eb = arena_.entry_bytes();
+        const size_t pinned = eb != 0 ? arena_.pinned_bytes() / eb : 0;
+        const size_t busy = arena_.reading_count() + pinned;
+        const size_t total = arena_.entry_count();
+        return total > busy ? total - busy : 0;
     }
 private:
 
@@ -13330,7 +13342,42 @@ static bool score_from_req_enabled() {
     return on;
 }
 
+// WP_WORKER_TWO_IN_FLIGHT knob getters (defined with the pipeline knobs below).
+bool wp_worker_two_in_flight_enabled();
+bool wp_worker_two_in_flight_cpu_compute_enabled();
+int  wp_worker_two_in_flight_slot_margin();
+bool wp_worker_two_in_flight_stats_enabled();
+
+// Decline reasons for a lookahead attempt. Values are the aux codes written by
+// WP_SPAN_LOOKAHEAD_DECLINE (see wp_span_kind enum).
+enum WpLookaheadDecline : uint8_t {
+    WP_LA_DECLINE_NONE = 0,
+    WP_LA_DECLINE_HEADROOM = 1,   // not enough unpinned slots for N+1's misses
+    WP_LA_DECLINE_OVERLAP  = 2,   // N+1 needs a page N has reserved but not drained
+    WP_LA_DECLINE_SAME_LAYER = 3, // N+1 is the same layer as N (imm/deferred pairs)
+    WP_LA_DECLINE_ARENA    = 4,   // host arena headroom too small
+    WP_LA_DECLINE_SPEC     = 5,   // speculative read in flight for an N+1 page
+    WP_LA_DECLINE_PARK     = 6,   // park/unpark pending
+    WP_LA_DECLINE_EXCEPTION = 7,  // prepare threw; lookahead dropped
+    WP_LA_DECLINE_INELIGIBLE = 8, // front frame not a plain DISPATCH_REQ, or other gate
+    WP_LA_DECLINE_COUNT
+};
+
+// Counters for WP_WORKER_TWO_IN_FLIGHT. Written only on the connection's compute
+// thread (prepare, consume, decline all run there), so plain integers suffice.
+struct WpLookaheadStats {
+    uint64_t n_prepared = 0;     // lookahead slots filled
+    uint64_t n_consumed = 0;     // lookahead slots dispatched (should equal n_prepared minus abandons)
+    uint64_t n_waited   = 0;     // consumed slots whose N+1 frame arrived before N finished (overlap used)
+    uint64_t n_abandoned = 0;    // prepared but dropped (park, exception, connection end)
+    uint64_t n_declined[WP_LA_DECLINE_COUNT] = {};
+    uint64_t ns_prepare = 0;     // total wall time spent preparing N+1
+    uint64_t ns_hidden  = 0;     // sum of (consume time - prepare end) for consumed slots
+    uint64_t ns_waited  = 0;     // consumed N+1: I/O wait inside its dispatch (ns_wait + ns_cpu_tier_wait)
+};
+
 class DeviceWorker {
+    struct CpuTierJob;   // defined below (private, like the definition)
 public:
     ~DeviceWorker();
 
@@ -14350,7 +14397,13 @@ public:
     }
     bool seed_pending() const { return seed_cursor_ < seed_list_.size() || ram_pending(); }
     bool ram_pending() const { return ram_cursor_ < ram_list_.size(); }
-    bool has_any_split_dispatch() const { return !split_pending_by_conn_.empty(); }
+    bool has_any_split_dispatch() const {
+        // A filled lookahead slot is an open transaction for park (ParkTxnProbe).
+        for (const auto & kv : lookahead_by_conn_) {
+            if (kv.second.filled) { return true; }
+        }
+        return !split_pending_by_conn_.empty();
+    }
     bool seed_in_ram_phase() const { return seed_cursor_ < seed_ram_items_; }
     void seed_cancel() {
         seed_cursor_ = seed_list_.size();
@@ -15486,12 +15539,343 @@ public:
         return arena_assignments_eligible(request, batch, *layout_opt);
     }
 
+    // ---------------------------------------------------------------------
+    // WP_WORKER_TWO_IN_FLIGHT (S6): lookahead prepare of request N+1 at the
+    // yield points of dispatch(N) (Y2 after N's complete(), Y3 inside the
+    // CPU-tier wait of finish_cpu_tier). Everything here runs on this device's
+    // compute thread, under the device mutex that dispatch(N) already holds.
+    //
+    // ROUTING / DETERMINISM: N+1's ensure_batch() is still the only planner
+    // that runs for N+1 and it runs strictly AFTER ensure_batch(N) (wire order).
+    // The CPU/GPU split of N+1 is decided from cpu_tier_refs_ and the shadow
+    // LRU under WP_EXPERT_CPU_TIER_DETERMINISTIC, both mutated only by demand
+    // planning calls in wire order (cpu_tier_refs_ at L~7237 under
+    // cpu_tier_this_call, shadow_ under shadow_active) -- neither is touched by
+    // N's completion, drains, CPU-tier settle, or any spec/prefetch call. So
+    // the split is the same as serial processing. (RAM-tier arena timing and
+    // VRAM residency timing can differ; they change where bytes come from, not
+    // which experts run on which device.)
+    // ---------------------------------------------------------------------
+    struct LookaheadPeek {
+        bool                  present     = false;   // a frame is queued behind N
+        bool                  ok          = false;   // reader decoded the header
+        bool                  stream_busy = false;   // streamed dispatch in progress
+        uint64_t              ord         = 0;       // reader-assigned frame ordinal
+        uint64_t              seq_id      = 0;
+        pipe_frame_type       type        = PIPE_PING;
+        const uint8_t *       data        = nullptr; // payload, valid until the next pop
+        size_t                len         = 0;
+    };
+    // Installed by serve_connection; fills `pk` from the front of the frame queue.
+    using LookaheadPeekFn = std::function<void(LookaheadPeek &)>;
+
+    struct LookaheadSlot {
+        bool                                 filled       = false;
+        uint64_t                             ord          = 0;
+        uint64_t                             seq_id       = 0;
+        int32_t                              layer        = -1;
+        uint64_t                             attempted_ord = UINT64_MAX; // last permanent decline
+        std::shared_ptr<pipe_expert_dispatch_req> request;   // stable address for the CPU job
+        std::optional<ExpertSlotPool::Batch> batch;
+        std::shared_ptr<CpuTierJob>          cpu_job;
+        std::chrono::steady_clock::time_point prepared_at;
+    };
+
+    // The request N whose yield point is running.
+    struct LookaheadCur {
+        bool                  active = false;
+        int                   conn   = -1;
+        int32_t               layer  = -1;
+        uint64_t              seq    = 0;
+        const ExpertSlotPool::Batch * batch = nullptr;
+        CpuTierJob *          cpu    = nullptr;
+    };
+    struct LookaheadYieldScope {
+        DeviceWorker & w;
+        LookaheadYieldScope(DeviceWorker & dw, int conn, int32_t layer, uint64_t seq,
+                            const ExpertSlotPool::Batch & batch, CpuTierJob * cpu)
+            : w(dw) {
+            w.la_cur_ = LookaheadCur{ true, conn, layer, seq, &batch, cpu };
+        }
+        ~LookaheadYieldScope() { w.la_cur_ = LookaheadCur(); }
+    };
+
+    // Installed by serve_connection: Worker::note_request_scores (host-tier
+    // hybrid scores live on Worker, not on this device).
+    using LookaheadScoresFn = std::function<void(int32_t, const std::vector<pipe_expert_assignment> &, uint32_t)>;
+    LookaheadScoresFn                         lookahead_scores_;
+    LookaheadPeekFn                           lookahead_peek_;
+    std::unordered_map<int, LookaheadSlot>    lookahead_by_conn_;
+    LookaheadCur                              la_cur_;
+    WpLookaheadStats                          la_stats_;
+
+    void lookahead_decline(LookaheadSlot & slot, WpLookaheadDecline why, uint64_t ord,
+                           uint64_t seq, int32_t layer, bool permanent) {
+        ++la_stats_.n_declined[why];
+        if (permanent) {
+            slot.attempted_ord = ord;   // do not re-attempt this frame at later yields
+        }
+        wp_span_took(WP_SPAN_LOOKAHEAD_DECLINE, layer, (uint32_t) seq, 0, (int64_t) why);
+    }
+
+    // Cancels an early/lookahead CPU-tier job without leaving its request
+    // pointer dangling: a queued job is marked cancelled and waited on (the
+    // compute loop finishes it once every page settles); an unqueued job is
+    // queued cancelled, which drains and releases its pages. Never returns
+    // before the job is finished.
+    void cancel_lookahead_cpu_job(const std::shared_ptr<CpuTierJob> & job) noexcept {
+        if (!job->compute_queued) {
+            queue_cpu_tier_compute(job, nullptr);
+        } else {
+            auto lock = wp_lock_timed(job->m);
+            if (!job->error) {
+                job->error = std::make_exception_ptr(std::runtime_error("lookahead cancelled"));
+            }
+        }
+        wait_cpu_tier(*job);
+    }
+
+    // Yield point entry (compute thread). Never throws: any failure drops the
+    // lookahead and request N+1 is processed by the serial path exactly as today.
+    void lookahead_yield(int y) noexcept {
+        if (!la_cur_.active || !lookahead_peek_) {
+            return;
+        }
+        try {
+            lookahead_try_prepare(y);
+        } catch (...) {
+            ++la_stats_.n_declined[WP_LA_DECLINE_EXCEPTION];
+        }
+    }
+
+    void lookahead_try_prepare(int y) {
+        (void) y;
+        const int conn = la_cur_.conn;
+        LookaheadSlot & slot = lookahead_by_conn_[conn];
+        if (slot.filled) {
+            return;   // one lookahead slot: N+1 already prepared
+        }
+        LookaheadPeek pk;
+        lookahead_peek_(pk);
+        if (!pk.present || pk.ord == slot.attempted_ord) {
+            return;   // nothing queued behind N yet, or already declined
+        }
+        const uint64_t ord     = pk.ord;
+        const uint64_t seq     = pk.seq_id;
+        const int32_t  cur_layer = la_cur_.layer;
+        if (!pk.ok || pk.stream_busy || pk.type != PIPE_EXPERT_DISPATCH_REQ ||
+                has_split_dispatch(conn)) {
+            lookahead_decline(slot, WP_LA_DECLINE_INELIGIBLE, ord, seq, cur_layer, true);
+            return;
+        }
+        if (parked()) {
+            lookahead_decline(slot, WP_LA_DECLINE_PARK, ord, seq, cur_layer, true);
+            return;
+        }
+        // Not yet: N's pages are not all reserved/settled. Retry at the next yield.
+        if (!lookahead_gate_open(*la_cur_.batch, la_cur_.cpu)) {
+            return;
+        }
+
+        pipe_expert_dispatch_req request;
+        try {
+            request = pipe_decode_expert_dispatch_req(
+                pk.data, pk.len, catalog_.descriptor.hparams.n_embd);
+            validate_dispatch(request);
+        } catch (const std::exception &) {
+            // Serial processing reports the same protocol error when N+1 is reached.
+            lookahead_decline(slot, WP_LA_DECLINE_INELIGIBLE, ord, seq, cur_layer, true);
+            return;
+        }
+        if (request.layer == cur_layer) {
+            // imm/deferred pairs of one layer share pages and seq_id (see WP_DEFER_K).
+            lookahead_decline(slot, WP_LA_DECLINE_SAME_LAYER, ord, seq, cur_layer, true);
+            return;
+        }
+        std::vector<const ExpertPage *> pages;
+        pages.reserve(request.assignments.size());
+        for (const pipe_expert_assignment & a : request.assignments) {
+            pages.push_back(&catalog_.pages.at({ request.layer, a.expert_id }));
+        }
+        if (pool_.spec_any_in_flight()) {
+            for (const ExpertPage * page : pages) {
+                if (pool_.spec_in_flight_for(*page)) {
+                    // ensure_batch would block in spec_pagein_poll(true).
+                    lookahead_decline(slot, WP_LA_DECLINE_SPEC, ord, seq, cur_layer, true);
+                    return;
+                }
+            }
+        }
+        if (!pool_.lookahead_slots_ok(pages)) {
+            lookahead_decline(slot, WP_LA_DECLINE_HEADROOM, ord, seq, cur_layer, true);
+            return;
+        }
+        size_t n_need = 0;
+        for (const ExpertPage * page : pages) {
+            if (!page->is_resident) {
+                ++n_need;
+            }
+        }
+        if (pool_.lookahead_arena_free_entries() < n_need) {
+            lookahead_decline(slot, WP_LA_DECLINE_ARENA, ord, seq, cur_layer, true);
+            return;
+        }
+
+        // ---- PREPARE N+1 (same calls, same order as serial dispatch(N+1)) ----
+        const auto t0 = std::chrono::steady_clock::now();
+        const WpSpanCtxScope span_ctx((uint32_t) seq, request.layer);
+        // Restores N's planning layer on every exit (set_current_layer(N+1) is
+        // what serial N+1 would have set before its own ensure_batch).
+        struct RestoreLayer {
+            ExpertSlotPool & p;
+            int32_t          l;
+            ~RestoreLayer() { p.set_current_layer(l); }
+        } restore_layer{ pool_, cur_layer };
+        pool_.set_current_layer(request.layer);
+        std::shared_ptr<CpuTierJob> cpu_job;
+        try {
+            if (lookahead_scores_) {
+                lookahead_scores_(request.layer, request.assignments, request.n_tokens);
+            }
+            for (const pipe_expert_assignment & a : request.assignments) {
+                note_expert_recency(a.expert_id);
+            }
+            note_demand_prefetch_lateness(pages);
+            ExpertSlotPool::Batch batch = pool_.ensure_batch(
+                pages, true, t0, request.n_tokens, conn, nullptr,
+                /* count_demand = */ true, /* spec_call = */ false,
+                /* spec_call_is_layer_ahead = */ false, /* lookahead = */ true);
+            if (batch.n_cpu_tier() > 0) {
+                // try_only: the IO side never waits on the arena (S5).
+                cpu_job = submit_cpu_tier_io(pages, batch, request, /* try_only = */ true);
+                bool declined = false;
+                {
+                    auto lock = wp_lock_timed(cpu_job->m);
+                    declined = cpu_job->declined;
+                }
+                if (declined) {
+                    cancel_lookahead_cpu_job(cpu_job);
+                    lookahead_decline(slot, WP_LA_DECLINE_ARENA, ord, seq, cur_layer, true);
+                    return;
+                }
+            }
+            auto req_sp = std::make_shared<pipe_expert_dispatch_req>(std::move(request));
+            if (cpu_job && wp_worker_two_in_flight_cpu_compute_enabled()) {
+                queue_cpu_tier_compute(cpu_job, req_sp.get());
+            }
+            slot.request     = std::move(req_sp);
+            slot.batch.emplace(std::move(batch));
+            slot.cpu_job     = cpu_job;
+            slot.ord         = ord;
+            slot.seq_id      = seq;
+            slot.layer       = slot.request->layer;
+            slot.prepared_at = std::chrono::steady_clock::now();
+            slot.filled      = true;
+        } catch (const std::exception &) {
+            if (cpu_job) {
+                cancel_lookahead_cpu_job(cpu_job);
+            }
+            lookahead_decline(slot, WP_LA_DECLINE_EXCEPTION, ord, seq, cur_layer, true);
+            return;
+        }
+        const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            slot.prepared_at - t0).count();
+        ++la_stats_.n_prepared;
+        la_stats_.ns_prepare += ns;
+        wp_span_took(WP_SPAN_LOOKAHEAD_PREP, slot.layer, (uint32_t) seq, ns,
+                     (int64_t) la_cur_.seq);
+    }
+
+    // Serve loop (compute thread, between requests): hands out the prepared N+1
+    // when it is the frame just popped. false => the frame is processed exactly
+    // as today. The CPU job (if any) is parked in early_cpu_job_by_conn_, which
+    // dispatch() adopts because the batch is passed as `prepared`.
+    bool lookahead_take(int conn, uint64_t ord, LookaheadSlot & out) {
+        const auto it = lookahead_by_conn_.find(conn);
+        if (it == lookahead_by_conn_.end() || !it->second.filled || it->second.ord != ord) {
+            return false;
+        }
+        LookaheadSlot & src = it->second;
+        out.filled       = true;
+        out.ord          = src.ord;
+        out.seq_id       = src.seq_id;
+        out.layer        = src.layer;
+        out.request      = std::move(src.request);
+        if (src.batch.has_value()) {
+            out.batch.emplace(std::move(*src.batch));
+        }
+        out.cpu_job      = std::move(src.cpu_job);
+        out.prepared_at  = src.prepared_at;
+        lookahead_by_conn_.erase(it);
+        ++la_stats_.n_consumed;
+        la_stats_.ns_hidden += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - out.prepared_at).count();
+        if (out.cpu_job) {
+            early_cpu_job_by_conn_[conn] = out.cpu_job;
+        }
+        return true;
+    }
+
+    // Serve loop: N+1 was dispatched from a prepared slot; ns = its I/O wait.
+    void lookahead_note_wait(uint64_t ns, uint64_t seq, int32_t layer) {
+        la_stats_.ns_waited += ns;
+        wp_span_took(WP_SPAN_LOOKAHEAD_WAIT, layer, (uint32_t) seq, ns, (int64_t) ns);
+    }
+
+    // Teardown / error path: drop a prepared-but-unconsumed N+1. Its CPU job is
+    // cancelled and waited on before the request it points at is released.
+    void abandon_lookahead(int conn) noexcept {
+        const auto it = lookahead_by_conn_.find(conn);
+        if (it == lookahead_by_conn_.end()) {
+            return;
+        }
+        LookaheadSlot slot = std::move(it->second);
+        lookahead_by_conn_.erase(it);
+        if (slot.filled) {
+            ++la_stats_.n_abandoned;
+            if (slot.cpu_job) {
+                cancel_lookahead_cpu_job(slot.cpu_job);
+            }
+        }
+        // slot.batch (abandons its reads) and slot.request are released here.
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT_STATS=1: one line per connection at teardown.
+    void lookahead_print_stats() const {
+        const WpLookaheadStats & st = la_stats_;
+        uint64_t declined = 0;
+        for (int r = 1; r < WP_LA_DECLINE_COUNT; ++r) {
+            declined += st.n_declined[r];
+        }
+        std::fprintf(stderr,
+            "wp lookahead: prepared=%llu consumed=%llu abandoned=%llu declined=%llu "
+            "[headroom=%llu overlap=%llu same_layer=%llu arena=%llu spec=%llu park=%llu "
+            "exception=%llu ineligible=%llu] prep_ms=%.3f hidden_ms=%.3f waited_ms=%.3f\n",
+            (unsigned long long) st.n_prepared, (unsigned long long) st.n_consumed,
+            (unsigned long long) st.n_abandoned, (unsigned long long) declined,
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_HEADROOM],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_OVERLAP],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_SAME_LAYER],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_ARENA],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_SPEC],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_PARK],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_EXCEPTION],
+            (unsigned long long) st.n_declined[WP_LA_DECLINE_INELIGIBLE],
+            st.ns_prepare / 1e6, st.ns_hidden / 1e6, st.ns_waited / 1e6);
+    }
+
+    bool lookahead_open(int conn) const {
+        const auto it = lookahead_by_conn_.find(conn);
+        return it != lookahead_by_conn_.end() && it->second.filled;
+    }
+
     pipe_expert_partial dispatch(
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats,
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1,
-            uint64_t trace_req = 0) {
+            uint64_t trace_req = 0,
+            bool lookahead = false) {
         const WpSpanCtxScope span_ctx(
             (uint32_t) trace_req, request.layer);
         if (parked()) {
@@ -15532,7 +15916,9 @@ public:
                 }
             }
         } early_cpu_job_guard{ *this, cpu_job };
-        const bool owns_gate = !prepared.has_value();
+        // A lookahead-prepared N+1 is still this request's gate owner: the gate was
+        // dropped when N finished (serial N+1 raises it here too).
+        const bool owns_gate = !prepared.has_value() || lookahead;
         if (owns_gate) {
             spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
                                         request.n_tokens > spec_prefill_gate_width_;
@@ -15589,7 +15975,10 @@ public:
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
         for (const pipe_expert_assignment & assignment : request.assignments) {
-            note_expert_recency(assignment.expert_id);
+            // Recency is stamped at lookahead prepare (same position in wire order).
+            if (!lookahead) {
+                note_expert_recency(assignment.expert_id);
+            }
             pages.push_back(&catalog_.pages.at({
                 request.layer, assignment.expert_id
             }));
@@ -15638,7 +16027,10 @@ public:
             if (!cpu_job) {
                 cpu_job = submit_cpu_tier_io(pages, batch, request);
             }
-            queue_cpu_tier_compute(cpu_job, &request);
+            // A lookahead job was queued (against its own request copy) at prepare.
+            if (!cpu_job->compute_queued) {
+                queue_cpu_tier_compute(cpu_job, &request);
+            }
         }
         struct CpuTierGuard {
             DeviceWorker & worker;
@@ -15943,6 +16335,11 @@ public:
         batch.complete();
         request_stats.ns_wait += wp_span_took(WP_SPAN_PAGEIN_WAIT, request.layer, (uint32_t) trace_req, lap());
         time_layer_ahead(request, request_stats);
+        // WP_WORKER_TWO_IN_FLIGHT (S6) yield Y2: N's pages are drained, so the
+        // lookahead gate on the reader side is open. No-op unless installed.
+        LookaheadYieldScope la_scope(*this, conn_index, request.layer, trace_req,
+                                     batch, cpu_job.get());
+        lookahead_yield(2);
         if (measure) {
             // bytes_read is set here, not at the lookup above: batch.bytes_read_
             // only grows in drain_one_read, which runs inside batch.complete().
@@ -16294,6 +16691,7 @@ public:
     }
 
     void abandon_split_dispatch(int conn_index = -1) noexcept {
+        abandon_lookahead(conn_index);
         if (std::shared_ptr<CpuTierJob> job = take_early_cpu_job(conn_index)) {
             queue_cpu_tier_compute(job, nullptr);   // drains + releases its pages
         }
@@ -19765,6 +20163,24 @@ private:
     }
 
     void wait_cpu_tier(CpuTierJob & job) noexcept {
+        if (la_cur_.active && la_cur_.cpu == &job && lookahead_peek_) {
+            // WP_WORKER_TWO_IN_FLIGHT (S6) yield Y3: wait in slices so a lookahead
+            // prepare can run between them. The job lock is NOT held while the
+            // hook runs.
+            for (;;) {
+                {
+                    auto lock = wp_lock_timed(job.m);
+                    if (job.finished) {
+                        return;
+                    }
+                    job.cv.wait_for(lock, std::chrono::microseconds(200));
+                    if (job.finished) {
+                        return;
+                    }
+                }
+                lookahead_yield(3);
+            }
+        }
         auto lock = wp_lock_timed(job.m);
         wp_cv_wait(WP_S_CPU_WAIT, job.cv, lock, [&] { return job.finished; });
     }
@@ -25263,11 +25679,12 @@ public:
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt,
             int conn_index = -1,
             uint64_t trace_req = 0,
-            const worker_stream_callback & stream_callback = {}) {
+            const worker_stream_callback & stream_callback = {},
+            bool lookahead = false) {
         if (prepared.has_value() || !multi_device()) {
             auto lock = wp_lock_timed(device_mutexes_.front());
             pipe_expert_partial result = devices_.front()->dispatch(
-                request, request_stats, std::move(prepared), conn_index, trace_req);
+                request, request_stats, std::move(prepared), conn_index, trace_req, lookahead);
             snapshot_device_reqlog_one(request_stats, request.assignments.size());
             return result;
         }
@@ -25673,6 +26090,33 @@ public:
         snapshot_device_reqlog(pending.groups, split_sub_stats);
         fold_result_partials_ordered(result.partial, partials, result.n_tokens);
         return result;
+    }
+
+    // WP_WORKER_TWO_IN_FLIGHT (S6): single device only (the knob requires
+    // !multi_device()); these forward to device 0 under its mutex.
+    void lookahead_install(DeviceWorker::LookaheadPeekFn peek,
+                           DeviceWorker::LookaheadScoresFn scores) {
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        devices_.front()->lookahead_peek_   = std::move(peek);
+        devices_.front()->lookahead_scores_ = std::move(scores);
+    }
+    void lookahead_uninstall() {
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        devices_.front()->lookahead_peek_   = nullptr;
+        devices_.front()->lookahead_scores_ = nullptr;
+    }
+    bool lookahead_take(int conn_index, uint64_t ord, DeviceWorker::LookaheadSlot & out) {
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        return devices_.front()->lookahead_take(conn_index, ord, out);
+    }
+    void lookahead_note_wait(int conn_index, uint64_t ns, uint64_t seq, int32_t layer) {
+        (void) conn_index;
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        devices_.front()->lookahead_note_wait(ns, seq, layer);
+    }
+    void lookahead_print_stats() const {
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        devices_.front()->lookahead_print_stats();
     }
 
     void abandon_split_dispatch(int conn_index = -1) noexcept {
@@ -27611,32 +28055,6 @@ bool wp_worker_two_in_flight_stats_enabled() {
     return on;
 }
 
-// Decline reasons for a lookahead attempt. Values are the aux codes written by
-// WP_SPAN_LOOKAHEAD_DECLINE (see wp_span_kind enum).
-enum WpLookaheadDecline : uint8_t {
-    WP_LA_DECLINE_NONE = 0,
-    WP_LA_DECLINE_HEADROOM = 1,   // not enough unpinned slots for N+1's misses
-    WP_LA_DECLINE_OVERLAP  = 2,   // N+1 needs a page N has reserved but not drained
-    WP_LA_DECLINE_SAME_LAYER = 3, // N+1 is the same layer as N (imm/deferred pairs)
-    WP_LA_DECLINE_ARENA    = 4,   // host arena headroom too small
-    WP_LA_DECLINE_SPEC     = 5,   // speculative read in flight for an N+1 page
-    WP_LA_DECLINE_PARK     = 6,   // park/unpark pending
-    WP_LA_DECLINE_EXCEPTION = 7,  // prepare threw; lookahead dropped
-    WP_LA_DECLINE_INELIGIBLE = 8, // front frame not a plain DISPATCH_REQ, or other gate
-    WP_LA_DECLINE_COUNT
-};
-
-// Counters for WP_WORKER_TWO_IN_FLIGHT. Written only on the connection's compute
-// thread (prepare, consume, decline all run there), so plain integers suffice.
-struct WpLookaheadStats {
-    uint64_t n_prepared = 0;     // lookahead slots filled
-    uint64_t n_consumed = 0;     // lookahead slots dispatched (should equal n_prepared minus abandons)
-    uint64_t n_waited   = 0;     // consumed slots whose N+1 frame arrived before N finished (overlap used)
-    uint64_t n_abandoned = 0;    // prepared but dropped (park, exception, connection end)
-    uint64_t n_declined[WP_LA_DECLINE_COUNT] = {};
-    uint64_t ns_prepare = 0;     // total wall time spent preparing N+1
-    uint64_t ns_hidden  = 0;     // sum of (consume time - prepare end) for consumed slots
-};
 
 // WP_REQ_LOG_TIMELINE=1 -- DEFAULT OFF. Sub-knob of WP_REQ_LOG: appends the
 // extra per-request columns needed to join this worker's own timeline against
@@ -28720,6 +29138,53 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         wp_state(WP_S_BOOKKEEP, -1, 0);
         return ok;
     };
+    // WP_WORKER_TWO_IN_FLIGHT (S6): lookahead prepare of the frame queued behind
+    // the one being dispatched. Off unless the knob is on AND the pipeline is on
+    // AND single device AND single connection; otherwise no branch below is taken.
+    const bool lookahead_on = pipeline_on && wp_worker_two_in_flight_enabled() &&
+                              !worker.multi_device() && g_worker_conn_request_counts.empty();
+    if (wp_worker_two_in_flight_enabled() && !lookahead_on) {
+        static const bool announced = [] {
+            std::fprintf(stderr, "wp expert worker: WP_WORKER_TWO_IN_FLIGHT disabled because "
+                                 "it needs WP_WORKER_PIPELINE, one device, and no MULTI_CONN\n");
+            return true;
+        }();
+        (void) announced;
+    }
+    uint64_t pipeline_ord = 0;
+    // Installs the peek/scores hooks for this connection and removes them (and
+    // prints the lookahead stats line when WP_WORKER_TWO_IN_FLIGHT_STATS=1) on
+    // every exit. Declared after the queues so it runs before they go away.
+    struct LookaheadGuard {
+        Worker & w;
+        bool     on;
+        ~LookaheadGuard() {
+            if (!on) { return; }
+            if (wp_worker_two_in_flight_stats_enabled()) { w.lookahead_print_stats(); }
+            w.lookahead_uninstall();
+        }
+    } lookahead_guard{ worker, lookahead_on };
+    if (lookahead_on) {
+        worker.lookahead_install(
+            [&pipeline_frames, &stream_dispatch](DeviceWorker::LookaheadPeek & pk) {
+                const WpPipelineFrame * f = nullptr;
+                if (!pipeline_frames.peek(f) || f == nullptr) {
+                    return;
+                }
+                pk.present     = true;
+                pk.ok          = f->ok;
+                pk.stream_busy = stream_dispatch.active;
+                pk.type        = f->type;
+                pk.ord         = f->ord;
+                pk.seq_id      = f->seq_id;
+                pk.data        = f->payload.data();
+                pk.len         = f->payload.size();
+            },
+            [&worker](int32_t layer, const std::vector<pipe_expert_assignment> & a, uint32_t n) {
+                worker.note_request_scores(layer, a, n);
+            });
+    }
+
     while (pipeline_on
                ? [&] {
                      WpPipelineFrame f;
@@ -28728,6 +29193,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                      }
                      type        = f.type;
                      seq_id      = f.seq_id;
+                     pipeline_ord = f.ord;
                      payload     = std::move(f.payload);
                      hdr_done_ns = f.hdr_done_ns;
                      pipeline_ns_recv_body = f.ns_recv_body;
@@ -29620,9 +30086,17 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 : std::chrono::steady_clock::time_point{};
             const uint8_t * request_data = shm_request ? shm_request_data : payload.data();
             const size_t request_length = shm_request ? shm_request_length : payload.size();
-            const pipe_expert_dispatch_req request = shm_request
-                ? pipe_decode_expert_dispatch_req_view(request_data, request_length, mine.n_embd)
-                : pipe_decode_expert_dispatch_req(request_data, request_length, mine.n_embd);
+            // WP_WORKER_TWO_IN_FLIGHT (S6): a prepared N+1 is used instead of decoding
+            // the frame (it was decoded at prepare, on this same thread).
+            DeviceWorker::LookaheadSlot la_slot;
+            const bool la_taken = lookahead_on && !shm_request &&
+                                  worker.lookahead_take(conn_index, pipeline_ord, la_slot);
+            const pipe_expert_dispatch_req la_decoded = la_taken
+                ? pipe_expert_dispatch_req()
+                : (shm_request
+                    ? pipe_decode_expert_dispatch_req_view(request_data, request_length, mine.n_embd)
+                    : pipe_decode_expert_dispatch_req(request_data, request_length, mine.n_embd));
+            const pipe_expert_dispatch_req & request = la_taken ? *la_slot.request : la_decoded;
             const std::chrono::steady_clock::time_point t_decoded =
                 seg_trace ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point();
@@ -29636,7 +30110,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 : 0;
             // WP_HOST_TIER_SCORE_FROM_REQ: feed the hybrid score table from this
             // request's routing weights (inline; a few hundred bytes of work).
-            worker.note_request_scores(request.layer, request.assignments, request.n_tokens);
+            if (!la_taken) {   // a prepared N+1 already fed the hybrid scores at prepare
+                worker.note_request_scores(request.layer, request.assignments, request.n_tokens);
+            }
             req_span.layer = request.layer;
             req_span.aux   = request.n_tokens;
             RequestStats request_stats;
@@ -29688,8 +30164,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         t_pre_dispatch - t_decoded).count();
             }
-            const pipe_expert_partial response = worker.dispatch(
-                request, request_stats, std::nullopt, conn_index, seq_id, stream_callback);
+            const pipe_expert_partial response = la_taken
+                ? worker.dispatch(request, request_stats, std::move(la_slot.batch), conn_index,
+                                  seq_id, stream_callback, /* lookahead = */ true)
+                : worker.dispatch(request, request_stats, std::nullopt, conn_index, seq_id,
+                                  stream_callback);
+            if (la_taken) {
+                worker.lookahead_note_wait(conn_index,
+                    request_stats.ns_wait + request_stats.ns_cpu_tier_wait, seq_id, request.layer);
+            }
             if (shm_request && !worker.local_shm()->consume_request(shm_request_ref)) {
                 throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                           worker.local_shm()->error());
