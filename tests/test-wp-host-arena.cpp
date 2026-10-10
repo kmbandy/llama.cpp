@@ -662,6 +662,59 @@ static void test_hybrid_flat_scores_and_sample1_are_lru() {
     }
 }
 
+// Full 16-entry sample (the worker default) over residents 0..15 in LRU order,
+// with a 17th demand read forcing one victim choice. Only a few pages carry a
+// positive score (the rest are the 0 that HostScoreTable starts with).
+static void test_hybrid_sparse_scores_sample16_keeps_lru_front() {
+    CountingAlloc a;
+    // (a) front (page 0) at score 0 and the others sparse-hot: rank 0 wins, so
+    //     the victim is the LRU front and the pick is not a non-tail pick.
+    {
+        std::vector<float> sc(32, 0.0f);
+        sc[5] = 0.6f; sc[11] = 0.6f;
+        HostArena arena;
+        HostArena::Config c = cfg(16, 16);
+        c.spec_frac_pct = 100; c.hybrid_eviction = true; c.hybrid_sample = 16;
+        c.hybrid_score = [&sc](int page) { return page >= 0 && (size_t) page < sc.size() ? sc[page] : 0.0f; };
+        require(arena.init(c, a.alloc(), a.dealloc()), "init sparse sample16");
+        for (int p = 0; p < 16; ++p) read_page(arena, p);
+        read_page(arena, 16);
+        require(arena.state_of(0) == HostArena::State::Free, "sparse scores: LRU front (score 0) is the victim");
+        require(arena.evictions_hybrid_nontail() == 0, "sparse scores: front pick is not counted as non-tail");
+    }
+    // (b) front has the same positive score as every other sampled page: all
+    //     share rank 0 on score, so recency decides and the front is evicted.
+    {
+        std::vector<float> sc(32, 0.6f);
+        HostArena arena;
+        HostArena::Config c = cfg(16, 16);
+        c.spec_frac_pct = 100; c.hybrid_eviction = true; c.hybrid_sample = 16;
+        c.hybrid_score = [&sc](int page) { return page >= 0 && (size_t) page < sc.size() ? sc[page] : 0.0f; };
+        require(arena.init(c, a.alloc(), a.dealloc()), "init equal sample16");
+        for (int p = 0; p < 16; ++p) read_page(arena, p);
+        read_page(arena, 16);
+        require(arena.state_of(0) == HostArena::State::Free, "equal scores: LRU front is the victim");
+        require(arena.evictions_hybrid_nontail() == 0, "equal scores: never a non-tail pick");
+    }
+    // (c) characterization: the rank rule is strict, so ONE page with any
+    //     positive score outranks every zero-score page in the sample. A hot
+    //     front page is therefore spared and the next-oldest zero page goes.
+    {
+        std::vector<float> sc(32, 0.0f);
+        sc[0] = 1e-3f;
+        HostArena arena;
+        HostArena::Config c = cfg(16, 16);
+        c.spec_frac_pct = 100; c.hybrid_eviction = true; c.hybrid_sample = 16;
+        c.hybrid_score = [&sc](int page) { return page >= 0 && (size_t) page < sc.size() ? sc[page] : 0.0f; };
+        require(arena.init(c, a.alloc(), a.dealloc()), "init positive-front sample16");
+        for (int p = 0; p < 16; ++p) read_page(arena, p);
+        read_page(arena, 16);
+        require(arena.state_of(0) == HostArena::State::Resident, "positive front page is spared");
+        require(arena.state_of(1) == HostArena::State::Free, "next-oldest zero-score page is the victim");
+        require(arena.evictions_hybrid_nontail() == 1, "that pick is counted as non-tail");
+    }
+}
+
 // Admission gate: a speculative reservation whose key is below the victim's
 // is dropped (nothing evicted); one above it is admitted and evicts.
 static void test_hybrid_gate_drops_low_key_speculative() {
@@ -1266,6 +1319,7 @@ int main() {
         test_lfu_evicts_low_frequency_not_lru_front();
         test_hybrid_evicts_lowest_key_not_lru_front();
         test_hybrid_flat_scores_and_sample1_are_lru();
+        test_hybrid_sparse_scores_sample16_keeps_lru_front();
         test_hybrid_gate_drops_low_key_speculative();
         test_hybrid_respects_pins();
         test_host_score_table_ewma();
