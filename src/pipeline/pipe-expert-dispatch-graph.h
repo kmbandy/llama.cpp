@@ -87,9 +87,10 @@ class graph_dispatcher {
                               ggml_tensor *  full_activations = nullptr,
                               ggml_tensor *  full_selected_experts = nullptr,
                               ggml_tensor *  full_weights = nullptr,
-                              int64_t        token_offset = 0);
-    ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
-    ggml_tensor * build_wait(ggml_context * ctx, int32_t layer);
+                              int64_t        token_offset = 0,
+                              int32_t        group = -1);
+    ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer, int32_t group = -1);
+    ggml_tensor * build_wait(ggml_context * ctx, int32_t layer, int32_t group = -1);
 
     // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (both default OFF): build the join of
     // the shared-expert output with the remote partial as one GGML_OP_WAIT_ADD
@@ -104,13 +105,17 @@ class graph_dispatcher {
     // build_wait + ggml_add. Decision depends only on (layer, n_tokens, env), so
     // it is reproduced identically by the compute callbacks at run time.
     // 0 = not eligible (use build_wait + ggml_add), 1 = zerocopy, 2 = gpu flag.
-    int           wait_add_mode(const ggml_tensor * shexp, int32_t layer);
+    // group >= 0 (row groups) resolves the per-(layer, group) slot, see wait_slot_key().
+    int           wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group = -1);
     // `wait` is the CPU wait node (mode 1) or nullptr (mode 2).
-    ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer);
+    ggml_tensor * build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait, int32_t layer,
+                                 int32_t group = -1);
 
+    // group = -1: legacy per-layer order check. group 0/1: independent check
+    // per row group (WP_SPINE_ROW_GROUPS), so A(l) and B(l) may interleave.
     void begin_graph_build(ggml_context * ctx);
-    bool begin_issue_build(ggml_context * ctx, int32_t layer);
-    void note_wait_expanded(ggml_context * ctx, int32_t layer);
+    bool begin_issue_build(ggml_context * ctx, int32_t layer, int32_t group = -1);
+    void note_wait_expanded(ggml_context * ctx, int32_t layer, int32_t group = -1);
 
     // ---- hash-layer prefetch ------------------------------------------------
     //
@@ -284,8 +289,8 @@ class graph_dispatcher {
     void spine_profile_begin(std::chrono::steady_clock::time_point begin) noexcept;
     spine_profile_stats spine_profile_end(std::chrono::steady_clock::time_point end) noexcept;
 
-    void mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept;
-    void mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept;
+    void mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index, int32_t group = -1) noexcept;
+    void mark_wait_tensor(ggml_tensor * tensor, int32_t layer, int32_t group = -1) noexcept;
 
     void spine_layer_profile_begin(uint64_t ubatch_index,
                                    uint32_t n_tokens,
@@ -327,6 +332,8 @@ class graph_dispatcher {
         float *            data = nullptr;   // n_embd * cap_tokens floats, mapped coherent pinned
         ggml_wait_ctrl *   ctrl = nullptr;   // 64 B handshake block, same allocation
         size_t             cap_floats = 0;
+        int32_t            layer = -1;       // for diagnostics
+        int32_t            group = -1;       // -1 = whole layer, 0/1 = row group
         uint64_t           seq = 0;          // epoch counter (dispatch thread only)
     };
     struct wait_job {
@@ -336,8 +343,9 @@ class graph_dispatcher {
         int64_t      n_tokens = 0;
     };
     // 0 = legacy, 1 = zerocopy, 2 = gpu flag; also resolves the slot.
-    int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out);
-    wait_slot * wait_slot_for(int32_t layer, int64_t n_floats, bool create);
+    // Row groups resolve their own slot keyed by (layer, group) (wait_slot_key).
+    int  wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out, int32_t group = -1);
+    wait_slot * wait_slot_for(int32_t layer, int32_t group, int64_t n_floats, bool create);
     // Body shared by compute_wait (host blocking; dst is the CPU wait node) and the
     // background job (dst == nullptr, bg == true). zc_out != nullptr redirects the
     // folded result into the pinned slot instead of dst->data.
@@ -349,7 +357,17 @@ class graph_dispatcher {
     void wait_drain();                 // dispatch thread: block until every queued job is published+done
     void wait_stop_thread() noexcept;
     void check_wait_gpu_failures();    // dispatch thread: GPU spin timeouts -> latch_failure
-    std::map<int32_t, wait_slot>      wait_slots_;
+    std::map<int32_t, wait_slot>      wait_slots_;   // key = wait_slot_key(layer, group)
+    // WP_SPINE_ROW_GROUPS hint bookkeeping: group A's routing for `layer`, consumed by
+    // group B's issue (see compute_issue_impl). layer -1 = empty.
+    struct rg_hint_stash {
+        int32_t              layer = -1;
+        int64_t              n_tokens = 0;
+        std::vector<float>   wire;
+        std::vector<int32_t> selected;
+        std::vector<float>   weights;
+    };
+    rg_hint_stash rg_hint_stash_;
     std::thread                       wait_thread_;
     std::mutex                        wait_mu_;
     std::condition_variable           wait_cv_;
@@ -703,6 +721,9 @@ class graph_dispatcher {
     ggml_context *                                 graph_build_ctx_ = nullptr;
     int32_t                                         last_issue_layer_ = -1;
     int32_t                                         last_expanded_wait_layer_ = -1;
+    // Per row group (0 = A, 1 = B) copies of the two order-check fields above.
+    int32_t                                         last_group_issue_layer_[2] = { -1, -1 };
+    int32_t                                         last_group_wait_layer_[2] = { -1, -1 };
     std::atomic<bool>                              failed_{ false };
     mutable std::mutex                             failure_mutex_;
     std::string                                    failure_message_;

@@ -1303,18 +1303,19 @@ static void dsv4_build_comp_inputs(
         llm_graph_input_dsv4::comp_input & inp,
         const llama_kv_cache_dsv4_context::comp_plan & plan,
         const char * name,
+        const std::string & tag,
         const llama_cparams & cparams,
         int64_t n_stream) {
-    inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + "_state_pos");
-    inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + "_state_persist_src_idxs");
-    inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + "_state_persist_dst_idxs");
-    inp.state_restore_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_restore_src_idxs.size(), std::string("dsv4_") + name + "_state_restore_src_idxs");
-    inp.state_restore_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_restore_dst_idxs.size(), std::string("dsv4_") + name + "_state_restore_dst_idxs");
-    inp.state_snapshot_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_snapshot_src_idxs.size(), std::string("dsv4_") + name + "_state_snapshot_src_idxs");
-    inp.state_snapshot_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_snapshot_dst_idxs.size(), std::string("dsv4_") + name + "_state_snapshot_dst_idxs");
-    inp.state_read_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_read_idxs.size(), std::string("dsv4_") + name + "_state_read_idxs");
-    inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
-    inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
+    inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + tag + "_state_pos");
+    inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + tag + "_state_persist_src_idxs");
+    inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + tag + "_state_persist_dst_idxs");
+    inp.state_restore_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_restore_src_idxs.size(), std::string("dsv4_") + name + tag + "_state_restore_src_idxs");
+    inp.state_restore_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_restore_dst_idxs.size(), std::string("dsv4_") + name + tag + "_state_restore_dst_idxs");
+    inp.state_snapshot_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_snapshot_src_idxs.size(), std::string("dsv4_") + name + tag + "_state_snapshot_src_idxs");
+    inp.state_snapshot_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_snapshot_dst_idxs.size(), std::string("dsv4_") + name + tag + "_state_snapshot_dst_idxs");
+    inp.state_read_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_read_idxs.size(), std::string("dsv4_") + name + tag + "_state_read_idxs");
+    inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + tag + "_state_write_idxs");
+    inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + tag + "_state_write_pos");
 
     if (plan.n_kv > 0) {
         const int64_t n_tokens = (int64_t) plan.n_visible.size();
@@ -1324,7 +1325,7 @@ static void dsv4_build_comp_inputs(
 
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
-        ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+        ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + tag + "_kq_mask").c_str());
     }
 }
 
@@ -1423,6 +1424,213 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
 
     return res;
+}
+
+// Test hooks (declared by tests/test-dsv4-rowgroup-inputs.cpp; the graph header
+// cannot name comp_plan because llama-kv-cache.h includes it). These are the
+// exact builders/fillers the row-group input uses.
+void llm_graph_dsv4_build_comp_input(
+        ggml_context * ctx,
+        llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        const char * name,
+        const std::string & tag,
+        const llama_cparams & cparams,
+        int64_t n_stream);
+void llm_graph_dsv4_fill_comp_input(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream);
+void llm_graph_dsv4_copy_kq_mask_rows(ggml_tensor * full, ggml_tensor * rows, uint32_t r0);
+
+// WP_SPINE_ROW_GROUPS (S3). kind: 0 = csa, 1 = hca, 2 = lid.
+static llama_dsv4_comp_plan_split dsv4_group_split_plans(
+        const llama_kv_cache_dsv4_context * mctx,
+        int kind,
+        const llama_ubatch & ubatch,
+        uint32_t k) {
+    const llama_dsv4_comp_state * st = kind == 0 ? mctx->get_csa_state() : kind == 1 ? mctx->get_hca_state() : mctx->get_lid_state();
+    const llama_kv_cache_dsv4_comp_context * comp = kind == 0 ? mctx->get_csa() : kind == 1 ? mctx->get_hca() : mctx->get_lid();
+
+    return llama_dsv4_split_comp_plan(ubatch, st->get_ratio(), st->get_overlap(), st->get_state_size(),
+            comp->get_write_capacity(), st->get_n_stream(), st->get_n_rs_seq(), mctx->get_rs_idx_ubatch(), k);
+}
+
+static const llama_kv_cache_dsv4_context::comp_plan & dsv4_group_plan(
+        const llama_dsv4_comp_plan_split & split, int group) {
+    return group == 0 ? split.a : split.b;
+}
+
+static const char * dsv4_kind_name(int kind) {
+    return kind == 0 ? "csa" : kind == 1 ? "hca" : "lid";
+}
+
+llm_graph_input_dsv4_rowgroup::llm_graph_input_dsv4_rowgroup(
+        const llama_cparams & cparams,
+        const llama_kv_cache_dsv4_context * mctx,
+        int      group,
+        uint32_t k,
+        uint32_t R) :
+    facade(std::make_unique<llm_graph_input_dsv4>(cparams,
+                std::make_unique<llm_graph_input_dsv4_raw>(cparams, mctx->get_raw()), mctx)),
+    cparams(cparams),
+    mctx(mctx),
+    group(group),
+    k(k),
+    r0(group == 0 ? 0 : k),
+    width(group == 0 ? k : R - k) {
+    GGML_ASSERT(group == 0 || group == 1);
+    GGML_ASSERT(k > 0 && k < R);
+}
+
+void llm_graph_input_dsv4_rowgroup::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(r0 + width <= ubatch->n_tokens);
+
+    facade->mctx = mctx;
+    auto * raw = facade->inp_raw.get();
+    const auto * raw_ctx = mctx->get_raw();
+    raw->mctx = raw_ctx;
+
+    if (inp_pos && inp_pos->buffer) {
+        GGML_ASSERT(ubatch->pos != nullptr);
+        ggml_backend_tensor_set(inp_pos, ubatch->pos + r0, 0, (size_t) width * ggml_element_size(inp_pos));
+    }
+
+    if (raw->self_k_idxs && raw->self_k_idxs->buffer) {
+        raw_ctx->set_input_k_idxs_trailing(raw->self_k_idxs, r0);
+    }
+
+    if (raw->self_kq_mask && raw->self_kq_mask->buffer) {
+        GGML_ASSERT(parent_kq_mask && "row group: parent raw kq_mask must be built before the group input");
+        llm_graph_dsv4_copy_kq_mask_rows(parent_kq_mask, raw->self_kq_mask, r0);
+    }
+
+    if (raw->self_k_rot) {
+        raw_ctx->set_input_k_rot(raw->self_k_rot);
+    }
+
+    llm_graph_input_dsv4::comp_input * comps[3] = { &facade->inp_csa, &facade->inp_hca, &facade->inp_lid };
+    for (int kind = 0; kind < 3; ++kind) {
+        const auto split = dsv4_group_split_plans(mctx, kind, *ubatch, k);
+        llm_graph_dsv4_fill_comp_input(*comps[kind], dsv4_group_plan(split, group), width, 1);
+
+        if (comps[kind]->k_rot && comps[kind]->k_rot->buffer) {
+            (kind == 0 ? mctx->get_csa() : kind == 1 ? mctx->get_hca() : mctx->get_lid())->set_input_k_rot(comps[kind]->k_rot);
+        }
+    }
+}
+
+bool llm_graph_input_dsv4_rowgroup::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_new = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+
+    this->mctx = mctx_new;
+    facade->mctx = mctx_new;
+
+    const auto * raw_ctx = mctx_new->get_raw();
+    facade->inp_raw->mctx = raw_ctx;
+
+    bool res = true;
+
+    // the split plans assume consecutive positions; allow_reuse() does not compare them
+    const llama_ubatch & ub = params.ubatch;
+    res &= ub.pos != nullptr;
+    for (uint32_t i = 1; res && i < ub.n_tokens; ++i) {
+        res &= ub.pos[i] == ub.pos[0] + (llama_pos) i;
+    }
+
+    if (inp_pos && inp_pos->buffer) {
+        res &= inp_pos->ne[0] == (int64_t) width;
+    }
+
+    auto * raw = facade->inp_raw.get();
+    if (raw->self_k_idxs && raw->self_k_idxs->buffer) {
+        res &= raw->self_k_idxs->ne[0] == (int64_t) width;
+    }
+    if (raw->self_kq_mask && raw->self_kq_mask->buffer) {
+        res &= raw->self_kq_mask->ne[0] == (int64_t) raw_ctx->get_n_kv() &&
+               raw->self_kq_mask->ne[1] == (int64_t) width &&
+               raw->self_kq_mask->ne[2] == 1 && raw->self_kq_mask->ne[3] == 1;
+    }
+
+    const llm_graph_input_dsv4::comp_input * comps[3] = { &facade->inp_csa, &facade->inp_hca, &facade->inp_lid };
+    for (int kind = 0; kind < 3; ++kind) {
+        const auto split = dsv4_group_split_plans(mctx_new, kind, params.ubatch, k);
+        res &= dsv4_can_reuse_comp_input(*comps[kind], dsv4_group_plan(split, group), width, 1);
+    }
+
+    return res;
+}
+
+void llm_graph_dsv4_build_comp_input(
+        ggml_context * ctx,
+        llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        const char * name,
+        const std::string & tag,
+        const llama_cparams & cparams,
+        int64_t n_stream) {
+    dsv4_build_comp_inputs(ctx, inp, plan, name, tag, cparams, n_stream);
+}
+
+void llm_graph_dsv4_fill_comp_input(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    dsv4_set_comp_inputs(inp, plan, "dsv4", false, n_tokens, n_stream);
+}
+
+void llm_graph_dsv4_copy_kq_mask_rows(ggml_tensor * full, ggml_tensor * rows, uint32_t r0) {
+    dsv4_copy_kq_mask_trailing(full, rows, r0);
+}
+
+llm_graph_input_dsv4_rowgroup * llm_graph_context::build_inp_dsv4_rowgroup(
+        const llm_graph_input_dsv4 * parent, int group, uint32_t k) const {
+    const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+    const auto * raw_ctx  = mctx_cur->get_raw();
+
+    GGML_ASSERT(parent && parent->inp_raw && parent->inp_raw->self_kq_mask);
+    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
+
+    const uint32_t R = ubatch.n_tokens;
+    const int64_t n_stream = mctx_cur->get_csa_plan(ubatch).n_stream;
+    GGML_ASSERT(n_stream == 1 && "WP_SPINE_ROW_GROUPS: row groups require a single stream");
+    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "WP_SPINE_ROW_GROUPS: row groups assume flat RoPE positions");
+
+    auto inp = std::make_unique<llm_graph_input_dsv4_rowgroup>(cparams, mctx_cur, group, k, R);
+    auto & f = *inp->facade;
+    const uint32_t width = inp->get_width();
+    const std::string tag = group == 0 ? "_gA" : "_gB";
+
+    inp->inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, width);
+    ggml_set_input(inp->inp_pos);
+    ggml_set_name(inp->inp_pos, ("inp_pos" + tag).c_str());
+
+    f.inp_raw->self_k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, width);
+    ggml_set_input(f.inp_raw->self_k_idxs);
+    ggml_set_name(f.inp_raw->self_k_idxs, ("dsv4_raw_k_idxs" + tag).c_str());
+
+    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    f.inp_raw->self_kq_mask     = ggml_new_tensor_4d(ctx0, type, raw_ctx->get_n_kv(), width, 1, 1);
+    ggml_set_input(f.inp_raw->self_kq_mask);
+    ggml_set_name(f.inp_raw->self_kq_mask, ("attn_inp_kq_mask" + tag).c_str());
+    f.inp_raw->self_kq_mask_cnv = f.inp_raw->self_kq_mask;
+    inp->parent_kq_mask = parent->inp_raw->self_kq_mask;
+
+    f.inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+
+    llm_graph_input_dsv4::comp_input * comps[3] = { &f.inp_csa, &f.inp_hca, &f.inp_lid };
+    for (int kind = 0; kind < 3; ++kind) {
+        const auto split = dsv4_group_split_plans(mctx_cur, kind, ubatch, k);
+        dsv4_build_comp_inputs(ctx0, *comps[kind], dsv4_group_plan(split, group), dsv4_kind_name(kind), tag, cparams, n_stream);
+    }
+
+    f.inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
+    f.inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
+    f.inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+
+    return (llm_graph_input_dsv4_rowgroup *) res->add_input(std::move(inp));
 }
 
 void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
@@ -1933,6 +2141,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
+        if (row_group_idx >= 0) {
+            // WP_SPINE_ROW_GROUPS: tag group-emitted names, e.g. ffn_moe_issued_gA-12
+            const std::string tagged = std::string(name) + (row_group_idx == 0 ? "_gA" : "_gB");
+            cb_func(ubatch, cur, tagged.c_str(), il);
+            return;
+        }
         cb_func(ubatch, cur, name, il);
     }
 }
@@ -1962,7 +2176,7 @@ ggml_tensor * llm_graph_context::shexp_after_issue(ggml_tensor * cur, int il) {
         cb(gated, "ffn_shexp_in", il);
         return gated;
     }
-    gated = expert_dispatch->after_issue(ctx0, gated, il);
+    gated = expert_dispatch->after_issue(ctx0, gated, il, row_group_idx);
     cb(gated, "ffn_shexp_in", il);
     return gated;
 }
@@ -1974,19 +2188,19 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         // WP_WAIT_ZEROCOPY / WP_WAIT_GPU_FLAG (default off -> mode 0 -> unchanged
         // path below). GGML_OP_WAIT_ADD computes shexp + partial in ONE fp32 add,
         // the same arithmetic and operand order as the ggml_add(shexp, wait) below.
-        const int wait_mode = expert_dispatch->wait_add_mode(shexp, il);
+        const int wait_mode = expert_dispatch->wait_add_mode(shexp, il, row_group_idx);
         if (wait_mode != 0) {
             ggml_tensor * wait = nullptr;
             if (wait_mode == 1) {
                 // Host still blocks and folds, but into the pinned slot; the GPU op
                 // only keeps an ordering edge to this node (never copied).
-                wait = expert_dispatch->build_wait(ctx0, il);
+                wait = expert_dispatch->build_wait(ctx0, il, row_group_idx);
                 ggml_backend_sched_set_tensor_backend(sched, wait, backend_cpu);
                 cb(wait, "ffn_moe_out", il);
-                expert_dispatch->mark_wait_tensor(wait, il);
+                expert_dispatch->mark_wait_tensor(wait, il, row_group_idx);
             }
-            ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il);
-            expert_dispatch->note_wait_expanded(ctx0, il);
+            ggml_tensor * joined = expert_dispatch->build_wait_add(ctx0, shexp, wait, il, row_group_idx);
+            expert_dispatch->note_wait_expanded(ctx0, il, row_group_idx);
             cb(joined, "ffn_out", il);
             return joined;
         }
@@ -1994,11 +2208,11 @@ ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issu
         // input. Do NOT after_issue the shexp *output* — that made the GPU
         // FFN a split that finished before wait, so skip-sync only overlapped
         // a 1-element acc with recv.
-        moe_or_issued = expert_dispatch->build_wait(ctx0, il);
+        moe_or_issued = expert_dispatch->build_wait(ctx0, il, row_group_idx);
         ggml_backend_sched_set_tensor_backend(sched, moe_or_issued, backend_cpu);
         cb(moe_or_issued, "ffn_moe_out", il);
-        expert_dispatch->mark_wait_tensor(moe_or_issued, il);
-        expert_dispatch->note_wait_expanded(ctx0, il);
+        expert_dispatch->mark_wait_tensor(moe_or_issued, il, row_group_idx);
+        expert_dispatch->note_wait_expanded(ctx0, il, row_group_idx);
     }
     // shexp first so expand visits the GPU FFN split before CPU wait. The
     // scheduler leaves MAP_CUSTOM2 wait splits unsynced against the previous
@@ -2758,8 +2972,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (n_tokens <= 16 && expert_dispatch->score_summary_enabled()) {
                     expert_dispatch->set_score_probs(il, probs_2d);
                 }
+                // row_group_idx >= 0 (WP_SPINE_ROW_GROUPS): keyed layer*2+group, chunk 0 of 1.
                 moe_out = expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il,
-                                                       dispatch_swiglu_clamp);
+                                                       dispatch_swiglu_clamp, 0, 1, nullptr, nullptr, nullptr,
+                                                       nullptr, 0, row_group_idx);
             }
         } else {
             moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp,
@@ -2768,7 +2984,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
         if (moe_out->op == GGML_OP_MAP_CUSTOM3 || expert_dispatch->is_score_issue_tensor(moe_out)) {
-            expert_dispatch->mark_issue_tensor(moe_out, il, 0);
+            expert_dispatch->mark_issue_tensor(moe_out, il, 0, row_group_idx);
         }
         return moe_out;
     }
@@ -4715,9 +4931,9 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
-    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
-    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
-    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
+    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", "", cparams, n_stream);
+    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", "", cparams, n_stream);
+    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", "", cparams, n_stream);
     inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);

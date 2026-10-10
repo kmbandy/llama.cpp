@@ -413,6 +413,15 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    // WP_SPINE_ROW_GROUPS: rollback rs_idx as consumed by the current ubatch
+    // (the value dsv4_build_comp_plans passed to llama_dsv4_build_comp_plan
+    // for it). Needed to rebuild the group split plans for the live ubatch.
+    const std::vector<uint32_t> & get_rs_idx_ubatch() const;
+
+    // WP_SPINE_ROW_GROUPS (S5): false for worst-case/reserve contexts that carry no
+    // per-ubatch state (get_rs_idx_ubatch() would assert). Gates the row-group path.
+    bool has_ubatch_state() const { return status == LLAMA_MEMORY_STATUS_SUCCESS && i_next < rs_idx_ubatches.size(); }
+
 private:
     size_t i_next = 0;
 
@@ -421,6 +430,7 @@ private:
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;
     std::vector<comp_plan> plans_lid;
+    std::vector<std::vector<uint32_t>> rs_idx_ubatches;
 
     const std::unique_ptr<llama_kv_cache_dsv4_raw_context> ctx_raw;
     const llama_memory_context_ptr ctx_csa_mem;
@@ -458,3 +468,23 @@ llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         uint32_t n_stream,
         uint32_t n_rs_seq,
         const std::vector<uint32_t> & rs_idx);
+
+// WP_SPINE_ROW_GROUPS: split of one single-sequence verify ubatch into row
+// group A (rows [0,k)) and group B (rows [k,R)). Each group plan is padded to
+// its own fixed rank. Gated: n_seqs_unq == 1, consecutive pos >= 0,
+// state_size >= max(2*ratio, R), n_stream == 1.
+struct llama_dsv4_comp_plan_split {
+    llama_kv_cache_dsv4_context::comp_plan a;
+    llama_kv_cache_dsv4_context::comp_plan b;
+};
+
+llama_dsv4_comp_plan_split llama_dsv4_split_comp_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq,
+        const std::vector<uint32_t> & rs_idx,
+        uint32_t k);

@@ -492,6 +492,47 @@ target_compile_definitions(test-wp-expert-dispatcher PRIVATE
 target_compile_features(test-wp-expert-dispatcher PRIVATE cxx_std_17)
 llama_test(test-wp-expert-dispatcher)
 
+# WP_SPINE_ROW_GROUPS: compressor-plan split equivalence (CPU only, no model)
+add_executable(test-dsv4-comp-plan-split test-dsv4-comp-plan-split.cpp)
+target_include_directories(test-dsv4-comp-plan-split PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-comp-plan-split PRIVATE llama)
+target_compile_features(test-dsv4-comp-plan-split PRIVATE cxx_std_17)
+llama_test(test-dsv4-comp-plan-split)
+
+# WP_SPINE_ROW_GROUPS: per-group DSv4 graph inputs equal row slices of the whole fill (CPU only)
+add_executable(test-dsv4-rowgroup-inputs test-dsv4-rowgroup-inputs.cpp)
+target_include_directories(test-dsv4-rowgroup-inputs PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-inputs PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-inputs PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-inputs)
+
+# WP_SPINE_ROW_GROUPS (S4): group B's compressor state concat and plan indices match the whole plan (CPU only)
+add_executable(test-dsv4-rowgroup-state test-dsv4-rowgroup-state.cpp)
+target_include_directories(test-dsv4-rowgroup-state PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-state PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-state PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-state)
+
+# WP_SPINE_ROW_GROUPS (S5): ping-pong emission order, executed on the ggml CPU backend with fake dispatch ops
+add_executable(test-dsv4-rowgroup-order test-dsv4-rowgroup-order.cpp)
+target_include_directories(test-dsv4-rowgroup-order PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-order PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-order PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-order)
+
+# WP_SPINE_ROW_GROUPS (S7): engram row slicing -- gather once, per-group slices, production mix helper (CPU)
+add_executable(test-dsv4-rowgroup-engram test-dsv4-rowgroup-engram.cpp)
+target_include_directories(test-dsv4-rowgroup-engram PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-rowgroup-engram PRIVATE llama)
+target_compile_features(test-dsv4-rowgroup-engram PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-engram)
+
+# WP_WAIT_ZEROCOPY per-(layer, group) pinned wait-slot keys (pure keying logic).
+add_executable(test-dsv4-rowgroup-wait-slot test-dsv4-rowgroup-wait-slot.cpp)
+target_include_directories(test-dsv4-rowgroup-wait-slot PRIVATE ${CMAKE_SOURCE_DIR}/src/pipeline)
+target_compile_features(test-dsv4-rowgroup-wait-slot PRIVATE cxx_std_17)
+llama_test(test-dsv4-rowgroup-wait-slot)
+
 # cross-host tensor parallelism: the rank-windowed row split (pure arithmetic, no model, no GPU)
 add_executable(
     test-tp-rank-window

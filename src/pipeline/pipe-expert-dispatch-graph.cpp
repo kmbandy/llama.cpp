@@ -1,6 +1,7 @@
 #include "pipe-expert-dispatch-graph.h"
 #include "pipe-prefetch-hints.h"
 #include "pipe-issue-trace.h"
+#include "pipe-wait-slot-key.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -208,6 +209,8 @@ struct graph_dispatcher::op_context {
     int32_t            layer = -1;
     int32_t            chunk_index = 0;
     int32_t            chunk_count = 1;
+    // -1 = whole layer; 0/1 = row group A/B (key layer*2+group, chunk_index 0).
+    int32_t            group = -1;
     int64_t            token_offset = 0;
     // hparams.swiglu_clamp_exp[layer]; <= 0 means no clamp. See the note on
     // pipe_expert_dispatch_req::swiglu_clamp -- the spine's own clamped SwiGLU
@@ -447,14 +450,19 @@ void graph_dispatcher::spine_profile_wait_end(dispatch_clock::time_point time) n
     spine_profile_.issue_active = false;
 }
 
-void graph_dispatcher::mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index) noexcept {
-    if (tensor != nullptr) {
+void graph_dispatcher::mark_issue_tensor(ggml_tensor * tensor, int32_t layer, int32_t chunk_index,
+                                         int32_t group) noexcept {
+    if (tensor != nullptr && group >= 0) {
+        ggml_format_name(tensor, "wp_spine_dispatch_issue-%d-g%d", layer, group);
+    } else if (tensor != nullptr) {
         ggml_format_name(tensor, "wp_spine_dispatch_issue-%d-%d", layer, chunk_index);
     }
 }
 
-void graph_dispatcher::mark_wait_tensor(ggml_tensor * tensor, int32_t layer) noexcept {
-    if (tensor != nullptr) {
+void graph_dispatcher::mark_wait_tensor(ggml_tensor * tensor, int32_t layer, int32_t group) noexcept {
+    if (tensor != nullptr && group >= 0) {
+        ggml_format_name(tensor, "wp_spine_dispatch_wait-%d-g%d", layer, group);
+    } else if (tensor != nullptr) {
         ggml_format_name(tensor, "wp_spine_dispatch_wait-%d", layer);
     }
 }
@@ -740,6 +748,7 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
     }
     context->chunk_index = 0;
     context->chunk_count = 1;
+    context->group = -1;
     context->token_offset = 0;
     context->full_activations = nullptr;
     context->full_selected_experts = nullptr;
@@ -763,9 +772,18 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
                                             ggml_tensor *  full_activations,
                                             ggml_tensor *  full_selected_experts,
                                             ggml_tensor *  full_weights,
-                                            int64_t        token_offset) {
+                                            int64_t        token_offset,
+                                            int32_t        group) {
     if (layer < 0) {
         throw std::invalid_argument("expert dispatch requires a non-negative layer");
+    }
+    if (group >= 0) {
+        if (group > 1 || chunk_index != 0 || chunk_count != 1) {
+            throw std::invalid_argument("expert dispatch row group must be 0 or 1 and unchunked");
+        }
+        if (remote.dispatch_chunks() != 1) {
+            throw std::invalid_argument("expert dispatch row groups need WP_DISPATCH_CHUNKS=1");
+        }
     }
     if (activations->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 ||
         weights->type != GGML_TYPE_F32) {
@@ -787,20 +805,21 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
             weights = ggml_add(ctx, weights, gate);
         }
     }
-    const int32_t key = layer * 2 + chunk_index;
+    const int32_t key = group >= 0 ? layer * 2 + group : layer * 2 + chunk_index;
     auto & context = op_contexts[key];
     if (!context) {
         context.reset(new op_context{ this, layer });
     }
     context->chunk_index         = chunk_index;
     context->chunk_count         = chunk_count;
+    context->group               = group;
     context->token_offset        = token_offset;
     context->swiglu_clamp = swiglu_clamp;
     context->full_activations    = full_activations;
     context->full_selected_experts = full_selected_experts;
     context->full_weights        = full_weights;
     ggml_tensor * issued = nullptr;
-    if (score_probs_ != nullptr && score_probs_layer_ == layer && chunk_count == 1) {
+    if (score_probs_ != nullptr && score_probs_layer_ == layer && chunk_count == 1 && group < 0) {
         // WP_SCORE_SUMMARY=1 only: the same issue op with the router probs as a
         // fourth, read-only source (adds a dependency, nothing else).
         ggml_tensor * args[4] = { activations, selected_experts, weights, score_probs_ };
@@ -813,16 +832,16 @@ ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
     }
     score_probs_       = nullptr;
     score_probs_layer_ = -1;
-    mark_issue_tensor(issued, layer, chunk_index);
+    mark_issue_tensor(issued, layer, chunk_index, group);
     context->issued = issued;
     return issued;
 }
 
-ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer) {
+ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer, int32_t group) {
     if (tensor == nullptr) {
         throw std::invalid_argument("after_issue requires a tensor");
     }
-    const auto it = op_contexts.find(layer * 2);
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
     }
@@ -842,8 +861,8 @@ ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * te
     return ggml_acc_inplace(ctx, tensor, zero, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
 }
 
-ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
-    const auto it = op_contexts.find(layer * 2);
+ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer, int32_t group) {
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
         throw std::runtime_error("build_wait has no issue node for layer " + std::to_string(layer));
     }
@@ -854,7 +873,7 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
     ggml_tensor * wait = nullptr;
     if (it->second->chunk_count == 1) {
         wait = ggml_map_custom2(ctx, issued, issued, compute_wait, 1, it->second.get());
-        mark_wait_tensor(wait, layer);
+        mark_wait_tensor(wait, layer, group);
     } else {
         const auto next = op_contexts.find(layer * 2 + 1);
         if (next == op_contexts.end() || next->second == nullptr || next->second->issued == nullptr) {
@@ -868,7 +887,10 @@ ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, int32_t layer) {
         mark_wait_tensor(wait_b, layer);
         wait = ggml_concat(ctx, wait_a, wait_b, 1);
     }
-    wait_tensors_[layer] = wait;
+    // Row-group waits are not read back by build_issue (chunk gate only).
+    if (group < 0) {
+        wait_tensors_[layer] = wait;
+    }
     return wait;
 }
 
@@ -916,8 +938,10 @@ static int32_t wait_timeout_ms() {
     return v;
 }
 
-graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int64_t n_floats, bool create) {
-    const auto it = wait_slots_.find(layer);
+graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int32_t group, int64_t n_floats,
+                                                              bool create) {
+    const int32_t key = wait_slot_key(layer, group);
+    const auto it = wait_slots_.find(key);
     if (it != wait_slots_.end()) {
         return (size_t) n_floats <= it->second.cap_floats ? &it->second : nullptr;
     }
@@ -936,16 +960,19 @@ graph_dispatcher::wait_slot * graph_dispatcher::wait_slot_for(int32_t layer, int
     slot.ctrl       = static_cast<ggml_wait_ctrl *>(mem);
     slot.data       = reinterpret_cast<float *>(static_cast<char *>(mem) + sizeof(ggml_wait_ctrl));
     slot.cap_floats = cap_floats;
-    return &wait_slots_.emplace(layer, slot).first->second;
+    slot.layer      = layer;
+    slot.group      = group;
+    return &wait_slots_.emplace(key, slot).first->second;
 }
 
-int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out) {
+int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count, wait_slot ** slot_out,
+                                int32_t group) {
     const int mode = wait_knob_mode();
     if (mode == 0 || chunk_count != 1 || remote.dispatch_chunks() == 2 || n_tokens <= 0 ||
         n_tokens > wait_slot_tokens()) {
         return 0;
     }
-    wait_slot * slot = wait_slot_for(layer, n_tokens * (int64_t) remote.n_embd(), false);
+    wait_slot * slot = wait_slot_for(layer, group, n_tokens * (int64_t) remote.n_embd(), false);
     if (slot == nullptr) {
         return 0;
     }
@@ -955,11 +982,11 @@ int graph_dispatcher::wait_mode(int32_t layer, int64_t n_tokens, int chunk_count
     return mode;
 }
 
-int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer) {
+int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer, int32_t group) {
     if (wait_knob_mode() == 0 || shexp == nullptr) {
         return 0;
     }
-    const auto it = op_contexts.find(layer * 2);
+    const auto it = op_contexts.find(group >= 0 ? layer * 2 + group : layer * 2);
     if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr ||
         it->second->chunk_count != 1) {
         return 0;
@@ -971,16 +998,16 @@ int graph_dispatcher::wait_add_mode(const ggml_tensor * shexp, int32_t layer) {
         return 0;
     }
     // Creates the slot (build time, dispatch thread); wait_mode() then resolves it.
-    if (wait_slot_for(layer, shexp->ne[0] * shexp->ne[1], true) == nullptr) {
+    if (wait_slot_for(layer, group, shexp->ne[0] * shexp->ne[1], true) == nullptr) {
         return 0;
     }
-    return wait_mode(layer, shexp->ne[1], 1, nullptr);
+    return wait_mode(layer, shexp->ne[1], 1, nullptr, group);
 }
 
 ggml_tensor * graph_dispatcher::build_wait_add(ggml_context * ctx, ggml_tensor * shexp, ggml_tensor * wait,
-                                               int32_t layer) {
+                                               int32_t layer, int32_t group) {
     wait_slot * slot = nullptr;
-    const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot);
+    const int   mode = wait_mode(layer, shexp->ne[1], 1, &slot, group);
     GGML_ASSERT(mode != 0 && slot != nullptr);
     // mode 1: ctrl == nullptr (no device wait; the host already folded into the
     // slot before the consuming split runs) and `wait` is the ordering edge.
@@ -1068,7 +1095,9 @@ void graph_dispatcher::check_wait_gpu_failures() {
             __atomic_store_n(&ctrl->fail, (uint64_t) 0, __ATOMIC_RELEASE);
             const std::string message = "expert dispatch: GPU timed out (" + std::to_string(wait_timeout_ms()) +
                                         " ms) waiting for the remote partial of layer " +
-                                        std::to_string(entry.first) + " (WP_WAIT_GPU_FLAG); output is invalid";
+                                        std::to_string(entry.second.layer) +
+                                        (entry.second.group >= 0 ? " group " + std::to_string(entry.second.group) : std::string()) +
+                                        " (WP_WAIT_GPU_FLAG); output is invalid";
             std::fprintf(stderr, "%s\n", message.c_str());
             latch_failure(message.c_str());
         }
@@ -1080,14 +1109,28 @@ void graph_dispatcher::begin_graph_build(ggml_context * ctx) {
     wait_tensors_.clear();
     last_issue_layer_ = -1;
     last_expanded_wait_layer_ = -1;
+    last_group_issue_layer_[0] = last_group_issue_layer_[1] = -1;
+    last_group_wait_layer_[0]  = last_group_wait_layer_[1]  = -1;
 }
 
-bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer) {
+bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer, int32_t group) {
     if (graph_build_ctx_ != ctx) {
         begin_graph_build(ctx);
     }
 
     const int32_t previous_layer = layer - 1;
+    if (group >= 0) {
+        // Group g issues layer l only after its own wait l-1 was expanded.
+        const bool ordered = last_group_issue_layer_[group] != previous_layer ||
+                             last_group_wait_layer_[group] >= previous_layer;
+        if (!ordered) {
+            std::fprintf(stderr,
+                         "expert dispatch graph order: layer %d group %d issue created before its wait %d expanded\n",
+                         layer, group, previous_layer);
+        }
+        last_group_issue_layer_[group] = layer;
+        return ordered;
+    }
     const bool ordered = last_issue_layer_ != previous_layer ||
                          last_expanded_wait_layer_ >= previous_layer;
     if (!ordered) {
@@ -1099,9 +1142,13 @@ bool graph_dispatcher::begin_issue_build(ggml_context * ctx, int32_t layer) {
     return ordered;
 }
 
-void graph_dispatcher::note_wait_expanded(ggml_context * ctx, int32_t layer) {
+void graph_dispatcher::note_wait_expanded(ggml_context * ctx, int32_t layer, int32_t group) {
     if (graph_build_ctx_ != ctx) {
         begin_graph_build(ctx);
+    }
+    if (group >= 0) {
+        last_group_wait_layer_[group] = std::max(last_group_wait_layer_[group], layer);
+        return;
     }
     last_expanded_wait_layer_ = std::max(last_expanded_wait_layer_, layer);
 }
@@ -3076,7 +3123,8 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
         // (the consuming kernel is already queued or about to be): armed here,
         // disarmed right before the real fold job is queued at the end of the try.
         wait_slot * gf_slot = nullptr;
-        const int   gf_mode = owner->wait_mode(context->layer, activations->ne[1], context->chunk_count, &gf_slot);
+        const int   gf_mode = owner->wait_mode(context->layer, activations->ne[1], context->chunk_count, &gf_slot,
+                                               context->group);
         struct gf_guard_t {
             graph_dispatcher * o;
             wait_slot *        slot;
@@ -3199,6 +3247,10 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
         wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_CHUNK, it_asg);
 
         std::vector<pipe_expert_assignment> full_assignments;
+        // WP_SPINE_ROW_GROUPS: keeps the group's own assignments for the request while
+        // the hint block runs over the union (see rg_union below).
+        std::vector<pipe_expert_assignment> rg_group_assignments;
+        std::unique_ptr<ggml_context, void (*)(ggml_context *)> rg_union_ctx(nullptr, ggml_free);
         std::function<void()> post_send_hints; // WP_ISSUE_HINTS_AFTER_SEND
         const std::vector<pipe_expert_assignment> * layer_assignments = nullptr;
         uint32_t layer_n_tokens = 0;
@@ -3209,7 +3261,7 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
                 ? context->full_selected_experts : selected_experts;
             const ggml_tensor * full_weights = context->full_weights != nullptr
                 ? context->full_weights : weights;
-            const int64_t full_tokens = full_activations->ne[1];
+            int64_t full_tokens = full_activations->ne[1];
             const uint64_t it_fa = wp_issue_trace::mark();
             std::vector<float> full_wire_activations((size_t) n_embd * (size_t) full_tokens);
             if (ggml_is_contiguous(full_activations)) {
@@ -3226,6 +3278,71 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
             wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_FULL, it_af);
             layer_assignments = &full_assignments;
             layer_n_tokens = (uint32_t) full_tokens;
+
+            // WP_SPINE_ROW_GROUPS: predictor/hint bookkeeping is per LAYER, not per group.
+            // Group A (issued first for the layer) stashes its routing and emits nothing.
+            // Group B (issued second) emits the hints ONCE over the union of both groups'
+            // rows (token order A then B). Without a stash (A not issued) B uses its own
+            // rows only. The request (begin_dispatch) always carries the group's own rows.
+            const bool rg_stage   = context->group >= 0;
+            const bool hint_owner = !rg_stage || context->group == 1;
+            if (rg_stage && context->group == 0) {
+                rg_hint_stash & st = owner->rg_hint_stash_;
+                st.layer    = context->layer;
+                st.n_tokens = full_tokens;
+                st.wire     = full_wire_activations;
+                st.selected.resize((size_t) ggml_nelements(full_selected));
+                st.weights.resize((size_t) ggml_nelements(full_weights));
+                for (size_t i = 0; i < st.selected.size(); ++i) {
+                    st.selected[i] = ggml_get_i32_1d(full_selected, (int) i);
+                }
+                for (size_t i = 0; i < st.weights.size(); ++i) {
+                    st.weights[i] = ggml_get_f32_1d(full_weights, (int) i);
+                }
+            }
+            if (rg_stage && context->group == 1 && owner->rg_hint_stash_.layer == context->layer) {
+                rg_hint_stash & st = owner->rg_hint_stash_;
+                const int64_t n_a     = st.n_tokens;
+                const int64_t n_b     = full_tokens;
+                const int64_t R       = n_a + n_b;
+                const int64_t n_sel_a = (int64_t) st.selected.size();
+                const int64_t n_wt_a  = (int64_t) st.weights.size();
+                const int64_t n_sel_b = ggml_nelements(full_selected);
+                const int64_t n_wt_b  = ggml_nelements(full_weights);
+                ggml_init_params ip = {};
+                ip.mem_size = 4 * ggml_tensor_overhead() + (size_t) (n_sel_a + n_sel_b + n_wt_a + n_wt_b) * 4 + 4096;
+                ip.no_alloc = false;
+                ggml_context * uctx = ggml_init(ip);
+                if (uctx != nullptr) {
+                    rg_union_ctx.reset(uctx);
+                    ggml_tensor * u_sel = ggml_new_tensor_2d(uctx, GGML_TYPE_I32, n_expert_used, R);
+                    ggml_tensor * u_wt  = ggml_new_tensor_3d(uctx, GGML_TYPE_F32, 1, n_expert_used, R);
+                    for (int64_t i = 0; i < n_sel_a; ++i) {
+                        ggml_set_i32_1d(u_sel, (int) i, st.selected[(size_t) i]);
+                    }
+                    for (int64_t i = 0; i < n_sel_b; ++i) {
+                        ggml_set_i32_1d(u_sel, (int) (n_sel_a + i), ggml_get_i32_1d(full_selected, (int) i));
+                    }
+                    for (int64_t i = 0; i < n_wt_a; ++i) {
+                        ggml_set_f32_1d(u_wt, (int) i, st.weights[(size_t) i]);
+                    }
+                    for (int64_t i = 0; i < n_wt_b; ++i) {
+                        ggml_set_f32_1d(u_wt, (int) (n_wt_a + i), ggml_get_f32_1d(full_weights, (int) i));
+                    }
+                    std::vector<pipe_expert_assignment> union_assignments = make_assignments(u_sel, u_wt, R, 0);
+                    std::vector<float> union_wire(st.wire);
+                    union_wire.insert(union_wire.end(), full_wire_activations.begin(), full_wire_activations.end());
+
+                    rg_group_assignments   = std::move(full_assignments);
+                    full_assignments       = std::move(union_assignments);
+                    full_wire_activations  = std::move(union_wire);
+                    full_selected          = u_sel;
+                    full_weights           = u_wt;
+                    full_tokens            = R;
+                    layer_assignments      = &rg_group_assignments;
+                }
+                owner->rg_hint_stash_.layer = -1;
+            }
             // WP_ISSUE_HINTS_AFTER_SEND (default ON, 0 restores the old order):
             // the hint bookkeeping used to sit in front of begin_dispatch (issue_v
             // mean 18.9 ms/step vs median 6). Move the parts that never touch a
@@ -3255,72 +3372,74 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
                 const char * e = std::getenv("WP_HINT_FLUSH_AFTER_SEND");
                 return e != nullptr && e[0] == '1';
             }();
-            owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
-            if (!hints_after_send) {
-                if (owner->router2_topm() > 0) {
-                    owner->flush_predicted_hints();
-                    owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
-                }
-                owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
-                                   full_weights, n_expert_used);
-                owner->pscore_note_routing(context->layer, full_selected, full_tokens, n_expert_used);
-                owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
-                ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
-                                     full_tokens, n_embd, n_expert_used);
-                if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
-                    capture_prefix != nullptr && capture_prefix[0] != '\0') {
-                    owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
-                                           full_selected, full_tokens, n_expert_used);
-                }
-                owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
-            } else {
-                const bool defer_sock = hint_inflight || hint_flush_after_send;
-                if (!defer_sock) {
-                    // socket-touching hints stay ahead of the send (in_flight == 0)
-                    // flush before enqueue, as before
-                    const uint64_t it_hf = wp_issue_trace::mark();
+            if (hint_owner) {
+                owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
+                if (!hints_after_send) {
                     if (owner->router2_topm() > 0) {
                         owner->flush_predicted_hints();
+                        owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
                     }
-                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_FLUSH, it_hf);
-                    const uint64_t it_hp = wp_issue_trace::mark();
-                    owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
-                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_PREFETCH, it_hp);
-                }
-                const int32_t layer_id = context->layer;
-                post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
-                                   defer_sock, &full_assignments,
-                                   wire = std::move(full_wire_activations)]() {
-                    const uint64_t it_ph = wp_issue_trace::mark();
-                    if (owner->router2_topm() > 0) {
-                        const uint64_t it_pf = wp_issue_trace::mark();
-                        if (defer_sock) {
-                            const hint_inflight_scope in_flight_ok;
-                            owner->flush_predicted_hints();
-                        }
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
-                        const uint64_t it_pe = wp_issue_trace::mark();
-                        owner->enqueue_prediction(layer_id, wire, full_tokens);
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_ENQUEUE_PRED, it_pe);
-                    }
-                    owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
-                    owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
-                    owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
-                    ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
+                    owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
+                                       full_weights, n_expert_used);
+                    owner->pscore_note_routing(context->layer, full_selected, full_tokens, n_expert_used);
+                    owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
+                    ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
                                          full_tokens, n_embd, n_expert_used);
                     if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
                         capture_prefix != nullptr && capture_prefix[0] != '\0') {
-                        owner->capture_routing(capture_prefix, layer_id, wire,
+                        owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
                                                full_selected, full_tokens, n_expert_used);
                     }
-                    if (defer_sock) {
-                        const uint64_t it_pp = wp_issue_trace::mark();
-                        const hint_inflight_scope in_flight_ok;
-                        owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
+                    owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                } else {
+                    const bool defer_sock = hint_inflight || hint_flush_after_send;
+                    if (!defer_sock) {
+                        // socket-touching hints stay ahead of the send (in_flight == 0)
+                        // flush before enqueue, as before
+                        const uint64_t it_hf = wp_issue_trace::mark();
+                        if (owner->router2_topm() > 0) {
+                            owner->flush_predicted_hints();
+                        }
+                        wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_FLUSH, it_hf);
+                        const uint64_t it_hp = wp_issue_trace::mark();
+                        owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                        wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_PREFETCH, it_hp);
                     }
-                    wp_issue_trace::add(wp_issue_trace::PH_POST_SEND_HINTS, it_ph);
-                };
+                    const int32_t layer_id = context->layer;
+                    post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
+                                       defer_sock, &full_assignments,
+                                       wire = std::move(full_wire_activations)]() {
+                        const uint64_t it_ph = wp_issue_trace::mark();
+                        if (owner->router2_topm() > 0) {
+                            const uint64_t it_pf = wp_issue_trace::mark();
+                            if (defer_sock) {
+                                const hint_inflight_scope in_flight_ok;
+                                owner->flush_predicted_hints();
+                            }
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
+                            const uint64_t it_pe = wp_issue_trace::mark();
+                            owner->enqueue_prediction(layer_id, wire, full_tokens);
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_ENQUEUE_PRED, it_pe);
+                        }
+                        owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
+                        owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
+                        owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
+                        ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
+                                             full_tokens, n_embd, n_expert_used);
+                        if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+                            capture_prefix != nullptr && capture_prefix[0] != '\0') {
+                            owner->capture_routing(capture_prefix, layer_id, wire,
+                                                   full_selected, full_tokens, n_expert_used);
+                        }
+                        if (defer_sock) {
+                            const uint64_t it_pp = wp_issue_trace::mark();
+                            const hint_inflight_scope in_flight_ok;
+                            owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
+                        }
+                        wp_issue_trace::add(wp_issue_trace::PH_POST_SEND_HINTS, it_ph);
+                    };
+                }
             }
         }
 
@@ -3467,7 +3586,8 @@ void graph_dispatcher::compute_wait(ggml_tensor *       dst,
     // WP_WAIT_ZEROCOPY: fold into the persistent pinned slot instead of dst->data;
     // the GPU consumes the slot directly (GGML_OP_WAIT_ADD), no H2D copy.
     wait_slot * slot = nullptr;
-    const int   mode = context->owner->wait_mode(context->layer, dst->ne[1], context->chunk_count, &slot);
+    const int   mode = context->owner->wait_mode(context->layer, dst->ne[1], context->chunk_count, &slot,
+                                                 context->group);
     context->owner->wait_core(context, dst, mode == 1 ? slot->data : nullptr, dst->ne[1], false);
 }
 

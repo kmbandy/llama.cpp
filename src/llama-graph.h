@@ -853,6 +853,54 @@ public:
     const llama_kv_cache_dsv4_context * mctx;
 };
 
+// WP_SPINE_ROW_GROUPS (S3): one row group of a single-sequence verify ubatch.
+// group 0 = rows [0,k) (plan.a), group 1 = rows [k,R) (plan.b). The group owns
+// a facade llm_graph_input_dsv4 (raw k_idxs / kq_mask and csa/hca/lid comp
+// inputs) whose tensors are dedicated host-filled leaves sized to the group.
+// They are never views of the whole-ubatch leaves. The raw kq_mask rows are
+// copied from the parent's kq_mask leaf, so the parent's set_input() must run
+// before this one's.
+class llm_graph_input_dsv4_rowgroup : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv4_rowgroup(
+            const llama_cparams & cparams,
+            const llama_kv_cache_dsv4_context * mctx,
+            int      group,
+            uint32_t k,
+            uint32_t R);
+    ~llm_graph_input_dsv4_rowgroup() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    int      get_group() const { return group; }
+    uint32_t get_r0()    const { return r0; }
+    uint32_t get_width() const { return width; }
+
+    const llm_graph_input_dsv4 & get_facade() const { return *facade; }
+    ggml_tensor * get_inp_pos() const { return inp_pos; }
+
+    std::unique_ptr<llm_graph_input_dsv4> facade;
+
+    // dedicated I32 [width] RoPE positions for this group's rows (replaces the
+    // graph-wide inp_pos leaf inside the group's attention/indexer rope ops)
+    ggml_tensor * inp_pos = nullptr;
+
+    // whole-ubatch raw kq_mask leaf (parent->inp_raw->self_kq_mask) that
+    // set_input() copies this group's rows from
+    ggml_tensor * parent_kq_mask = nullptr;
+
+    const llama_cparams cparams;
+    const llama_kv_cache_dsv4_context * mctx;
+
+    const int      group;
+    const uint32_t k;     // split point: group 0 = [0,k), group 1 = [k,R)
+    const uint32_t r0;    // first ubatch row of this group
+    const uint32_t width; // number of rows in this group
+};
+
+
 class llm_graph_input_attn_cross : public llm_graph_input_i {
 public:
     llm_graph_input_attn_cross(const llama_cross * cross) : cross(cross) {}
@@ -1404,6 +1452,10 @@ struct llm_graph_context {
     // building shexp (wait + add). DS4 and qwen4exp set this.
     bool moe_dispatch_split_shexp = false;
 
+    // WP_SPINE_ROW_GROUPS (S5/S6): row group (0 = A, 1 = B) being emitted by the trunk
+    // builder, or -1. Selects the group dispatch op keys and tags cb() names _gA/_gB.
+    mutable int32_t row_group_idx = -1;
+
     ggml_tensor * shexp_after_issue(ggml_tensor * cur, int il);
 
     ggml_tensor * complete_moe_dispatch(ggml_tensor * moe_or_issued,
@@ -1719,6 +1771,9 @@ struct llm_graph_context {
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
+    // WP_SPINE_ROW_GROUPS (S3): group input for rows [0,k) (group 0) or [k,R) (group 1).
+    // parent must be the whole-ubatch input built by build_inp_dsv4() for this graph.
+    llm_graph_input_dsv4_rowgroup * build_inp_dsv4_rowgroup(const llm_graph_input_dsv4 * parent, int group, uint32_t k) const;
 
     // note: if k_cur or v_cur are not provided, they will not be stored in the memory
     ggml_tensor * build_attn(
