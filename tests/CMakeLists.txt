@@ -527,6 +527,14 @@ target_link_libraries(test-dsv4-rowgroup-engram PRIVATE llama)
 target_compile_features(test-dsv4-rowgroup-engram PRIVATE cxx_std_17)
 llama_test(test-dsv4-rowgroup-engram)
 
+# WP_SPINE_ROW_GROUPS=2 end-to-end on CPU: tiny DS4.1 model with the real layer table,
+# row groups off vs on (logits + layer-input taps), plus the host-side visibility check.
+add_executable(test-dsv41-rowgroup-e2e test-dsv41-rowgroup-e2e.cpp)
+target_include_directories(test-dsv41-rowgroup-e2e PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv41-rowgroup-e2e PRIVATE llama)
+target_compile_features(test-dsv41-rowgroup-e2e PRIVATE cxx_std_17)
+llama_test(test-dsv41-rowgroup-e2e)
+
 # WP_WAIT_ZEROCOPY per-(layer, group) pinned wait-slot keys (pure keying logic).
 add_executable(test-dsv4-rowgroup-wait-slot test-dsv4-rowgroup-wait-slot.cpp)
 target_include_directories(test-dsv4-rowgroup-wait-slot PRIVATE ${CMAKE_SOURCE_DIR}/src/pipeline)

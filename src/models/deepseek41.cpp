@@ -433,6 +433,17 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                     {n_head * n_embd_head / o_groups, o_lora_rank}, flags | TENSOR_NOT_REQUIRED);
         }
         if (!(flags & TENSOR_SKIP)) { // MTP layers skipped at load have neither form, by design
+            // A synthetic (user-metadata) load creates every requested tensor, absent or not.
+            // Keep only the wo_a form the metadata actually carries; for a file load
+            // create_tensor already returned null for an absent form, so this is a no-op.
+            if (ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_A, "weight", i).str().c_str()) == nullptr) {
+                layer.wo_a = nullptr;
+            }
+            for (int64_t g = 0; g < o_groups; ++g) {
+                if (ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_A_SPLIT, "weight", i, (int) g).str().c_str()) == nullptr) {
+                    layer.wo_a_g[g] = nullptr;
+                }
+            }
             int64_t n_split = 0;
             for (int64_t g = 0; g < o_groups; ++g) {
                 n_split += layer.wo_a_g[g] != nullptr;
@@ -3292,6 +3303,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     bool row_groups_active = false;
     {
         const char * e = std::getenv("WP_SPINE_ROW_GROUPS");
+        // TEST-ONLY relaxation: CPU end-to-end tests have no expert dispatcher.
+        const char * rg_nd = std::getenv("WP_SPINE_ROW_GROUPS_ALLOW_NO_DISPATCH");
+        const bool rg_no_dispatch_relaxed = rg_nd != nullptr && rg_nd[0] == '1' && expert_dispatch == nullptr;
         if (e != nullptr && std::strcmp(e, "2") == 0) {
             uint32_t min_rows = 2;
             if (const char * m = std::getenv("WP_SPINE_ROW_GROUPS_MIN_ROWS")) {
@@ -3331,6 +3345,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 why = "non-consecutive-pos";
             } else if (R < 2 * min_rows || R > 16) {
                 why = "rows-out-of-range";
+            } else if (rg_no_dispatch_relaxed) {
+                // TEST-ONLY (WP_SPINE_ROW_GROUPS_ALLOW_NO_DISPATCH=1): with no expert
+                // dispatcher, complete_moe_dispatch() is a plain add, so the dispatch
+                // checks are vacuous. Production (env unset) never takes this branch.
             } else if (expert_dispatch == nullptr || !moe_dispatch_split_shexp) {
                 why = "no-split-dispatch";
             } else if (expert_dispatch->dispatch_chunks() != 1) {
@@ -3364,13 +3382,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 rg_k = (R + 1) / 2;
             }
             if (std::getenv("WP_SPINE_ROW_GROUPS_LOG") != nullptr) {
-                static std::string last_reason;
+                // one line per graph build (no dedupe): the CPU end-to-end test counts "active" lines
                 const std::string reason = why ? why : "active";
-                if (reason != last_reason) {
-                    last_reason = reason;
-                    LLAMA_LOG_WARN("%s: WP_SPINE_ROW_GROUPS=2 %s R=%u k=%u n_layer=%d reason=%s\n", __func__,
-                            row_groups_active ? "active" : "fallback", R, rg_k, n_layer, reason.c_str());
-                }
+                LLAMA_LOG_WARN("%s: WP_SPINE_ROW_GROUPS=2 %s R=%u k=%u n_layer=%d reason=%s\n", __func__,
+                        row_groups_active ? "active" : "fallback", R, rg_k, n_layer, reason.c_str());
             }
         }
     }
