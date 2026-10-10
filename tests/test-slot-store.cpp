@@ -209,14 +209,32 @@ int main() {
         assert(fs::is_symlink(r));
         assert(slot_store_list(r.string()).empty());
 
-        // trailing separators must not get past the symlink check
-        for (const std::string suffix : { std::string("/"), std::string("//") }) {
+        // trailing separators and "." components must not get past the symlink check
+        for (const std::string suffix : { std::string("/"), std::string("//"),
+                                          std::string("/."), std::string("/./"), std::string("/.//") }) {
             const std::string p = r.string() + suffix;
             slot_store_touch(p);
             assert(!fs::exists(outside / ".last_used"));
             assert(slot_store_list(p).empty());
         }
+        // a ".." that resolves back to the link name must not get past the check either
+        {
+            const std::string p = (root / "x" / ".." / "alias-link").string();
+            slot_store_touch(p);
+            assert(!fs::exists(outside / ".last_used"));
+            assert(slot_store_list(p).empty());
+        }
         assert(fs::is_symlink(r));
+
+        // a residual ".." (escaping root) and a bare "." are refused: nothing is created
+        {
+            const fs::path rel = fs::path("..") / ("slot-store-probe-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            slot_store_touch(rel.string());
+            assert(!fs::exists(rel));
+            assert(slot_store_list(rel.string()).empty());
+            slot_store_touch(".");
+            assert(!fs::exists(fs::path(".") / ".last_used"));
+        }
     }
 
     // foreign dirs (unmarked, not only slot files) are never deleted nor counted

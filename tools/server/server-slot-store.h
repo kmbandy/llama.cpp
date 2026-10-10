@@ -18,8 +18,10 @@ std::string slot_store_file(const std::string & dir, int slot_id);
 std::vector<int> slot_store_list(const std::string & dir);
 
 // Marks dir as recently used: creates dir if needed and (re)writes dir/.last_used,
-// whose mtime is the LRU key. Refuses (logs, writes nothing) when dir is a symlink, so an
-// alias dir can never redirect writes outside root.
+// whose mtime is the LRU key. dir is lexically normalised before the symlink check, so
+// spellings such as "<link>/." or "<root>/x/../<link>" cannot bypass it. Refuses (logs,
+// writes nothing) when dir is a symlink or still has a ".." component after normalisation,
+// so an alias dir can never redirect writes outside root.
 void slot_store_touch(const std::string & dir);
 
 // Deletes slot-store dirs directly under root, least recently used first, until the bytes of

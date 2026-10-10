@@ -58,13 +58,31 @@ bool is_regular_nofollow(const fs::path & p) {
     return !ec && fs::is_regular_file(st);
 }
 
-// Symlink itself (not its target), judged without following it. Trailing separators are
-// stripped first: symlink_status("link/") resolves the link and would report a directory.
-bool is_symlink_nofollow(const fs::path & path) {
-    fs::path p = path;
+// Normalises a caller-supplied alias dir before any symlink check or use. lexically_normal()
+// folds "." components ("a/link/." -> "a/link/"), then trailing separators are stripped so
+// symlink_status() judges the entry itself: symlink_status("link/") resolves the link and
+// would report a directory. Returns false (caller refuses) when the result still has a ".."
+// component (e.g. "../x"), or is empty or "." (no alias name), since those could escape root.
+bool normalise_alias_dir(const fs::path & in, fs::path & out) {
+    fs::path p = in.lexically_normal();
+    for (const fs::path & part : p) {
+        if (part == "..") {
+            return false;
+        }
+    }
     while (p.filename().empty() && p.parent_path() != p) {
         p = p.parent_path();
     }
+    if (p.empty() || p.filename() == ".") {
+        return false;
+    }
+    out = p;
+    return true;
+}
+
+// Symlink itself (not its target), judged without following it. Callers pass a path that
+// normalise_alias_dir() has already processed.
+bool is_symlink_nofollow(const fs::path & p) {
     std::error_code ec;
     return fs::is_symlink(fs::symlink_status(p, ec));
 }
@@ -180,16 +198,21 @@ std::string slot_store_file(const std::string & dir, int slot_id) {
 
 std::vector<int> slot_store_list(const std::string & dir) {
     std::vector<int> ids;
-    if (is_symlink_nofollow(fs::path(dir))) {
+    fs::path d;
+    if (!normalise_alias_dir(fs::path(dir), d)) {
+        LOG_WRN("slot-store: refusing to list %s: alias dir is not a plain name under root\n", dir.c_str());
+        return ids;
+    }
+    if (is_symlink_nofollow(d)) {
         LOG_WRN("slot-store: refusing to list %s: alias dir is a symlink\n", dir.c_str());
         return ids;
     }
     try {
         std::error_code ec;
-        fs::directory_iterator it(dir, ec);
+        fs::directory_iterator it(d, ec);
         const fs::directory_iterator end;
         if (ec) {
-            if (fs::exists(dir, ec)) {
+            if (fs::exists(d, ec)) {
                 LOG_WRN("slot-store: cannot list %s: %s\n", dir.c_str(), ec.message().c_str());
             }
             return ids;
@@ -212,7 +235,11 @@ std::vector<int> slot_store_list(const std::string & dir) {
 }
 
 void slot_store_touch(const std::string & dir) {
-    const fs::path d(dir);
+    fs::path d;
+    if (!normalise_alias_dir(fs::path(dir), d)) {
+        LOG_WRN("slot-store: refusing to touch %s: alias dir is not a plain name under root\n", dir.c_str());
+        return;
+    }
     // an alias dir that is a symlink could point outside root: refuse before any write
     if (is_symlink_nofollow(d)) {
         LOG_WRN("slot-store: refusing to touch %s: alias dir is a symlink\n", dir.c_str());
