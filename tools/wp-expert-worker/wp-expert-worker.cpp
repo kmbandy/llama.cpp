@@ -27287,6 +27287,81 @@ bool wp_worker_pipeline_enabled() {
     return on;
 }
 
+// WP_WORKER_TWO_IN_FLIGHT=1 -- DEFAULT OFF. "Lookahead prepare": while request
+// N computes on the GPU, the compute thread prepares request N+1 (page
+// lookup, slot reservation, NVMe/CPU-tier IO issue) so its page-in latency is
+// hidden under N. The full design lives in the S1..S9 commit series; with the
+// knob off no lookahead branch is taken anywhere (byte-identical path).
+// Requires WP_WORKER_PIPELINE (default on); the multi-device and MULTI_CONN
+// restrictions are enforced at the call site (serve_connection) so the
+// reason can be printed once.
+bool wp_worker_two_in_flight_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_TWO_IN_FLIGHT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// Sub-knob: run the CPU-tier compute of request N+1 at prepare time (queued
+// behind N's CPU job). Default ON under the main knob; =0 for A/B only.
+bool wp_worker_two_in_flight_cpu_compute_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_TWO_IN_FLIGHT_CPU_COMPUTE");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
+}
+
+// Sub-knob: headroom margin for the lookahead slot dry run (need * margin
+// unpinned slots must exist). Default 2. Clamped to [1, 16].
+int wp_worker_two_in_flight_slot_margin() {
+    static const int m = [] {
+        const char * e = std::getenv("WP_WORKER_TWO_IN_FLIGHT_SLOT_MARGIN");
+        if (e == nullptr || e[0] == '\0') { return 2; }
+        const long v = std::strtol(e, nullptr, 10);
+        return (int) (v < 1 ? 1 : (v > 16 ? 16 : v));
+    }();
+    return m;
+}
+
+// WP_WORKER_TWO_IN_FLIGHT_STATS=1 -- DEFAULT OFF. Prints the lookahead counters
+// every 20k prepared requests (see WpLookaheadStats).
+bool wp_worker_two_in_flight_stats_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_WORKER_TWO_IN_FLIGHT_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
+// Decline reasons for a lookahead attempt. Values are the aux codes written by
+// WP_SPAN_LOOKAHEAD_DECLINE (see wp_span_kind enum).
+enum WpLookaheadDecline : uint8_t {
+    WP_LA_DECLINE_NONE = 0,
+    WP_LA_DECLINE_HEADROOM = 1,   // not enough unpinned slots for N+1's misses
+    WP_LA_DECLINE_OVERLAP  = 2,   // N+1 needs a page N has reserved but not drained
+    WP_LA_DECLINE_SAME_LAYER = 3, // N+1 is the same layer as N (imm/deferred pairs)
+    WP_LA_DECLINE_ARENA    = 4,   // host arena headroom too small
+    WP_LA_DECLINE_SPEC     = 5,   // speculative read in flight for an N+1 page
+    WP_LA_DECLINE_PARK     = 6,   // park/unpark pending
+    WP_LA_DECLINE_EXCEPTION = 7,  // prepare threw; lookahead dropped
+    WP_LA_DECLINE_INELIGIBLE = 8, // front frame not a plain DISPATCH_REQ, or other gate
+    WP_LA_DECLINE_COUNT
+};
+
+// Counters for WP_WORKER_TWO_IN_FLIGHT. Written only on the connection's compute
+// thread (prepare, consume, decline all run there), so plain integers suffice.
+struct WpLookaheadStats {
+    uint64_t n_prepared = 0;     // lookahead slots filled
+    uint64_t n_consumed = 0;     // lookahead slots dispatched (should equal n_prepared minus abandons)
+    uint64_t n_waited   = 0;     // consumed slots whose N+1 frame arrived before N finished (overlap used)
+    uint64_t n_abandoned = 0;    // prepared but dropped (park, exception, connection end)
+    uint64_t n_declined[WP_LA_DECLINE_COUNT] = {};
+    uint64_t ns_prepare = 0;     // total wall time spent preparing N+1
+    uint64_t ns_hidden  = 0;     // sum of (consume time - prepare end) for consumed slots
+};
+
 // WP_REQ_LOG_TIMELINE=1 -- DEFAULT OFF. Sub-knob of WP_REQ_LOG: appends the
 // extra per-request columns needed to join this worker's own timeline against
 // the spine's WP_DISPATCH_REQ_LOG_TIMELINE=1 rows (scripts/wp-req-timeline.py)
