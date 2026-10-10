@@ -3306,8 +3306,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             for (uint32_t i = 1; consecutive && i < R; ++i) {
                 consecutive = ubatch.pos[i] == ubatch.pos[0] + (llama_pos) i;
             }
-            if (params.gtype != LLM_GRAPH_TYPE_DECODER) {
-                why = "not-decoder";
+            // The main context's graph is LLM_GRAPH_TYPE_DEFAULT (ctx_type_to_graph_type);
+            // DECODER is encoder-decoder only. Draft graphs (MTP / DSPARK stages, layers
+            // n_layer..n_layer_all, and sidecar draft contexts borrowing the target's
+            // tensors via ctx_other) must never reach this trunk path, so exclude them
+            // explicitly as well as by graph type.
+            const bool draft_graph = params.gtype == LLM_GRAPH_TYPE_DECODER_MTP ||
+                                     params.gtype == LLM_GRAPH_TYPE_DECODER_DSPARK ||
+                                     params.cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+                                     params.cparams.ctx_other != nullptr;
+            if (params.gtype != LLM_GRAPH_TYPE_DEFAULT) {
+                why = "not-default-graph";
+            } else if (draft_graph) {
+                why = "draft-graph";
             } else if (ubatch.embd != nullptr) {
                 why = "embd-ubatch";
             } else if (ubatch.n_seqs != 1) {
@@ -3342,7 +3353,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 const std::string reason = why ? why : "active";
                 if (reason != last_reason) {
                     last_reason = reason;
-                    LLAMA_LOG_INFO("%s: WP_SPINE_ROW_GROUPS=2 %s R=%u k=%u n_layer=%d reason=%s\n", __func__,
+                    LLAMA_LOG_WARN("%s: WP_SPINE_ROW_GROUPS=2 %s R=%u k=%u n_layer=%d reason=%s\n", __func__,
                             row_groups_active ? "active" : "fallback", R, rg_k, n_layer, reason.c_str());
                 }
             }
