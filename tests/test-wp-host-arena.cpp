@@ -366,6 +366,52 @@ static void test_try_acquire_nonblocking_contract() {
     }
 }
 
+// WP_WORKER_TWO_IN_FLIGHT (late refusal): a prepared lookahead batch that is
+// discarded at take gives back every arena resource it acquired through the
+// try-only API. The worker's discard path is: reader-side failed reads free
+// their Reading entry (finish_read ok=false); landed-but-undrained reads drop
+// their keep_borrowed token (release); RAM-hit borrows are released. Afterwards
+// the arena must be back at baseline (no Reading, no pinned bytes) and every
+// entry must be reusable (a full refill never refuses).
+static void test_lookahead_discard_releases_arena_accounting() {
+    using TA = HostArena::TryAcquire;
+    CountingAlloc a;
+    HostArena arena;
+    require(arena.init(cfg(4), a.alloc(), a.dealloc()), "discard: init");
+    void * data = nullptr; HostArena::Handle h = 0;
+    require(arena.begin_read(0, false, &data, &h), "discard: resident 0");
+    std::memset(data, 0x3A, ENTRY);
+    arena.finish_read(0, h, true);
+    require(arena.reading_count() == 0 && arena.pinned_bytes() == 0, "discard: baseline");
+
+    // Lookahead acquisitions: a RAM hit, a landed miss, and a miss whose read fails.
+    const void * hsrc = nullptr; void * hd = nullptr; HostArena::Handle hb = 0;
+    require(arena.try_acquire_nonblocking(0, &hsrc, &hd, &hb) == TA::Hit, "discard: hit");
+    const void * rsrc = nullptr; void * rdata = nullptr; HostArena::Handle rh = 0;
+    require(arena.try_acquire_nonblocking(1, &rsrc, &rdata, &rh) == TA::Reserved, "discard: reserve 1");
+    std::memset(rdata, 0x4B, ENTRY);
+    arena.finish_read(1, rh, true, /*keep_borrowed=*/true);   // landed, undrained
+    const void * fsrc = nullptr; void * fdata = nullptr; HostArena::Handle fh = 0;
+    require(arena.try_acquire_nonblocking(2, &fsrc, &fdata, &fh) == TA::Reserved, "discard: reserve 2");
+    require(arena.reading_count() == 1 && arena.state_of(2) == HostArena::State::Reading,
+            "discard: acquired state visible");
+    arena.finish_read(2, fh, /*ok=*/false);                   // reader-side failure
+
+    // Discard: release exactly what each acquisition handed out.
+    arena.release(0, hb);
+    arena.release(1, rh);
+    require(arena.reading_count() == 0, "discard: no Reading entry left");
+    require(arena.pinned_bytes() == 0, "discard: no explicit pins left");
+    require(arena.state_of(2) == HostArena::State::Free, "discard: failed page freed");
+
+    // Every entry is reusable: a full refill must not refuse.
+    for (int p = 10; p < 14; ++p) {
+        require(arena.begin_read(p, false, &data, &h), "discard: refill never refuses");
+        arena.finish_read(p, h, true);
+    }
+    require(arena.reading_count() == 0 && arena.pinned_bytes() == 0, "discard: back to baseline");
+}
+
 static void test_stale_handle_is_noop() {
     CountingAlloc a;
     HostArena arena;
@@ -1506,6 +1552,7 @@ int main() {
         test_inflight_cap_and_pinned_cap();
         test_try_only_refusal_is_nonblocking_and_mutates_nothing();
         test_try_acquire_nonblocking_contract();
+        test_lookahead_discard_releases_arena_accounting();
         test_stale_handle_is_noop();
         test_finish_read_keep_borrowed();
         test_tier_cap_zero_frees_on_release();
