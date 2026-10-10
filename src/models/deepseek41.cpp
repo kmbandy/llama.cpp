@@ -3321,7 +3321,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 why = "draft-graph";
             } else if (ubatch.embd != nullptr) {
                 why = "embd-ubatch";
-            } else if (ubatch.n_seqs != 1) {
+            } else if (ubatch.n_seqs_unq != 1) {
                 why = "multi-seq";
             } else if (hparams.n_pos_per_embd() != 1) {
                 why = "mrope";
