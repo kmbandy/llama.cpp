@@ -8117,6 +8117,17 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // WP_HINT_TRACE type 7 ACCEPT record (no-op unless tracing is on). flags bit2 = replay round.
+                if (llama_hint_trace_enabled(slot.ctx_tgt)) {
+                    uint32_t trace_flags = 0;
+                    if (slot.spec_is_replay) {
+                        trace_flags |= 4;
+                    }
+                    llama_hint_trace_accept(slot.ctx_tgt, slot.stream_slot_idx, (uint32_t) n_draft,
+                            slot.spec_draft.data(), (uint32_t) (accepted.size() - 1),
+                            accepted.data(), (uint32_t) accepted.size(), trace_flags);
+                }
+
                 // MAD-LAB (WP_MTP_DRAFT_SWA_DEBUG): for the first 32 draft
                 // rejections that occur once the sequence position exceeds the
                 // draft-mtp SWA ring's window (WP_MTP_DRAFT_SWA), log the

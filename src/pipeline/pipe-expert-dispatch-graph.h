@@ -273,6 +273,15 @@ class graph_dispatcher {
     void trace_batch(const int32_t * tokens, uint32_t n_rows, int32_t pos0) noexcept;
     void trace_draft(uint32_t n_slots, const int32_t * tokens, const float * conf, int32_t anchor,
                      const float * hidden, uint32_t n_embd_h, uint32_t flags) noexcept;
+    // WP_HINT_TRACE type 6 LENS / type 7 ACCEPT (same queue and file). No-ops when
+    // WP_HINT_TRACE is unset. Never block or throw; overflow is counted as dropped_all.
+    //   trace_lens:   data[n_rows][n_embd] f32 rows of one layer's hidden state, tagged with
+    //                 the current step. Converted to WP_LENS_DTYPE (f32|f16|bf16) on the caller.
+    //   trace_accept: draft[n_draft] (the verify's draft tokens) and emitted[n_emitted]
+    //                 (target-sampled tokens, accepted[] of the server), tagged with the step.
+    void trace_lens(uint32_t layer, uint32_t n_rows, uint32_t n_embd, const float * data) noexcept;
+    void trace_accept(int32_t seq, uint32_t n_draft, const int32_t * draft, uint32_t n_accepted,
+                      const int32_t * emitted, uint32_t n_emitted, uint32_t flags) noexcept;
     void end_decode() noexcept;
     uint64_t decode_dispatch_ns() const noexcept { return decode_ns_total_; }
 
@@ -686,7 +695,7 @@ class graph_dispatcher {
     // WP_HINT_TRACE state. trace_step_ is bumped by begin_decode() (dispatch
     // thread, under io_mutex_) and read by trace_layer() on the same thread.
     struct trace_job {
-        uint32_t              kind     = 1;   // 1 ROUTING (+PRED), 4 DRAFT, 5 BATCH
+        uint32_t              kind     = 1;   // 1 ROUTING (+PRED), 4 DRAFT, 5 BATCH, 6 LENS, 7 ACCEPT
         uint32_t              step     = 0;
         int32_t               layer    = -1;
         uint32_t              n_rows   = 0;
@@ -704,6 +713,15 @@ class graph_dispatcher {
         uint32_t              flags    = 0;
         int32_t               anchor   = -1;
         int32_t               pos0     = -1;
+        // kind 6 LENS: layer, n_rows, n_embd_h = n_embd, dtype, flags, blob = raw rows in dtype.
+        // kind 7 ACCEPT: seq, n_rows = n_draft (draft ids in tokens), n_accepted,
+        //                n_emitted, emitted[n_emitted], flags.
+        uint32_t              dtype      = 0;   // 0 f32, 1 f16, 2 bf16
+        int32_t               seq        = 0;
+        uint32_t              n_accepted = 0;
+        uint32_t              n_emitted  = 0;
+        std::vector<int32_t>  emitted;
+        std::vector<uint8_t>  blob;
     };
     void trace_push_aux(trace_job && job);
     std::mutex                                     trace_mutex_;

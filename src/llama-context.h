@@ -78,6 +78,9 @@ struct llama_context {
     bool hint_trace_enabled() const;
     void hint_trace_draft(uint32_t n_slots, const llama_token * tokens, const float * conf,
                           llama_token anchor, const float * hidden, uint32_t n_embd_h, uint32_t flags);
+    // WP_HINT_TRACE type 7 ACCEPT (see llama_hint_trace_accept in llama-ext.h).
+    void hint_trace_accept(llama_seq_id seq, uint32_t n_draft, const llama_token * draft,
+                           uint32_t n_accepted, const llama_token * emitted, uint32_t n_emitted, uint32_t flags);
 
     ggml_backend_sched_t get_sched() const;
 

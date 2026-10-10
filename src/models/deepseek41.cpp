@@ -17,9 +17,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // DeepSeek-V4.1.
@@ -843,6 +847,77 @@ static ggml_tensor * dsv41_hc_mean(ggml_context * ctx0, ggml_tensor * x) {
         acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
     }
     return ggml_scale(ctx0, acc, 1.0f/hc);
+}
+
+// WP_LENS_LAYERS=<comma-separated layer ids>: logit-lens tap for WP_HINT_TRACE
+// capture (graph_dispatcher::trace_lens). Parsed once; unset or empty = no tap.
+static const std::set<int> & dsv41_lens_layers() {
+    static const std::set<int> layers = [] {
+        std::set<int> s;
+        const char * p = std::getenv("WP_LENS_LAYERS");
+        while (p != nullptr && *p != '\0') {
+            char * end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) {
+                ++p;
+                continue;
+            }
+            if (v >= 0) {
+                s.insert((int) v);
+            }
+            p = end;
+        }
+        return s;
+    }();
+    return layers;
+}
+
+struct dsv41_lens_ud {
+    pipe_expert_dispatcher::graph_dispatcher * disp;
+    int layer;
+};
+
+// The callback userdata must outlive graph execution, and a reused graph runs
+// its callbacks on every decode step. One entry per (dispatcher, layer) is kept
+// for the process lifetime (unique_ptr, so the address is stable).
+static dsv41_lens_ud * dsv41_lens_userdata(pipe_expert_dispatcher::graph_dispatcher * disp, int layer) {
+    static std::mutex mtx;
+    static std::map<std::pair<const void *, int>, std::unique_ptr<dsv41_lens_ud>> reg;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto & slot = reg[std::make_pair((const void *) disp, layer)];
+    if (!slot) {
+        slot.reset(new dsv41_lens_ud{ disp, layer });
+    }
+    return slot.get();
+}
+
+// Read-only CPU custom op: dst is never consumed and no model value depends on
+// it. Copies a [n_embd, n_rows] f32 view (any strides) into a contiguous buffer
+// and hands it to the dispatcher's trace. Runs on thread 0 only (n_tasks = 1).
+static void dsv41_lens_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    try {
+        const auto * u = static_cast<const dsv41_lens_ud *>(ud);
+        const uint32_t n_embd = (uint32_t) a->ne[0];
+        const uint32_t n_rows = (uint32_t) a->ne[1];
+        if (u == nullptr || u->disp == nullptr || a->data == nullptr || n_rows == 0 || n_embd == 0) {
+            return;
+        }
+        std::vector<float> buf((size_t) n_embd * n_rows);
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            const char * row = (const char *) a->data + (size_t) r * a->nb[1];
+            for (uint32_t c = 0; c < n_embd; ++c) {
+                std::memcpy(&buf[(size_t) r * n_embd + c], row + (size_t) c * a->nb[0], sizeof(float));
+            }
+        }
+        u->disp->trace_lens((uint32_t) u->layer, n_rows, n_embd, buf.data());
+    } catch (...) {
+        // trace_lens never throws; a failed copy just loses this tap.
+    }
 }
 
 ggml_tensor * llama_model_deepseek41::graph::identity_pre_mix() const {
@@ -3575,6 +3650,16 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         GGML_ASSERT(inpL->ne[2] == (int64_t) R);
     }
 
+    // WP_LENS_LAYERS tap gate, decided once per graph build. Same draft-graph
+    // exclusion as the row-groups gate (main context only), plus a dispatcher
+    // and WP_HINT_TRACE. Pure function of env and ubatch shape, so reuse-safe.
+    const bool lens_graph_ok = !row_groups_active && !ced_trim && !ced_skip_nonfinal &&
+        expert_dispatch != nullptr && pipe_expert_dispatcher::graph_dispatcher::hint_trace_enabled() &&
+        params.gtype == LLM_GRAPH_TYPE_DEFAULT &&
+        params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.cparams.ctx_other == nullptr &&
+        n_tokens >= 2 && n_tokens <= 32 && ubatch.token != nullptr && ubatch.n_seqs_unq == 1;
+    const std::set<int> & lens_layers = dsv41_lens_layers();
+
     for (int il = 0; il < n_layer && !row_groups_active; ++il) {
         // CED prefill trim (WP_DSV41_CED_SKIP_NONFINAL): on a non-final
         // ubatch (nothing reads this graph's output), every decoder-range
@@ -3796,6 +3881,18 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+
+        // WP_LENS_LAYERS logit-lens tap: collapse the post-layer-il stream with
+        // layer il's own FFN mix (pre_mix, set above), i.e. what the final path
+        // at hc_collapse would compute if il were the last layer. Output unused;
+        // forward-expanded so it executes. Pinned to CPU so the copy is host-side.
+        if (lens_graph_ok && lens_layers.count(il) != 0) {
+            ggml_tensor * h = build_hc_pre(inpL, pre_mix, -1);  // [n_embd, nt]
+            ggml_tensor * t = ggml_map_custom1(ctx0, h, dsv41_lens_cb, 1,
+                    dsv41_lens_userdata(expert_dispatch, il));
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            ggml_build_forward_expand(gf, t);
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {

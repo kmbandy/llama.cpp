@@ -1720,8 +1720,9 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
 // floats are little-endian (host order on every supported target).
 //
 //   file   := header record*
-//   header := "WPHT1\0\0\0" u32 version(=1) u32 n_expert u32 n_embd u32 trace_k
+//   header := "WPHT1\0\0\0" u32 version(=2) u32 n_expert u32 n_embd u32 trace_k
 //             u32 top_n(=16) u32 pid u32 reserved[4]                  (48 bytes)
+//                                  (version 2 adds types 6 LENS and 7 ACCEPT)
 //   record := u32 type u32 payload_bytes payload
 //   type 1 ROUTING: u32 step i32 layer u32 n_rows u32 k u32 phantom_mask u32 flags
 //                   i32 ids[n_rows][k]  f32 gate[n_rows][k]
@@ -1740,6 +1741,16 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
 //   type 5 BATCH:   u32 step u32 n_rows i32 pos0 i32 token[n_rows]
 //                   input tokens of every decode call with <= 32 rows (target verify AND
 //                   draft decodes), keyed by the same step as ROUTING.
+//   type 6 LENS:    u32 step u32 layer u32 n_rows u32 n_embd u32 dtype(0=f32,1=f16,2=bf16)
+//                   u32 flags(=0) data[n_rows][n_embd] (dtype-sized elements, row-major).
+//                   Hidden-state rows of one layer; row order = ubatch row order (row 0 =
+//                   committed token, rows 1.. = drafts [+ phantoms]). dtype from WP_LENS_DTYPE
+//                   (f32 default), converted on the caller thread.
+//   type 7 ACCEPT:  u32 step u32 seq u32 n_draft u32 n_accepted u32 n_emitted u32 flags
+//                   i32 draft[n_draft] i32 emitted[n_emitted]
+//                   draft = draft tokens of the verify; emitted = target-sampled tokens
+//                   (accepted[] from the server, emitted[i] = sample at verify row i).
+//                   flags bit0 = row-drop armed, bit1 = capped by row-drop, bit2 = replay round.
 // flags bit0 = decode batch (always set: prefill ubatches are not traced).
 // dist[i] = target_layer - src_layer; only targets with a registered router
 // are listed. 0xFFFF in ids = padding.
@@ -1748,6 +1759,8 @@ static constexpr uint32_t TRACE_REC_PRED    = 2;
 static constexpr uint32_t TRACE_REC_FOOTER  = 3;
 static constexpr uint32_t TRACE_REC_DRAFT   = 4;
 static constexpr uint32_t TRACE_REC_BATCH   = 5;
+static constexpr uint32_t TRACE_REC_LENS    = 6;
+static constexpr uint32_t TRACE_REC_ACCEPT  = 7;
 static constexpr uint32_t TRACE_TOP_N       = 16;
 static constexpr int64_t  TRACE_MAX_ROWS    = 32;   // above this = prefill, not traced
 
@@ -1858,6 +1871,81 @@ void graph_dispatcher::trace_draft(uint32_t n_slots, const int32_t * tokens, con
     }
 }
 
+// WP_LENS_DTYPE: f32 (default) | f16 | bf16. Read once; unknown values fall back to f32.
+static uint32_t trace_lens_dtype() {
+    static const uint32_t dtype = [] {
+        const char * v = std::getenv("WP_LENS_DTYPE");
+        if (v == nullptr || v[0] == '\0' || std::strcmp(v, "f32") == 0) {
+            return (uint32_t) 0;
+        }
+        if (std::strcmp(v, "f16") == 0) {
+            return (uint32_t) 1;
+        }
+        if (std::strcmp(v, "bf16") == 0) {
+            return (uint32_t) 2;
+        }
+        std::fprintf(stderr, "WP_LENS_DTYPE: unknown value '%s', using f32\n", v);
+        return (uint32_t) 0;
+    }();
+    return dtype;
+}
+
+void graph_dispatcher::trace_lens(uint32_t layer, uint32_t n_rows, uint32_t n_embd, const float * data) noexcept {
+    if (hint_trace_path() == nullptr || data == nullptr || n_rows == 0 || n_embd == 0) {
+        return;
+    }
+    try {
+        const uint32_t dtype = trace_lens_dtype();
+        const size_t   n     = (size_t) n_rows * (size_t) n_embd;
+        trace_job job;
+        job.kind   = TRACE_REC_LENS;
+        job.step   = trace_step_.load(std::memory_order_relaxed);
+        job.layer  = (int32_t) layer;
+        job.n_rows = n_rows;
+        job.n_embd_h = n_embd;
+        job.dtype  = dtype;
+        job.flags  = 0;
+        if (dtype == 1) {
+            job.blob.resize(n * sizeof(ggml_fp16_t));
+            ggml_fp32_to_fp16_row(data, (ggml_fp16_t *) job.blob.data(), (int64_t) n);
+        } else if (dtype == 2) {
+            job.blob.resize(n * sizeof(ggml_bf16_t));
+            ggml_fp32_to_bf16_row(data, (ggml_bf16_t *) job.blob.data(), (int64_t) n);
+        } else {
+            job.blob.resize(n * sizeof(float));
+            std::memcpy(job.blob.data(), data, n * sizeof(float));
+        }
+        trace_push_aux(std::move(job));
+    } catch (...) {
+    }
+}
+
+void graph_dispatcher::trace_accept(int32_t seq, uint32_t n_draft, const int32_t * draft, uint32_t n_accepted,
+                                    const int32_t * emitted, uint32_t n_emitted, uint32_t flags) noexcept {
+    if (hint_trace_path() == nullptr || (n_draft > 0 && draft == nullptr) ||
+        (n_emitted > 0 && emitted == nullptr)) {
+        return;
+    }
+    try {
+        trace_job job;
+        job.kind       = TRACE_REC_ACCEPT;
+        job.step       = trace_step_.load(std::memory_order_relaxed);
+        job.seq        = seq;
+        job.n_rows     = n_draft;
+        job.n_accepted = n_accepted;
+        job.n_emitted  = n_emitted;
+        job.flags      = flags;
+        if (n_draft > 0) {
+            job.tokens.assign(draft, draft + n_draft);
+        }
+        if (n_emitted > 0) {
+            job.emitted.assign(emitted, emitted + n_emitted);
+        }
+        trace_push_aux(std::move(job));
+    } catch (...) {
+    }
+}
+
 void graph_dispatcher::trace_push_aux(trace_job && job) {
     if (!trace_thread_started_.exchange(true)) {
         trace_thread_ = std::thread([this] { trace_loop(); });
@@ -1896,7 +1984,7 @@ void graph_dispatcher::trace_loop() {
     {
         const char magic[8] = { 'W', 'P', 'H', 'T', '1', 0, 0, 0 };
         put(magic, sizeof(magic));
-        put_u32(1);
+        put_u32(2);
         put_u32((uint32_t) n_expert);
         put_u32((uint32_t) n_embd);
         put_u32((uint32_t) trace_k);
@@ -1941,6 +2029,31 @@ void graph_dispatcher::trace_loop() {
                 put(job.conf.data(), job.conf.size() * sizeof(float));
                 put(&job.anchor, sizeof(int32_t));
                 put(job.hidden.data(), job.hidden.size() * sizeof(float));
+                continue;
+            }
+            if (job.kind == TRACE_REC_LENS) {
+                put_u32(TRACE_REC_LENS);
+                put_u32((uint32_t) (6 * 4 + job.blob.size()));
+                put_u32(job.step);
+                put_u32((uint32_t) job.layer);
+                put_u32(job.n_rows);
+                put_u32(job.n_embd_h);
+                put_u32(job.dtype);
+                put_u32(job.flags);
+                put(job.blob.data(), job.blob.size());
+                continue;
+            }
+            if (job.kind == TRACE_REC_ACCEPT) {
+                put_u32(TRACE_REC_ACCEPT);
+                put_u32((uint32_t) (6 * 4 + job.tokens.size() * 4 + job.emitted.size() * 4));
+                put_u32(job.step);
+                put_u32((uint32_t) job.seq);
+                put_u32(job.n_rows);
+                put_u32(job.n_accepted);
+                put_u32(job.n_emitted);
+                put_u32(job.flags);
+                put(job.tokens.data(), job.tokens.size() * sizeof(int32_t));
+                put(job.emitted.data(), job.emitted.size() * sizeof(int32_t));
                 continue;
             }
             {

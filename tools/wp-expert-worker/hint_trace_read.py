@@ -5,7 +5,7 @@
 Pure numpy. Usage:  hint_trace_read.py TRACE.bin [--max-m 6] [--max-d 6]
 
 Format (little-endian):
-  header (48 B): "WPHT1\\0\\0\\0" u32 version u32 n_expert u32 n_embd u32 trace_k
+  header (48 B): "WPHT1\\0\\0\\0" u32 version(1 or 2) u32 n_expert u32 n_embd u32 trace_k
                  u32 top_n u32 pid u32 reserved[4]
   record: u32 type, u32 payload_bytes, payload
     1 ROUTING: u32 step i32 layer u32 n_rows u32 k u32 phantom_mask u32 flags
@@ -19,11 +19,15 @@ Format (little-endian):
                token -1 = slot not drafted. Slot i's token is verify row i+1 (row 0 = anchor).
                `step` = the draft decode's step; its verify is the next target decode (step+1).
     5 BATCH:   u32 step u32 n_rows i32 pos0 i32 token[n_rows]   (input tokens of each <=32-row decode)
+    6 LENS:    u32 step u32 layer u32 n_rows u32 n_embd u32 dtype(0 f32,1 f16,2 bf16) u32 flags
+               data[n_rows][n_embd] in dtype (version 2 only)
+    7 ACCEPT:  u32 step u32 seq u32 n_draft u32 n_accepted u32 n_emitted u32 flags
+               i32 draft[n_draft] i32 emitted[n_emitted]; flags bit0 row-drop armed,
+               bit1 capped by row-drop, bit2 replay round (version 2 only)
   Row 0 = committed token, rows 1..n = drafted. dist = target_layer - src_layer.
   Only decode/verify ubatches (<= 32 rows) are traced; prefill is skipped.
   A step is one begin_decode() call (draft-model decodes, if they share the
-  dispatcher, also advance it). Accepted-count is not known on the spine and is
-  not recorded.
+  dispatcher, also advance it).
 """
 import argparse
 import struct
@@ -43,6 +47,10 @@ class Trace:
         self.draft = {}     # step -> dict(tokens[n_slots] i32, conf f32, anchor, hidden[n_slots,n_embd_h] f32|None, flags, seq)
         self.draft_all = []  # every DRAFT record in file order (multi-seq: several per step)
         self.batch = {}     # step -> dict(tokens[n_rows] i32, pos0)
+        self.version = 0
+        self.lens = {}      # (step, layer) -> float32 array [n_rows, n_embd] (converted from dtype)
+        self.accept = {}    # step -> dict(seq, n_draft, n_accepted, n_emitted, flags, draft[], emitted[])
+        self.accept_all = []  # every ACCEPT record in file order
 
     def verify_step_of_draft(self, step):
         """Step of the target verify batch that consumes the DRAFT record at `step`:
@@ -61,7 +69,7 @@ def load(path):
     if buf[:5] != b"WPHT1":
         raise ValueError("not a WP_HINT_TRACE file")
     t = Trace()
-    (_ver, t.n_expert, t.n_embd, t.trace_k, t.top_n, t.pid) = struct.unpack_from("<6I", buf, 8)
+    (t.version, t.n_expert, t.n_embd, t.trace_k, t.top_n, t.pid) = struct.unpack_from("<6I", buf, 8)
     pos = HDR
     while pos + 8 <= len(buf):
         rtype, nbytes = struct.unpack_from("<II", buf, pos)
@@ -119,6 +127,29 @@ def load(path):
             step, n_rows, pos0 = struct.unpack_from("<IIi", buf, p)
             p += 12
             t.batch[step] = dict(tokens=np.frombuffer(buf, "<i4", n_rows, p), pos0=pos0)
+        elif rtype == 6:
+            step, layer, n_rows, n_embd, dtype, _flags = struct.unpack_from("<IiIIII", buf, p)
+            p += 24
+            n = n_rows * n_embd
+            if dtype == 0:
+                arr = np.frombuffer(buf, "<f4", n, p)
+            elif dtype == 1:
+                arr = np.frombuffer(buf, "<f2", n, p).astype(np.float32)
+            elif dtype == 2:
+                bits = np.frombuffer(buf, "<u2", n, p).astype(np.uint32) << 16
+                arr = bits.view(np.float32)
+            else:
+                raise ValueError(f"LENS record with unknown dtype {dtype}")
+            t.lens[(step, layer)] = arr.reshape(n_rows, n_embd)
+        elif rtype == 7:
+            step, seq, n_draft, n_accepted, n_emitted, flags = struct.unpack_from("<IIIIII", buf, p)
+            p += 24
+            draft = np.frombuffer(buf, "<i4", n_draft, p)
+            emitted = np.frombuffer(buf, "<i4", n_emitted, p + 4 * n_draft)
+            rec = dict(seq=seq, n_draft=n_draft, n_accepted=n_accepted, n_emitted=n_emitted,
+                       flags=flags, draft=draft.tolist(), emitted=emitted.tolist())
+            t.accept_all.append((step, rec))
+            t.accept[step] = rec
         pos += nbytes
     return t
 

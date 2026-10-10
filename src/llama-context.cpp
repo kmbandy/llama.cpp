@@ -1215,6 +1215,16 @@ void llama_context::hint_trace_draft(uint32_t n_slots, const llama_token * token
     expert_dispatch->trace_draft(n_slots, (const int32_t *) tokens, conf, (int32_t) anchor, hidden, n_embd_h, flags);
 }
 
+void llama_context::hint_trace_accept(llama_seq_id seq, uint32_t n_draft, const llama_token * draft,
+                                      uint32_t n_accepted, const llama_token * emitted, uint32_t n_emitted,
+                                      uint32_t flags) {
+    if (!hint_trace_enabled()) {
+        return;
+    }
+    expert_dispatch->trace_accept(seq, n_draft, (const int32_t *) draft, n_accepted,
+                                  (const int32_t *) emitted, n_emitted, flags);
+}
+
 bool llama_hint_trace_enabled(struct llama_context * ctx) {
     return ctx != nullptr && ctx->hint_trace_enabled();
 }
@@ -1224,6 +1234,14 @@ void llama_hint_trace_draft(struct llama_context * ctx, uint32_t n_slots, const 
                             uint32_t n_embd_h, uint32_t flags) {
     if (ctx != nullptr) {
         ctx->hint_trace_draft(n_slots, tokens, conf, anchor, hidden, n_embd_h, flags);
+    }
+}
+
+void llama_hint_trace_accept(struct llama_context * ctx, llama_seq_id seq, uint32_t n_draft,
+                             const llama_token * draft, uint32_t n_accepted,
+                             const llama_token * emitted, uint32_t n_emitted, uint32_t flags) {
+    if (ctx != nullptr) {
+        ctx->hint_trace_accept(seq, n_draft, draft, n_accepted, emitted, n_emitted, flags);
     }
 }
 

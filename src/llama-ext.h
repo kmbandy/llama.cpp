@@ -386,6 +386,14 @@ LLAMA_API void llama_hint_trace_draft(struct llama_context * ctx, uint32_t n_slo
                                       llama_token anchor, const float * hidden,
                                       uint32_t n_embd_h, uint32_t flags);
 
+// WP_HINT_TRACE type 7 ACCEPT: one speculative verify outcome. draft[n_draft] are the verify's
+// draft tokens; emitted[n_emitted] are the target-sampled tokens (accepted[] in the server),
+// n_accepted is the number of accepted drafts. flags bit2 (4) = replay round. No-op when
+// tracing is off. Call with the TARGET ctx, after the verify decode.
+LLAMA_API void llama_hint_trace_accept(struct llama_context * ctx, llama_seq_id seq, uint32_t n_draft,
+                                       const llama_token * draft, uint32_t n_accepted,
+                                       const llama_token * emitted, uint32_t n_emitted, uint32_t flags);
+
 // Adaptive gate: when false, skip running the draft model this step (pool
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0
 // always returns true. No-op / true if paging disabled.
