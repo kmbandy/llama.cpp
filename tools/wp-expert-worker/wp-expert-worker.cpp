@@ -86,7 +86,7 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 // WP_WORKER_SPAN_TRACE=1 (default OFF): worker-side interval timeline.
-// Each span is one POD record in a preallocated ring (4M entries, calloc'd only
+// Each record is one POD entry in a preallocated ring (4M entries, calloc'd only
 // when the knob is on), claimed with one relaxed fetch_add. Timestamps are
 // CLOCK_REALTIME so they join the spine's realtime stamps across hosts.
 // Output: TSV at WP_WORKER_SPAN_FILE (default /tmp/wp-worker-span.<pid>.tsv).
@@ -94,8 +94,23 @@ using json = nlohmann::json;
 // SIGTERM/SIGINT stop path, and at normal exit. Off = one branch on a latched
 // bool per call site. Records are not ordered across threads; a record still
 // being written during a flush may be dropped (kind 0 = not yet written).
-// Spans on the lap()/measure paths need the phase timers, so the knob also
-// forces `measure` on in dispatch() and the request handler.
+//
+// Two families of records share the ring:
+//   REQ / phase spans (WP_SPAN_*): overlays on the request timeline, may overlap.
+//   THREAD STATE records (WP_S_*): the authoritative per-thread tiling. Each
+//     thread's [first state call, now] is cut into contiguous S_ spans with no
+//     gaps: a transition closes the previous span [last_t, now] with the previous
+//     kind/layer/seq/aux and opens the next. See the wp_state section below.
+//   WP_S_ROLE: one per thread, aux = role id (names in the TSV header).
+//
+// Record fields: kind, layer, page_layer, seq, tid, t0, t1, aux.
+//   layer      request-attributed spans: the REQUEST's layer. NVME_READ: the
+//              expert's (page's) layer, per read.
+//   page_layer page-attributed spans (H2D, CPU_TIER_JOB, ...): the PAGE's expert
+//              layer, so layer != page_layer is expected for layer-ahead
+//              prefetch. -1 = not applicable.
+//   aux        kind-specific; NVME_READ: bytes in the low 48 bits, origin in
+//              bits 48..55 (see WpReadOrigin).
 enum wp_span_kind : uint8_t {
     WP_SPAN_REQ = 1,         // frame arrival -> response sent (aux = n_tokens)
     WP_SPAN_PAGEIN_WAIT,     // batch.complete() wait (ns_wait)
@@ -107,23 +122,95 @@ enum wp_span_kind : uint8_t {
     WP_SPAN_CPU_TIER_JOB,    // one CPU-tier compute (aux = expert id; batch: page count)
     WP_SPAN_ENCODE,          // fp32 -> wire encode of the reply (ns_encode)
     WP_SPAN_SEND,            // response frame send (aux = part index for streamed)
-    WP_SPAN_NVME_READ_DEMAND,// pread of one expert range, demand (aux = bytes)
-    WP_SPAN_NVME_READ_SPEC,  // pread of one expert range, speculative/prefetch
+    WP_SPAN_NVME_READ,       // one pread of an expert range (aux: bytes | origin<<48)
     WP_SPAN_H2D,             // host->device copy (aux = bytes)
+    // ---- thread state records (tiling). Kinds >= 32.
+    WP_S_IDLE = 32,          // waiting for work: queue pop, cv wait, poll, sleep, idle recv
+    WP_S_READ,               // inside pread / read path of a file (state-level)
+    WP_S_READ_WAIT,          // waiting for reads issued by other threads to land
+    WP_S_LOCK,               // blocked on a contended mutex (arena/pool/table/gpu lock)
+    WP_S_COMPUTE_CPU,        // CPU-tier / CPU ggml graph compute
+    WP_S_GPU_SUBMIT,         // host issuing GPU graph / kernels
+    WP_S_GPU_SYNC,           // host waiting on GPU sync / readback
+    WP_S_H2D,                // issuing / waiting H2D copies
+    WP_S_DECODE,             // frame decode
+    WP_S_ENCODE,             // reply encode
+    WP_S_SEND,               // socket send
+    WP_S_RECV,               // socket recv of a frame body
+    WP_S_PACK,               // wire pack
+    WP_S_BOOKKEEP,           // lookup / prep / slot assignment / eviction bookkeeping
+    WP_S_CPU_WAIT,           // waiting on a CPU-tier job (dispatch thread)
+    WP_S_OTHER,              // explicit fallthrough: unclassified work (minimise)
+    WP_S_ROLE = 63,          // thread role record, aux = WpRole
+};
+
+// Origin of an NVME_READ record (aux bits 48..55).
+enum WpReadOrigin : uint8_t {
+    WP_RD_OTHER = 0,
+    WP_RD_DEMAND,      // request batch (BatchState without speculative flag)
+    WP_RD_SPEC,        // speculative / prefetch page-in
+    WP_RD_CPUTIER,     // CPU-tier IO thread
+    WP_RD_PF,          // cpu_pf_loop
+    WP_RD_LANDING,     // cold landing thread
+};
+
+// Thread roles (ROLE record aux). Names printed in the TSV header.
+enum WpRole : int64_t {
+    WP_ROLE_SERVE = 1,        // serve_connection on the main / connection thread
+    WP_ROLE_PIPE_READER,      // wp_worker_pipeline_reader_thread
+    WP_ROLE_PIPE_WRITER,      // wp_worker_pipeline_writer_thread
+    WP_ROLE_BATCH_READER,     // ensure_batch read threads (batch.workers_)
+    WP_ROLE_CPU_TIER_IO,      // cpu_tier_io_loop
+    WP_ROLE_CPU_TIER_COMPUTE, // cpu_tier_compute_loop
+    WP_ROLE_CPU_PF,           // cpu_pf_loop
+    WP_ROLE_LANDING,          // cold landing thread (spec_host_submit)
+    WP_ROLE_DEMOTE,           // demote_loop
+    WP_ROLE_CPU_EXEC,         // CPU expert executor thread (pinned tier executor)
+    WP_ROLE_WATCH,            // DemandLog::watch
+    WP_ROLE_PARK,             // ParkControl reader thread
+    WP_ROLE_ACCEPT_SERVE,     // multi-conn accept+serve slot thread
+    WP_ROLE_FOLD,             // parallel fold helper (not decode)
 };
 
 inline const char * wp_span_kind_name(uint8_t k) {
-    static const char * const names[] = {
-        "?", "REQ", "PAGEIN_WAIT", "PAGEIN_COMPUTE", "GPU_SUBMIT", "FINAL_SYNC",
-        "READBACK", "CPU_TIER_WAIT", "CPU_TIER_JOB", "ENCODE", "SEND",
-        "NVME_READ_DEMAND", "NVME_READ_SPEC", "H2D",
-    };
-    return k < sizeof(names) / sizeof(names[0]) ? names[k] : "?";
+    switch (k) {
+        case WP_SPAN_REQ:            return "REQ";
+        case WP_SPAN_PAGEIN_WAIT:    return "PAGEIN_WAIT";
+        case WP_SPAN_PAGEIN_COMPUTE: return "PAGEIN_COMPUTE";
+        case WP_SPAN_GPU_SUBMIT:     return "GPU_SUBMIT";
+        case WP_SPAN_FINAL_SYNC:     return "FINAL_SYNC";
+        case WP_SPAN_READBACK:       return "READBACK";
+        case WP_SPAN_CPU_TIER_WAIT:  return "CPU_TIER_WAIT";
+        case WP_SPAN_CPU_TIER_JOB:   return "CPU_TIER_JOB";
+        case WP_SPAN_ENCODE:         return "ENCODE";
+        case WP_SPAN_SEND:           return "SEND";
+        case WP_SPAN_NVME_READ:      return "NVME_READ";
+        case WP_SPAN_H2D:            return "H2D";
+        case WP_S_IDLE:              return "S_IDLE";
+        case WP_S_READ:              return "S_READ";
+        case WP_S_READ_WAIT:         return "S_READ_WAIT";
+        case WP_S_LOCK:              return "S_LOCK";
+        case WP_S_COMPUTE_CPU:       return "S_COMPUTE_CPU";
+        case WP_S_GPU_SUBMIT:        return "S_GPU_SUBMIT";
+        case WP_S_GPU_SYNC:          return "S_GPU_SYNC";
+        case WP_S_H2D:               return "S_H2D";
+        case WP_S_DECODE:            return "S_DECODE";
+        case WP_S_ENCODE:            return "S_ENCODE";
+        case WP_S_SEND:              return "S_SEND";
+        case WP_S_RECV:              return "S_RECV";
+        case WP_S_PACK:              return "S_PACK";
+        case WP_S_BOOKKEEP:          return "S_BOOKKEEP";
+        case WP_S_CPU_WAIT:          return "S_CPU_WAIT";
+        case WP_S_OTHER:             return "S_OTHER";
+        case WP_S_ROLE:              return "ROLE";
+        default:                     return "?";
+    }
 }
 
 struct WpSpanRec {
     uint8_t  kind;
     int16_t  layer;
+    int16_t  page_layer;
     uint32_t seq;
     uint32_t tid;
     int64_t  t0_ns;
@@ -163,10 +250,10 @@ inline void wp_span_flush(bool block) {
     for (uint64_t i = lo; i < hi; ++i) {
         const WpSpanRec & rec = r->buf[i % WpSpanRing::kCap];
         if (rec.kind == 0) { continue; }
-        std::fprintf(r->f, "%s\t%d\t%u\t%u\t%lld\t%lld\t%lld\n",
-                     wp_span_kind_name(rec.kind), (int) rec.layer, (unsigned) rec.seq,
-                     (unsigned) rec.tid, (long long) rec.t0_ns, (long long) rec.t1_ns,
-                     (long long) rec.aux);
+        std::fprintf(r->f, "%s\t%d\t%d\t%u\t%u\t%lld\t%lld\t%lld\n",
+                     wp_span_kind_name(rec.kind), (int) rec.layer, (int) rec.page_layer,
+                     (unsigned) rec.seq, (unsigned) rec.tid, (long long) rec.t0_ns,
+                     (long long) rec.t1_ns, (long long) rec.aux);
     }
     r->flushed.store(hi, std::memory_order_relaxed);
     if (block) {
@@ -198,7 +285,10 @@ inline bool wp_span_init() {
         delete r;
         return false;
     }
-    std::fprintf(r->f, "kind_name\tlayer\tseq\ttid\tt0_ns\tt1_ns\taux\n");
+    std::fprintf(r->f, "kind_name\tlayer\tpage_layer\tseq\ttid\tt0_ns\tt1_ns\taux\n");
+    std::fprintf(r->f, "# roles: 1=SERVE 2=PIPE_READER 3=PIPE_WRITER 4=BATCH_READER "
+                       "5=CPU_TIER_IO 6=CPU_TIER_COMPUTE 7=CPU_PF 8=LANDING 9=DEMOTE "
+                       "10=CPU_EXEC 11=WATCH 12=PARK 13=ACCEPT_SERVE 14=FOLD\n");
     g_wp_span_ring = r;
     std::atexit([] { wp_span_flush(true); });
     std::fprintf(stderr, "wp expert worker: WP_WORKER_SPAN_TRACE on, writing %s\n", path.c_str());
@@ -229,7 +319,8 @@ struct WpSpanCtxScope {
 };
 
 // Explicit interval [t0, t1] in CLOCK_REALTIME ns.
-inline void wp_span(uint8_t kind, int layer, uint32_t seq, int64_t t0, int64_t t1, int64_t aux) {
+inline void wp_span(uint8_t kind, int layer, uint32_t seq, int64_t t0, int64_t t1, int64_t aux,
+                    int page_layer = -1) {
     if (!g_wp_span_on) { return; }
     WpSpanRing * r = g_wp_span_ring;
     static thread_local uint32_t tid = 0;
@@ -241,30 +332,247 @@ inline void wp_span(uint8_t kind, int layer, uint32_t seq, int64_t t0, int64_t t
         return;
     }
     WpSpanRec & rec = r->buf[i % WpSpanRing::kCap];
-    rec.layer = (int16_t) layer;
-    rec.seq   = seq;
-    rec.tid   = tid;
-    rec.t0_ns = t0;
-    rec.t1_ns = t1;
-    rec.aux   = aux;
+    rec.layer      = (int16_t) layer;
+    rec.page_layer = (int16_t) page_layer;
+    rec.seq        = seq;
+    rec.tid        = tid;
+    rec.t0_ns      = t0;
+    rec.t1_ns      = t1;
+    rec.aux        = aux;
     std::atomic_thread_fence(std::memory_order_release);
-    rec.kind  = kind;                       // written last: 0 means "not yet"
+    rec.kind       = kind;                  // written last: 0 means "not yet"
     if (i - fl >= WpSpanRing::kCap / 10 * 9) { wp_span_flush(false); }
 }
 
 // Interval ending now, of length elapsed_ns (what lap() / elapsed sites return).
 // elapsed_ns == 0 means the phase timer was not running: record nothing.
-inline void wp_span_end(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns, int64_t aux) {
+inline void wp_state_took(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns,
+                          int64_t aux, int page_layer);
+
+// Thread state a timed phase occupies (0 = none: CPU_TIER_JOB / NVME_READ / REQ
+// are tiled by their own scopes on the thread that runs them).
+inline uint8_t wp_span_state_kind(uint8_t k) {
+    switch (k) {
+        case WP_SPAN_PAGEIN_WAIT:    return WP_S_READ_WAIT;
+        case WP_SPAN_PAGEIN_COMPUTE: return WP_S_GPU_SUBMIT;
+        case WP_SPAN_GPU_SUBMIT:     return WP_S_GPU_SUBMIT;
+        case WP_SPAN_FINAL_SYNC:     return WP_S_GPU_SYNC;
+        case WP_SPAN_READBACK:       return WP_S_GPU_SYNC;
+        case WP_SPAN_CPU_TIER_WAIT:  return WP_S_CPU_WAIT;
+        case WP_SPAN_ENCODE:         return WP_S_ENCODE;
+        case WP_SPAN_SEND:           return WP_S_SEND;
+        case WP_SPAN_H2D:            return WP_S_H2D;
+        default:                     return 0;
+    }
+}
+
+inline void wp_span_end(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns, int64_t aux,
+                        int page_layer = -1) {
     if (!g_wp_span_on || elapsed_ns == 0) { return; }
     const int64_t t1 = wp_now_realtime_ns();
-    wp_span(kind, layer, seq, t1 - (int64_t) elapsed_ns, t1, aux);
+    wp_span(kind, layer, seq, t1 - (int64_t) elapsed_ns, t1, aux, page_layer);
+    if (const uint8_t sk = wp_span_state_kind(kind)) {
+        wp_state_took(sk, layer, seq, elapsed_ns, aux, page_layer);
+    }
 }
 
 // Same as wp_span_end, returning elapsed_ns so a lap() site stays one line.
 inline uint64_t wp_span_took(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns,
-                             int64_t aux = 0) {
-    wp_span_end(kind, layer, seq, elapsed_ns, aux);
+                             int64_t aux = 0, int page_layer = -1) {
+    wp_span_end(kind, layer, seq, elapsed_ns, aux, page_layer);
     return elapsed_ns;
+}
+
+// ---- Thread state tiling -------------------------------------------------
+// Thread-local current state. last_t is the start of the open span; the open
+// span is closed by the next transition (or wp_state_end_thread). Every
+// transition reads the clock once and writes at most one record.
+struct WpStateTls {
+    uint8_t  kind    = 0;
+    int16_t  layer   = -1;
+    int16_t  page_layer = -1;
+    uint32_t seq     = 0;
+    int64_t  aux     = 0;
+    int64_t  last_t  = 0;
+    bool     active  = false;   // a state span is open (begin_thread or a transition)
+    bool     began   = false;   // wp_state_begin_thread ran on this thread
+};
+inline thread_local WpStateTls g_wp_st;
+
+// Close the open span at t (clipped so spans never run backwards) and open a new
+// state at t. Records the closed span with its own kind/layer/seq/aux.
+inline void wp_state_switch_at(uint8_t kind, int layer, int page_layer, uint32_t seq,
+                               int64_t aux, int64_t t) {
+    WpStateTls & s = g_wp_st;
+    if (s.active) {
+        if (t < s.last_t) { t = s.last_t; }
+        if (t > s.last_t) {
+            wp_span(s.kind, s.layer, s.seq, s.last_t, t, s.aux, s.page_layer);
+        }
+    }
+    s.kind = kind; s.layer = (int16_t) layer; s.page_layer = (int16_t) page_layer;
+    s.seq = seq; s.aux = aux; s.last_t = t; s.active = true;
+}
+
+// Open a new state now (closes the previous one now).
+inline void wp_state(uint8_t kind, int layer, uint32_t seq, int64_t aux = 0, int page_layer = -1) {
+    if (!g_wp_span_on) { return; }
+    wp_state_switch_at(kind, layer, page_layer, seq, aux, wp_now_realtime_ns());
+}
+
+// Backdated state: the last `elapsed_ns` of the thread's time was `kind`
+// (for sites that measure a phase with a lap timer and only report it after).
+// Closes the previous state at now-elapsed, records [now-elapsed, now] as `kind`
+// and resumes the previous state at now. Tiling is preserved.
+inline void wp_state_took(uint8_t kind, int layer, uint32_t seq, uint64_t elapsed_ns,
+                          int64_t aux = 0, int page_layer = -1) {
+    if (!g_wp_span_on || elapsed_ns == 0) { return; }
+    WpStateTls & s = g_wp_st;
+    const int64_t t1 = wp_now_realtime_ns();
+    int64_t t0 = t1 - (int64_t) elapsed_ns;
+    if (!s.active) { return; }
+    if (t0 < s.last_t) { t0 = s.last_t; }
+    // Previous state ends at t0; the phase occupies [t0, t1]; then resume previous.
+    const uint8_t pk = s.kind; const int16_t pl = s.layer; const int16_t ppl = s.page_layer;
+    const uint32_t ps = s.seq; const int64_t pa = s.aux;
+    wp_state_switch_at(kind, layer, page_layer, seq, aux, t0);
+    wp_state_switch_at(pk, pl, ppl, ps, pa, t1);
+}
+
+// RAII state: enter sets the state, exit restores the enclosing state. This is
+// the form used around blocking calls, so the enclosing state resumes exactly.
+struct WpStateScope {
+    WpStateTls saved;
+    bool       on;
+    WpStateScope(uint8_t kind, int layer, uint32_t seq, int64_t aux = 0, int page_layer = -1)
+        : on(g_wp_span_on) {
+        if (on) {
+            saved = g_wp_st;
+            wp_state(kind, layer, seq, aux, page_layer);
+        }
+    }
+    ~WpStateScope() {
+        if (on) {
+            const int64_t t = wp_now_realtime_ns();
+            wp_state_switch_at(saved.kind, saved.layer, saved.page_layer, saved.seq,
+                               saved.aux, t);
+            if (!saved.active) { g_wp_st.active = false; }
+        }
+    }
+};
+
+// pipe_recv_frame stamps hdr_done_ns (steady_clock ns) when the 32-byte header
+// returns. Split the recv that began in S_IDLE at that point: everything before
+// the header is waiting for a frame (S_IDLE), everything after is the body (S_RECV).
+inline void wp_state_recv_split(uint64_t hdr_done_steady_ns) {
+    if (!g_wp_span_on || hdr_done_steady_ns == 0) { return; }
+    const int64_t now_rt = wp_now_realtime_ns();
+    const int64_t now_st = (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    wp_state_switch_at(WP_S_RECV, -1, -1, 0, 0,
+                       now_rt - (now_st - (int64_t) hdr_done_steady_ns));
+}
+
+// Graph compute inside a tiled state (ggml_backend_graph_compute is the blocking call).
+inline ggml_status wp_graph_compute(uint8_t st, ggml_backend_t backend, ggml_cgraph * graph) {
+    WpStateScope scope(st, -1, 0);
+    return ggml_backend_graph_compute(backend, graph);
+}
+
+// Read origin for preads that carry no BatchState (set once per owning thread loop).
+inline thread_local uint8_t wp_read_origin_tls = WP_RD_OTHER;
+struct WpReadOriginScope {
+    uint8_t prev;
+    explicit WpReadOriginScope(uint8_t o) : prev(wp_read_origin_tls) { wp_read_origin_tls = o; }
+    ~WpReadOriginScope() { wp_read_origin_tls = prev; }
+};
+
+// Thread begin/end. begin records the ROLE once per thread (idempotent: a second
+// call on the same thread, e.g. serve_connection inside a multi-conn slot thread,
+// is a no-op) and opens S_IDLE at now. end closes the open span.
+inline void wp_state_begin_thread(int64_t role) {
+    if (!g_wp_span_on) { return; }
+    WpStateTls & s = g_wp_st;
+    if (s.began) { return; }
+    s.began = true;
+    const int64_t t = wp_now_realtime_ns();
+    wp_span(WP_S_ROLE, -1, 0, t, t, role);
+    wp_state_switch_at(WP_S_IDLE, -1, -1, 0, 0, t);
+}
+inline void wp_state_end_thread() {
+    if (!g_wp_span_on) { return; }
+    WpStateTls & s = g_wp_st;
+    if (!s.active) { return; }
+    const int64_t t = wp_now_realtime_ns();
+    if (t > s.last_t) { wp_span(s.kind, s.layer, s.seq, s.last_t, t, s.aux, s.page_layer); }
+    s.active = false;
+}
+
+// One per thread body: begin (ROLE + S_BOOKKEEP as the loop's enclosing state)
+// on construction, end on every exit path. Nested use on a thread that already
+// began (serve_connection inside an accept slot) is a no-op.
+struct WpThreadScope {
+    bool owner;
+    explicit WpThreadScope(int64_t role) : owner(g_wp_span_on && !g_wp_st.began) {
+        if (owner) {
+            wp_state_begin_thread(role);
+            wp_state(WP_S_BOOKKEEP, -1, 0);
+        }
+    }
+    ~WpThreadScope() {
+        if (owner) { wp_state_end_thread(); }
+    }
+};
+
+// Mutex acquisition as a tiled S_LOCK phase. Uncontended acquisitions (< 1 us)
+// are not recorded: the previous state simply keeps running, so tiling holds.
+template <class M>
+inline std::unique_lock<M> wp_lock_timed(M & m) {
+    if (!g_wp_span_on) { return std::unique_lock<M>(m); }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<M> lk(m);
+    const auto ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (ns >= 1000) { wp_state_took(WP_S_LOCK, -1, 0, ns); }
+    return lk;
+}
+
+// Condition-variable wait inside a tiled state (st = S_IDLE / S_READ_WAIT / ...).
+template <class CV, class... A>
+inline decltype(auto) wp_cv_wait(uint8_t st, CV & cv, A &&... a) {
+    WpStateScope s(st, -1, 0);
+    return cv.wait(std::forward<A>(a)...);
+}
+
+// Thread-state role of a blocking call that is not a cv wait.
+// join() inside a tiled state (shutdown / reap = S_IDLE, batch completion = S_READ_WAIT).
+template <class T>
+inline void wp_join(uint8_t st, T & t) {
+    WpStateScope s(st, -1, 0);
+    t.join();
+}
+
+// wait_for / wait_until inside a tiled state.
+template <class CV, class... A>
+inline decltype(auto) wp_cv_wait_for(uint8_t st, CV & cv, A &&... a) {
+    WpStateScope s(st, -1, 0);
+    return cv.wait_for(std::forward<A>(a)...);
+}
+template <class CV, class... A>
+inline decltype(auto) wp_cv_wait_until(uint8_t st, CV & cv, A &&... a) {
+    WpStateScope s(st, -1, 0);
+    return cv.wait_until(std::forward<A>(a)...);
+}
+
+// sleep_for / yield inside a tiled state (waiting, not working).
+template <class Rep, class Per>
+inline void wp_sleep_for(uint8_t st, std::chrono::duration<Rep, Per> d) {
+    WpStateScope s(st, -1, 0);
+    std::this_thread::sleep_for(d);
+}
+inline void wp_yield(uint8_t st) {
+    WpStateScope s(st, -1, 0);
+    std::this_thread::yield();
 }
 
 // REQ span for one serve-loop frame: t0 = arrival (0 = now), recorded on exit.
@@ -2226,11 +2534,14 @@ static void fold_result_partials_ordered(
     for (size_t worker = 0; worker + 1 < n_threads; ++worker) {
         const size_t begin = result.size() * worker / n_threads;
         const size_t end = result.size() * (worker + 1) / n_threads;
-        workers.emplace_back(fold_range, begin, end);
+        workers.emplace_back([&fold_range, begin, end] {
+            WpThreadScope wp_thread(WP_ROLE_FOLD);
+            fold_range(begin, end);
+        });
     }
     fold_range(result.size() * (n_threads - 1) / n_threads, result.size());
     for (std::thread & worker : workers) {
-        worker.join();
+        wp_join(WP_S_COMPUTE_CPU, worker);
     }
 }
 
@@ -2631,7 +2942,7 @@ private:
         // still looks like data. Function-local static => one mutex shared by
         // every WorkerStats instance, which is the scope required.
         static std::mutex report_mu;
-        std::lock_guard<std::mutex> report_lock(report_mu);
+        auto report_lock = wp_lock_timed(report_mu);
         std::cout << "wp expert worker stats"
                   << " device=" << (device_.empty() ? std::string("?") : device_)
                   << " n_requests=" << n_requests_
@@ -4919,13 +5230,13 @@ void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff) {
     }
     {
         std::vector<uint8_t> junk(ggml_nbytes(gate), 0x5a);
-        ggml_backend_tensor_set(gate, junk.data(), 0, ggml_nbytes(gate));
-        ggml_backend_tensor_set(up,   junk.data(), 0, ggml_nbytes(up));
-        ggml_backend_tensor_set(down, junk.data(), 0, ggml_nbytes(down));
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(gate, junk.data(), 0, ggml_nbytes(gate)); }
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(up,   junk.data(), 0, ggml_nbytes(up)); }
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(down, junk.data(), 0, ggml_nbytes(down)); }
         std::vector<float> f(n_embd, 0.01f);
-        ggml_backend_tensor_set(input, f.data(), 0, ggml_nbytes(input));
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(input, f.data(), 0, ggml_nbytes(input)); }
         const float one = 0.5f;
-        ggml_backend_tensor_set(rw, &one, 0, sizeof(float));
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(rw, &one, 0, sizeof(float)); }
     }
     const size_t nodes = 32;
     const ggml_init_params gp = {
@@ -4950,14 +5261,14 @@ void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff) {
         return;
     }
     for (int i = 0; i < 5; ++i) {          // warm up: first Vulkan submit compiles pipelines
-        ggml_backend_graph_compute(backend, graph);
+        { WpStateScope wss(WP_S_GPU_SUBMIT, -1, 0); ggml_backend_graph_compute(backend, graph); }
     }
-    ggml_backend_synchronize(backend);
+    { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend); }
     uint64_t best = UINT64_MAX, total = 0;
     const int iters = 300;
     for (int i = 0; i < iters; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        ggml_backend_graph_compute(backend, graph);
+        { WpStateScope wss(WP_S_GPU_SUBMIT, -1, 0); ggml_backend_graph_compute(backend, graph); }
         const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t0).count();
         if (ns < best) best = ns;
@@ -5233,8 +5544,8 @@ void tensor_set_page_range(
     zero_quantized_member_padding(tensor, page);
     for_each_page_chunk(page, page_offset, size,
                         [tensor, source](size_t source_offset, size_t device_offset, size_t n) {
-        ggml_backend_tensor_set(
-            tensor, (const char *) source + source_offset, device_offset, n);
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+            tensor, (const char *) source + source_offset, device_offset, n); }
     });
 }
 
@@ -5242,8 +5553,8 @@ void tensor_get_page(
         ggml_tensor * tensor, const ExpertPage & page, void * destination) {
     for_each_page_chunk(page, 0, (size_t) page.size,
                         [tensor, destination](size_t destination_offset, size_t device_offset, size_t n) {
-        ggml_backend_tensor_get(
-            tensor, (char *) destination + destination_offset, device_offset, n);
+        { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(
+            tensor, (char *) destination + destination_offset, device_offset, n); }
     });
 }
 
@@ -5294,7 +5605,7 @@ void tensor_verify_page_range(
     for_each_page_chunk(page, page_offset, size,
                         [&](size_t source_offset, size_t device_offset, size_t n) {
         std::vector<uint8_t> readback(n);
-        ggml_backend_tensor_get(tensor, readback.data(), device_offset, n);
+        { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(tensor, readback.data(), device_offset, n); }
         if (std::memcmp(readback.data(), (const char *) source + source_offset, n) != 0) {
             ++mismatches;
         }
@@ -5416,7 +5727,7 @@ public:
             allocations_.push_back(std::move(allocation));
         }
         if (pinned_pages_ != 0) {
-            ggml_backend_synchronize(backend_);
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_); }
         }
     }
 
@@ -5432,6 +5743,7 @@ private:
 
     static void read_once(const ExpertPage & page, void * dst) {
 #if defined(__linux__)
+        WpStateScope rd_state(WP_S_READ, -1, 0, 0, page.layer);
         const int fd = open(page.blob.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         if (fd < 0) {
             throw std::runtime_error(
@@ -5503,7 +5815,7 @@ public:
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     void write(const char * buf, size_t n) {
-        std::lock_guard<std::mutex> lock(mu_);
+        auto lock = wp_lock_timed(mu_);
         std::fwrite(buf, 1, n, f_);
         dirty_ = true;
         if (++lines_since_flush_ >= 1000) { flush_locked(); }
@@ -5515,17 +5827,17 @@ public:
         write(buf, (size_t) n);
     }
     void note_ident(int cache_id, int layer, int expert) {
-        std::lock_guard<std::mutex> lock(id_mu_);
+        auto lock = wp_lock_timed(id_mu_);
         ident_[cache_id] = { layer, expert };
     }
     bool ident(int cache_id, int & layer, int & expert) {
-        std::lock_guard<std::mutex> lock(id_mu_);
+        auto lock = wp_lock_timed(id_mu_);
         const auto it = ident_.find(cache_id);
         if (it == ident_.end()) { return false; }
         layer = it->second.first; expert = it->second.second;
         return true;
     }
-    void flush() { std::lock_guard<std::mutex> lock(mu_); flush_locked(); }
+    void flush() { auto lock = wp_lock_timed(mu_); flush_locked(); }
 
 private:
     explicit DemandLog(FILE * f) : f_(f) {
@@ -5540,7 +5852,7 @@ private:
             ::sigaction(SIGINT, &sa, nullptr);
         }
         std::atexit([] { if (DemandLog * l = DemandLog::get()) { l->flush(); } });
-        std::thread([this] { watch(); }).detach();
+        std::thread([this] { WpThreadScope wp_thread(WP_ROLE_WATCH); watch(); }).detach();
 #endif
     }
 #if defined(__linux__)
@@ -5556,7 +5868,11 @@ private:
         inst_for_signal() = this;
         for (;;) {
             struct pollfd pfd { pipe_[0], POLLIN, 0 };
-            const int r = ::poll(&pfd, 1, 1000);
+            int r = 0;
+            {
+                WpStateScope idle(WP_S_IDLE, -1, 0);
+                r = ::poll(&pfd, 1, 1000);
+            }
             if (r > 0 && (pfd.revents & POLLIN)) {
                 flush();
                 const int sig = g_sig_ != 0 ? g_sig_ : SIGTERM;
@@ -5564,7 +5880,7 @@ private:
                 ::raise(sig);
                 continue;
             }
-            std::lock_guard<std::mutex> lock(mu_);
+            auto lock = wp_lock_timed(mu_);
             if (dirty_) { flush_locked(); }
         }
     }
@@ -5651,6 +5967,7 @@ private:
         size_t             slot_index  = 0;
         const ExpertPage * page        = nullptr;
         uint32_t           span_seq    = 0;   // WP_WORKER_SPAN_TRACE request tag
+        int                span_layer  = -1;  // WP_WORKER_SPAN_TRACE request layer (not the page's)
         int                fd          = -1;
         std::shared_ptr<DemandRec> demand_rec;   // WP_DEMAND_LOG (null when off)
         // Destination tensor for this page-in's H2D, captured HERE, at plan
@@ -5829,21 +6146,22 @@ private:
         if (shared.reserve_state.compare_exchange_strong(expected, 1)) {
             const bool ok = reserve_arena_for_pagein(pagein, conn_index);
             {
-                std::lock_guard<std::mutex> lock(shared.reserve_mu);
+                auto lock = wp_lock_timed(shared.reserve_mu);
                 shared.reserve_ok = ok;
                 shared.reserve_state.store(2, std::memory_order_release);
             }
             shared.reserve_cv.notify_all();
             return ok;
         }
-        std::unique_lock<std::mutex> lock(shared.reserve_mu);
-        shared.reserve_cv.wait(lock, [&]() {
+        auto lock = wp_lock_timed(shared.reserve_mu);
+        wp_cv_wait(WP_S_LOCK, shared.reserve_cv, lock, [&]() {
             return shared.reserve_state.load(std::memory_order_acquire) == 2;
         });
         return shared.reserve_ok;
     }
 
     struct BatchState {
+        int                                      span_layer = -1;  // WP_WORKER_SPAN_TRACE request layer
         std::vector<PageIn>                       pageins;
         uint32_t                                span_seq = 0;   // WP_WORKER_SPAN_TRACE request tag
         std::atomic<size_t>                     next{0};
@@ -6180,7 +6498,7 @@ public:
         // anything they touch goes away. No detached threads, ever.
         for (auto & w : host_threads_) {
             if (w.thread.joinable()) {
-                w.thread.join();
+                wp_join(WP_S_IDLE, w.thread);
             }
         }
         stop_cpu_pf();   // reads into the arena through fds_: join before they close
@@ -6223,7 +6541,7 @@ public:
         }
         ggml_backend_event_t ev = nullptr;
         {
-            std::lock_guard<std::mutex> lock(copy_event_mutex_);
+            auto lock = wp_lock_timed(copy_event_mutex_);
             ggml_backend_event_t & slot = copy_flight_events_[data];
             if (slot == nullptr) {
                 slot = ggml_backend_event_new(device_);
@@ -6235,13 +6553,13 @@ public:
             // so the only safe fallback is a full backend sync now, and the
             // feature disarms for the rest of the process.
             copy_stream_h2d_ = false;
-            ggml_backend_synchronize(backend_);
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_); }
             return;
         }
         if (copy_stream_h2d_ && ggml_backend_cuda_wp_copy_stream_record_event != nullptr) {
             if (!ggml_backend_cuda_wp_copy_stream_record_event(backend_, ev)) {
                 copy_stream_h2d_ = false;
-                ggml_backend_synchronize(backend_);
+                { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_); }
             }
         } else {
             ggml_backend_event_record(ev, backend_);
@@ -6559,6 +6877,9 @@ public:
             std::chrono::steady_clock::time_point issued{};
             uint64_t upload_hash = 0;
             bool upload_hash_valid = false;
+            uint32_t span_seq = 0;      // WP_WORKER_SPAN_TRACE: the copy's own request tag
+            int      span_layer = -1;   // ... and request layer (completion may run elsewhere)
+            int      span_page_layer = -1;
         };
 
         explicit Batch(ExpertSlotPool * owner, size_t count) :
@@ -7095,6 +7416,7 @@ public:
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->conn_index = conn_index;
             batch.state_->span_seq = wp_span_ctx_seq;
+            batch.state_->span_layer = wp_span_ctx_layer;
             batch.copy_event_ = new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
             // Reader-thread H2D: decide once, here, under the lock, for every
@@ -7147,6 +7469,7 @@ public:
                     PageIn pi;
                     pi.entry_index = entry_index;
                     pi.span_seq   = wp_span_ctx_seq;
+                    pi.span_layer = wp_span_ctx_layer;
                     pi.page        = &page;
                     pi.demand_rec  = batch.demand_rec_;
                     // speculative verify (2-8 tokens) is decode traffic. Prefill
@@ -7390,7 +7713,7 @@ public:
                     });
             }
             {
-                std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                auto lock = wp_lock_timed(batch.state_->mutex);
                 batch.state_->start = true;
             }
             batch.state_->cv.notify_all();
@@ -7577,7 +7900,7 @@ public:
         // next R -- then cannot credit the page to the request that used it. That
         // alone moved USED from 686 to 424 with no change in behaviour.
         if (spec_log_ != nullptr) {
-            std::lock_guard<std::mutex> lock(*log_mutex_);
+            auto lock = wp_lock_timed(*log_mutex_);
             for (const ExpertPage * page : entry.inflight) {
                 fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
             }
@@ -7622,14 +7945,14 @@ public:
         for (const Batch::ArenaHold & hold : batch.arena_holds_) {
             ggml_backend_event_t ev = nullptr;
             {
-                std::lock_guard<std::mutex> lock(copy_event_mutex_);
+                auto lock = wp_lock_timed(copy_event_mutex_);
                 auto it = copy_flight_events_.find(hold.data);
                 if (it != copy_flight_events_.end()) {
                     ev = it->second;
                 }
             }
             if (ev != nullptr) {
-                ggml_backend_event_synchronize(ev);
+                { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_event_synchronize(ev); }
             }
             arena_.release(hold.cache_id, hold.handle);
             if (hold.pagein != nullptr) {
@@ -7663,7 +7986,7 @@ public:
     // reader thread and never hold across a drain, so they are exempt
     // (drain_quota_cap_ stays 0 = unlimited).
     void set_arena_inflight(size_t global_inflight, size_t n_drainers) {
-        std::lock_guard<std::mutex> lock(drain_quota_mu_);
+        auto lock = wp_lock_timed(drain_quota_mu_);
         arena_inflight_max_ = global_inflight;
         drain_quota_cap_ = reader_h2d_enabled_ || n_drainers <= 1
             ? 0
@@ -7682,14 +8005,14 @@ public:
         if (pagein.quota_held || pagein.reader_h2d || pagein.cpu_direct) {
             return;
         }
-        std::unique_lock<std::mutex> lock(drain_quota_mu_);
+        auto lock = wp_lock_timed(drain_quota_mu_);
         if (drain_quota_cap_ == 0) {
             return;
         }
         const bool   spec = pagein.spec;
         const size_t cap  = spec ? drain_quota_spec_cap_ : drain_quota_cap_;
         size_t & held = drain_quota_held_[spec ? kDrainQuotaSpecKey : conn_index];
-        drain_quota_cv_.wait(lock, [&]() { return held < cap; });
+        wp_cv_wait(WP_S_LOCK, drain_quota_cv_, lock, [&]() { return held < cap; });
         ++held;
         pagein.quota_held = true;
         pagein.quota_spec = spec;
@@ -7700,7 +8023,7 @@ public:
         }
         pagein.quota_held = false;
         {
-            std::lock_guard<std::mutex> lock(drain_quota_mu_);
+            auto lock = wp_lock_timed(drain_quota_mu_);
             auto it = drain_quota_held_.find(pagein.quota_spec ? kDrainQuotaSpecKey : conn_index);
             if (it != drain_quota_held_.end() && it->second > 0) {
                 --it->second;
@@ -7787,6 +8110,8 @@ public:
         // the original single-thread code relied on via host_pending_==0.
         auto finished = std::make_shared<std::atomic<bool>>(false);
         std::thread landing_thread([this, cold, finished]() {
+            WpThreadScope wp_thread(WP_ROLE_LANDING);
+            WpReadOriginScope rd_origin(WP_RD_LANDING);
             for (const auto & [page, fd] : cold) {
                 // Reserve a speculative arena entry for this landing. A
                 // refusal (inflight cap, or nothing evictable) just skips
@@ -7810,7 +8135,7 @@ public:
                 try {
                     if (spec_preempt_before_borrow_) {
                         while (must_yield()) {
-                            std::this_thread::sleep_for(std::chrono::microseconds(200));
+                            wp_sleep_for(WP_S_IDLE, std::chrono::microseconds(200));
                         }
                     }
                     // Fire the same hooks as every other read path. A host
@@ -7861,11 +8186,11 @@ public:
                                         // yielding for the next slice.
                                         break;
                                     }
-                                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                                    wp_sleep_for(WP_S_IDLE, std::chrono::microseconds(200));
                                 }
                             } else {
                                 while (must_yield()) {
-                                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                                    wp_sleep_for(WP_S_IDLE, std::chrono::microseconds(200));
                                 }
                             }
                             const size_t n =
@@ -7937,7 +8262,7 @@ public:
     void spec_host_reap() {
         for (auto it = host_threads_.begin(); it != host_threads_.end(); ) {
             if (it->finished->load(std::memory_order_acquire)) {
-                it->thread.join();
+                wp_join(WP_S_IDLE, it->thread);
                 it = host_threads_.erase(it);
             } else {
                 ++it;
@@ -8041,7 +8366,7 @@ public:
         // first, which starves the later layers of the step.
         static const size_t per_layer = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_PER_LAYER", 0);
         {
-            std::lock_guard<std::mutex> lock(pf_mu_);
+            auto lock = wp_lock_timed(pf_mu_);
             if (per_layer != 0 ? pf_layer_count_[page.layer] >= per_layer : pf_step_count_ >= cap) {
                 n_pf_capped_.fetch_add(1, std::memory_order_relaxed);
                 pf_log(page, "dropped");
@@ -8111,19 +8436,19 @@ public:
 
     void stop_cpu_pf() noexcept {
         {
-            std::lock_guard<std::mutex> lock(pf_mu_);
+            auto lock = wp_lock_timed(pf_mu_);
             pf_stop_ = true;
         }
         pf_cv_.notify_all();
         // pf_stop_ is set, so no enqueue can add a reader any more.
         std::vector<std::thread> threads;
         {
-            std::lock_guard<std::mutex> lock(pf_mu_);
+            auto lock = wp_lock_timed(pf_mu_);
             threads.swap(pf_threads_);
         }
         for (std::thread & t : threads) {
             if (t.joinable()) {
-                t.join();
+                wp_join(WP_S_IDLE, t);
             }
         }
     }
@@ -8219,7 +8544,7 @@ public:
             bool landed = true;
             while (batch.received_ < batch.state_->pageins.size()) {
                 if (!must_block) {
-                    std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                    auto lock = wp_lock_timed(batch.state_->mutex);
                     if (batch.state_->ready.empty()) {
                         landed = false;   // still in flight; come back later
                         break;
@@ -8392,7 +8717,7 @@ public:
             // per-step prefetch budget starts over. pf_layer_ is what the
             // prefetch reader's staleness test reads (atomic: other thread).
             if (layer < current_layer_) {
-                std::lock_guard<std::mutex> lock(pf_mu_);
+                auto lock = wp_lock_timed(pf_mu_);
                 pf_step_count_ = 0;
                 pf_layer_count_.clear();
             }
@@ -8496,8 +8821,8 @@ public:
         double best = 0.0;
         for (int i = 0; i < 3; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set(slots_[0].raw, src, 0, n);
-            ggml_backend_synchronize(backend_);
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(slots_[0].raw, src, 0, n); }
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_); }
             const double ns = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             if (ns > 0.0) {
@@ -9227,7 +9552,7 @@ private:
     std::shared_ptr<DemoteTicket> submit_demote(const ExpertPage * victim, ggml_tensor * raw) {
         auto ticket = std::make_shared<DemoteTicket>();
         {
-            std::lock_guard<std::mutex> lock(demote_mu_);
+            auto lock = wp_lock_timed(demote_mu_);
             if (!demote_thread_.joinable()) {
                 demote_thread_ = std::thread([this] { demote_loop(); });
             }
@@ -9243,8 +9568,8 @@ private:
         }
         const auto t0 = std::chrono::steady_clock::now();
         {
-            std::unique_lock<std::mutex> lock(ticket->m);
-            ticket->cv.wait(lock, [&] { return ticket->done; });
+            auto lock = wp_lock_timed(ticket->m);
+            wp_cv_wait(WP_S_READ_WAIT, ticket->cv, lock, [&] { return ticket->done; });
         }
         ns_victim_wait_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
@@ -9252,11 +9577,12 @@ private:
     }
 
     void demote_loop() {
+        WpThreadScope wp_thread(WP_ROLE_DEMOTE);
         for (;;) {
             DemoteJob job;
             {
-                std::unique_lock<std::mutex> lock(demote_mu_);
-                demote_cv_.wait(lock, [&] { return demote_stop_ || !demote_q_.empty(); });
+                auto lock = wp_lock_timed(demote_mu_);
+                wp_cv_wait(WP_S_IDLE, demote_cv_, lock, [&] { return demote_stop_ || !demote_q_.empty(); });
                 if (demote_q_.empty()) {
                     return;   // stop requested and nothing left
                 }
@@ -9264,13 +9590,16 @@ private:
                 demote_q_.pop_front();
                 ++demote_active_;
             }
-            demote_core(*job.victim, job.raw);
             {
-                std::lock_guard<std::mutex> lock(demote_mu_);
+                WpStateScope dm(WP_S_GPU_SYNC, -1, 0);   // demote = device->host copy + sync
+                demote_core(*job.victim, job.raw);
+            }
+            {
+                auto lock = wp_lock_timed(demote_mu_);
                 --demote_active_;
             }
             {
-                std::lock_guard<std::mutex> lock(job.ticket->m);
+                auto lock = wp_lock_timed(job.ticket->m);
                 job.ticket->done = true;
             }
             job.ticket->cv.notify_all();
@@ -9279,12 +9608,12 @@ private:
 
     void stop_demote_thread() {
         {
-            std::lock_guard<std::mutex> lock(demote_mu_);
+            auto lock = wp_lock_timed(demote_mu_);
             demote_stop_ = true;
         }
         demote_cv_.notify_all();
         if (demote_thread_.joinable()) {
-            demote_thread_.join();
+            wp_join(WP_S_IDLE, demote_thread_);
         }
     }
 
@@ -9320,8 +9649,12 @@ private:
                 for_each_page_chunk(victim, 0, (size_t) victim.size,
                                     [&](size_t dst_off, size_t dev_off, size_t n) {
                     if (!fast || !ok) return;
-                    if (!ggml_backend_cuda_wp_d2h(backend_, raw,
-                                                  (char *) data + dst_off, dev_off, n)) {
+                    const bool d2h_ok = [&] {
+                        WpStateScope d2h_state(WP_S_GPU_SYNC, -1, 0);   // blocking D2H
+                        return ggml_backend_cuda_wp_d2h(backend_, raw,
+                                                        (char *) data + dst_off, dev_off, n);
+                    }();
+                    if (!d2h_ok) {
                         if (first) fast = false; else ok = false;
                     }
                     first = false;
@@ -9496,6 +9829,8 @@ private:
             // retired before any later kernel launch is a stronger
             // guarantee than the same-stream kernel ordering MAD-114 is
             // actually about).
+            WpStateScope h2d_state(WP_S_H2D, pagein.span_layer, pagein.span_seq, 0,
+                                   pagein.page->layer);
             tensor_set_page_range_reader(
                 backend_, pagein.raw, *pagein.page, pagein.arena_data,
                 0, (size_t) pagein.page->size);
@@ -9512,8 +9847,8 @@ private:
         if (measure) {
             result.h2d_ns = h2d_ns;
         }
-        wp_span_end(WP_SPAN_H2D, pagein.page->layer, pagein.span_seq, h2d_ns,
-                    (int64_t) pagein.page->size);
+        wp_span_end(WP_SPAN_H2D, pagein.span_layer, pagein.span_seq, h2d_ns,
+                    (int64_t) pagein.page->size, pagein.page->layer);
         if (reader_h2d_verify_enabled()) {
             const size_t page_size = (size_t) pagein.page->size;
             const size_t sample    = std::min<size_t>(4096, page_size);
@@ -9574,7 +9909,7 @@ private:
                     // all -- reserve it lazily, exactly once per page, under
                     // the same gate the normal reservation used.
                     if (pagein.arena_data == nullptr) {
-                        std::lock_guard<std::mutex> lock(shared.reserve_mu);
+                        auto lock = wp_lock_timed(shared.reserve_mu);
                         if (pagein.arena_data == nullptr) {
                             pagein.cpu_direct = false;
                             if (!reserve_arena_for_pagein(pagein, state->conn_index)) {
@@ -9700,7 +10035,7 @@ private:
                 result->uploaded = true;
             }
             {
-                std::lock_guard<std::mutex> lock(state->mutex);
+                auto lock = wp_lock_timed(state->mutex);
                 state->ready.push_back(std::move(result));
             }
             state->cv.notify_one();
@@ -9708,12 +10043,13 @@ private:
     }
 
     void read_worker(const std::shared_ptr<BatchState> & state) {
+        WpThreadScope wp_thread(WP_ROLE_BATCH_READER);
 #if defined(__linux__)
         apply_reader_cpu_affinity(&reader_cpu_set_, reader_cpus_enabled_);
 #endif
         {
-            std::unique_lock<std::mutex> lock(state->mutex);
-            state->cv.wait(lock, [&]() {
+            auto lock = wp_lock_timed(state->mutex);
+            wp_cv_wait(WP_S_IDLE, state->cv, lock, [&]() {
                 return state->start || state->cancel;
             });
             if (state->cancel) {
@@ -9757,7 +10093,7 @@ private:
                     result->error = std::current_exception();
                 }
                 {
-                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto lock = wp_lock_timed(state->mutex);
                     state->ready.push_back(std::move(result));
                 }
                 state->cv.notify_one();
@@ -9900,7 +10236,7 @@ private:
                     release_pagein_hold(pagein, state->conn_index);
                 }
                 {
-                    std::lock_guard<std::mutex> lock(state->mutex);
+                    auto lock = wp_lock_timed(state->mutex);
                     state->ready.push_back(std::move(result));
                 }
                 state->cv.notify_one();
@@ -9952,10 +10288,14 @@ private:
                 continue;
             }
             if (it->event != nullptr) {
-                ggml_backend_event_synchronize(it->event);
+                {
+                    WpStateScope h2d_wait(WP_S_H2D, it->span_layer, it->span_seq, 0,
+                                          it->span_page_layer);
+                    { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_event_synchronize(it->event); }
+                }
                 if (measure) {
                     batch.ns_h2d_complete_ += wp_span_took(WP_SPAN_H2D,
-                        it->page != nullptr ? it->page->layer : -1, wp_span_ctx_seq,
+                        it->span_layer, it->span_seq,
                         (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - it->issued).count(),
                         it->page != nullptr ? (int64_t) it->page->size : 0);
@@ -9978,8 +10318,8 @@ private:
         {
             std::unique_ptr<ReadResult> result;
             {
-                std::unique_lock<std::mutex> lock(batch.state_->mutex);
-                batch.state_->cv.wait(lock, [&]() {
+                auto lock = wp_lock_timed(batch.state_->mutex);
+                wp_cv_wait(WP_S_READ_WAIT, batch.state_->cv, lock, [&]() {
                     return !batch.state_->ready.empty();
                 });
                 result = std::move(batch.state_->ready.front());
@@ -10100,7 +10440,7 @@ private:
                             async_copy = true;
                         } else {
                             used_fallback = wanted_copy_stream;
-                            ggml_backend_tensor_set(slot.raw, source, device_offset, n);
+                            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(slot.raw, source, device_offset, n); }
                         }
                     });
                     if (async_copy) {
@@ -10117,9 +10457,9 @@ private:
                     result_async = true;
                 } else {
                     used_fallback = wanted_copy_stream;
-                    ggml_backend_tensor_set(
+                    { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
                         slot.raw, (const char *) result->src + result->offset,
-                        result->offset, result->len);
+                        result->offset, result->len); }
                 }
                 const uint64_t h2d_issue_ns = measure_h2d
                     ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -10130,8 +10470,8 @@ private:
                     batch.ns_h2d_issue_ += h2d_issue_ns;
                     batch.bytes_h2d_ += result->len;
                 }
-                wp_span_end(WP_SPAN_H2D, pagein.page->layer, wp_span_ctx_seq, h2d_issue_ns,
-                            (int64_t) result->len);
+                wp_span_end(WP_SPAN_H2D, pagein.span_layer, pagein.span_seq, h2d_issue_ns,
+                            (int64_t) result->len, pagein.page->layer);
                 copy_stream_async = used_copy_stream && !used_fallback;
                 if (page_done) {
                     if (copy_stream_async) {
@@ -10216,7 +10556,7 @@ private:
                     // Default off; one fprintf per pagein, negligible against a
                     // 13.37 MB O_DIRECT read.
                     if (pagein_log_ != nullptr) {
-                        std::lock_guard<std::mutex> lock(*log_mutex_);
+                        auto lock = wp_lock_timed(*log_mutex_);
                         fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
                         // The harness SIGKILLs workers at teardown, so a buffered
                         // stream is lost entirely -- the first run produced two
@@ -10232,7 +10572,7 @@ private:
                     // logged "S" at submit, and a second line here would claim
                     // speculation provoked the very demand read it prevented.
                     if (spec_log_ != nullptr && !batch.state_->speculative) {
-                        std::lock_guard<std::mutex> lock(*log_mutex_);
+                        auto lock = wp_lock_timed(*log_mutex_);
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
@@ -10256,6 +10596,9 @@ private:
                             pending.issued = std::chrono::steady_clock::now();
                             pending.upload_hash = slot.upload_hash;
                             pending.upload_hash_valid = slot.upload_hash_valid;
+                            pending.span_seq = pagein.span_seq;
+                            pending.span_layer = pagein.span_layer;
+                            pending.span_page_layer = pagein.page->layer;
                             batch.pending_copies_.push_back(pending);
                             batch.entries_[pagein.entry_index].copy_pending = true;
                         } else {
@@ -10346,7 +10689,7 @@ private:
         harvest_copy_events(batch, std::numeric_limits<size_t>::max());
 
         for (std::thread & worker : batch.workers_) {
-            worker.join();
+            wp_join(WP_S_READ_WAIT, worker);
         }
         batch.workers_.clear();
         batch.completed_ = true;
@@ -10373,12 +10716,12 @@ private:
     void cancel_workers(Batch & batch) {
         if (batch.state_ != nullptr && !batch.workers_.empty()) {
             {
-                std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                auto lock = wp_lock_timed(batch.state_->mutex);
                 batch.state_->cancel = true;
             }
             batch.state_->cv.notify_all();
             for (std::thread & worker : batch.workers_) {
-                worker.join();
+                wp_join(WP_S_IDLE, worker);
             }
             batch.workers_.clear();
             // A cancelled-before-it-ran reader thread never calls
@@ -10872,6 +11215,7 @@ private:
             return it->second;
         }
         int fd = -1;
+        WpStateScope fd_state(WP_S_READ, -1, 0);   // open() of a blob file
         if (read_direct_) {
             fd = open(key.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
             if (fd < 0) {
@@ -10918,10 +11262,18 @@ private:
         }
         ssize_t n = -1;
         const bool measure_read = g_read_path_stats.enabled();
-        const bool span_read = state != nullptr && wp_span_on();
+        const bool span_read = wp_span_on();
+        // Every pread is span-recorded, null-state paths included. Request layer
+        // and seq come from the BatchState when there is one, else the thread's
+        // dispatch context (-1/0 on reader threads with no request).
+        const int      rd_req_layer = state != nullptr ? state->span_layer : wp_span_ctx_layer;
+        const uint32_t rd_seq = state != nullptr ? state->span_seq : wp_span_ctx_seq;
+        const uint8_t  rd_origin = state != nullptr
+            ? (state->speculative ? WP_RD_SPEC : WP_RD_DEMAND) : wp_read_origin_tls;
         const std::chrono::steady_clock::time_point read_started =
             measure_read || span_read ? std::chrono::steady_clock::now() :
                             std::chrono::steady_clock::time_point();
+        WpStateScope read_state(WP_S_READ, rd_req_layer, rd_seq, 0, page.layer);
         do {
             n = pread(fd, dst, len, (off_t) (page.offset + (uint64_t) offset));
         } while (n < 0 && errno == EINTR);
@@ -10950,10 +11302,11 @@ private:
                 elapsed, started_ns, finished_ns);
         }
         if (span_read) {
-            wp_span_end(state->speculative ? WP_SPAN_NVME_READ_SPEC : WP_SPAN_NVME_READ_DEMAND,
-                        page.layer, state->span_seq,
+            // layer = the expert's (page's) layer; page_layer = requesting layer.
+            wp_span_end(WP_SPAN_NVME_READ, page.layer, rd_seq,
                         (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - read_started).count(), (int64_t) len);
+                            std::chrono::steady_clock::now() - read_started).count(),
+                        (int64_t) len | ((int64_t) rd_origin << 48), rd_req_layer);
         }
         if (n < 0 || (size_t) n != len) {
             throw std::runtime_error(
@@ -11781,7 +12134,7 @@ private:
                 return PfGate::Go;
             }
             {
-                std::lock_guard<std::mutex> lock(pf_mu_);
+                auto lock = wp_lock_timed(pf_mu_);
                 if (pf_stop_) {
                     return PfGate::Stop;
                 }
@@ -11802,11 +12155,13 @@ private:
                 yielded = true;
                 n_pf_yield_.fetch_add(1, std::memory_order_relaxed);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            wp_sleep_for(WP_S_IDLE, std::chrono::microseconds(100));
         }
     }
 
     void cpu_pf_loop() {
+        WpThreadScope wp_thread(WP_ROLE_CPU_PF);
+        WpReadOriginScope rd_origin(WP_RD_PF);
         static const size_t chunk = [] {
             const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_PREFETCH_CHUNK", 2u << 20);
             return std::max<size_t>(64u << 10, (v + 4095) / 4096 * 4096);
@@ -11814,8 +12169,8 @@ private:
         for (;;) {
             PfItem it;
             {
-                std::unique_lock<std::mutex> lock(pf_mu_);
-                pf_cv_.wait(lock, [&] { return pf_stop_ || !pf_q_.empty(); });
+                auto lock = wp_lock_timed(pf_mu_);
+                wp_cv_wait(WP_S_IDLE, pf_cv_, lock, [&] { return pf_stop_ || !pf_q_.empty(); });
                 if (pf_stop_) {
                     return;
                 }
@@ -12328,21 +12683,21 @@ bool ExpertSlotPool::park_quiescent(std::string & why) const {
 void ExpertSlotPool::pf_pause(bool on) {
     pf_paused_.store(on, std::memory_order_relaxed);
     if (on) {
-        std::lock_guard<std::mutex> lock(pf_mu_);
+        auto lock = wp_lock_timed(pf_mu_);
         pf_q_.clear();
     }
 }
 
 bool ExpertSlotPool::bg_idle(std::string & why) const {
     {
-        std::lock_guard<std::mutex> lock(demote_mu_);
+        auto lock = wp_lock_timed(demote_mu_);
         if (!demote_q_.empty() || demote_active_ != 0) {
             why = "victim-demote thread busy";
             return false;
         }
     }
     {
-        std::lock_guard<std::mutex> lock(pf_mu_);
+        auto lock = wp_lock_timed(pf_mu_);
         if (!pf_q_.empty() || pf_active_.load(std::memory_order_relaxed) != 0) {
             why = "CPU prefetch thread busy";
             return false;
@@ -13472,7 +13827,7 @@ public:
             return;   // no device memory to compute on while parked
         }
         if (keepalive_graph_ != nullptr) {
-            ggml_backend_graph_compute(backend_.get(), keepalive_graph_);
+            { WpStateScope wss(WP_S_GPU_SUBMIT, -1, 0); ggml_backend_graph_compute(backend_.get(), keepalive_graph_); }
         }
     }
 
@@ -13548,7 +13903,7 @@ public:
         drop_spec_work();
         pool_.spec_pagein_poll(true);
         while (pool_.spec_host_in_flight() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            wp_sleep_for(WP_S_IDLE, std::chrono::milliseconds(2));
             pool_.spec_host_reap();
         }
         pool_.spec_host_reap();
@@ -13559,7 +13914,7 @@ public:
         for (;;) {
             bool idle = false;
             {
-                std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+                auto lock = wp_lock_timed(cpu_tier_mu_);
                 idle = cpu_tier_io_q_.empty() && cpu_tier_compute_q_.empty() &&
                        cpu_tier_io_active_.load(std::memory_order_relaxed) == 0;
             }
@@ -13572,7 +13927,7 @@ public:
                              "CPU-tier executor still has queued or running work";
                 return false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            wp_sleep_for(WP_S_IDLE, std::chrono::milliseconds(2));
         }
         if (!pool_.park_quiescent(why)) {
             return false;
@@ -13587,7 +13942,7 @@ public:
         st.dev_total = dev_total;
         try {
             // Fence everything issued on the backend BEFORE any D2H or free.
-            ggml_backend_synchronize(backend_.get());
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
 
             // --- residency snapshot, hottest first ---
             snapshot_residency(park_rows_, st.n_vram, st.n_ram);
@@ -13606,7 +13961,7 @@ public:
                     }
                 }
                 st.demoted = pool_.park_demote(hot_first, st.demoted_bytes, st.not_demoted);
-                ggml_backend_synchronize(backend_.get());
+                { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
             }
 
             // --- free the device memory ---
@@ -14622,7 +14977,7 @@ public:
         if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> lock(logs_->mutex);
+        auto lock = wp_lock_timed(logs_->mutex);
         std::fprintf(logs_->hint, "R %d", layer);
         for (const pipe_expert_assignment & a : assignments) {
             std::fprintf(logs_->hint, " %d", a.expert_id);
@@ -15924,7 +16279,7 @@ public:
         ggml_backend_graph_plan_t plan = nullptr;
         try {
             synchronize_async(nullptr);
-            ggml_backend_synchronize(backend_.get());
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
             plan = ggml_backend_graph_plan_create(backend_.get(), graph);
         } catch (...) {
             plan = nullptr;
@@ -16131,7 +16486,7 @@ private:
             return;
         }
         const auto started = std::chrono::steady_clock::now();
-        ggml_backend_synchronize(backend_.get());
+        { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
         take_vk_node_ts(request_stats);
         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count();
@@ -16376,12 +16731,12 @@ private:
         if (persistent_plan != nullptr) {
             status = ggml_backend_graph_plan_compute(backend_.get(), persistent_plan);
             if (!submit_async_) {
-                ggml_backend_synchronize(backend_.get());
+                { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
             }
         } else {
             status = submit_async_
                 ? ggml_backend_graph_compute_async(backend_.get(), graph)
-                : ggml_backend_graph_compute(backend_.get(), graph);
+                : wp_graph_compute(WP_S_GPU_SUBMIT, backend_.get(), graph);
         }
         if (submit_async_ && is_cuda_backend() && status == GGML_STATUS_SUCCESS) {
             enqueue_work_input_trace();
@@ -16718,7 +17073,7 @@ private:
         if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> lock(logs_->mutex);
+        auto lock = wp_lock_timed(logs_->mutex);
         std::fprintf(logs_->hint, "C %s\n", prefetch_hint_line().c_str());
         std::fflush(logs_->hint);
     }
@@ -16731,7 +17086,7 @@ private:
         if (logs_ == nullptr || logs_->hint == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> lock(logs_->mutex);
+        auto lock = wp_lock_timed(logs_->mutex);
         std::fprintf(logs_->hint, "H %d", hint.layer);
         for (int32_t expert_id : hint.expert_ids) {
             std::fprintf(logs_->hint, " %d", expert_id);
@@ -16780,7 +17135,7 @@ private:
             return;
         }
         // Warm it once so the first real gap does not pay pipeline compilation.
-        ggml_backend_graph_compute(backend_.get(), keepalive_graph_);
+        { WpStateScope wss(WP_S_GPU_SUBMIT, -1, 0); ggml_backend_graph_compute(backend_.get(), keepalive_graph_); }
         fprintf(stderr, "wp keepalive enabled: every %d us while idle\n", keepalive_us_);
     }
 
@@ -17168,7 +17523,7 @@ private:
             std::vector<uint8_t> padded(full_bytes);
             std::memcpy(padded.data(), activation, act_bytes);
             std::memset(padded.data() + act_bytes, 0, full_bytes - act_bytes);
-            ggml_backend_tensor_set(input, padded.data(), 0, full_bytes);
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(input, padded.data(), 0, full_bytes); }
             sublap(request_stats.ns_prep_set);
             return;
         }
@@ -17207,7 +17562,7 @@ private:
             ggml_backend_tensor_set_async(
                 backend_.get(), input, src, 0, set_bytes);
         } else {
-            ggml_backend_tensor_set(input, src, 0, set_bytes);
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(input, src, 0, set_bytes); }
         }
         sublap(request_stats.ns_prep_set);
     }
@@ -17817,7 +18172,7 @@ private:
                     result_offset != std::numeric_limits<size_t>::max() ? 1 : 0,
                     use_gather ? 1 : 0, sel_begin, sel_end,
                     request.assignments.size());
-                std::lock_guard<std::mutex> lock(s_shape_mu);
+                auto lock = wp_lock_timed(s_shape_mu);
                 if (s_shape_logged < 20 && s_seen_shapes.insert(key).second) {
                     std::fprintf(stderr, "WP_VK_FUSED_EXPERT_SHAPE %s\n", key);
                     ++s_shape_logged;
@@ -18343,7 +18698,7 @@ private:
                     ggml_backend_tensor_set_async(
                         backend_.get(), gc->blob, state.params.back().data(), 0, params_span);
                 } else {
-                    ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span);
+                    { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span); }
                 }
                 const uint64_t params_elapsed =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -18785,10 +19140,10 @@ private:
                 request_stats.n_weight_total += idx.size();
                 if (!s_params_coalesce) {
                     const auto params_started = std::chrono::steady_clock::now();
-                    ggml_backend_tensor_set(
-                        item.first, compact.data(), 0, compact.size() * sizeof(float));
-                    ggml_backend_tensor_set(
-                        gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t));
+                    { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+                        item.first, compact.data(), 0, compact.size() * sizeof(float)); }
+                    { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+                        gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t)); }
                     const uint64_t params_elapsed =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - params_started).count();
@@ -18814,8 +19169,8 @@ private:
                         wbytes = padded.size() * sizeof(float);
                     }
                     const auto params_started = std::chrono::steady_clock::now();
-                    ggml_backend_tensor_set(
-                        item.first, wdata, 0, wbytes);
+                    { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+                        item.first, wdata, 0, wbytes); }
                     const uint64_t params_elapsed =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - params_started).count();
@@ -18852,7 +19207,7 @@ private:
                 ggml_backend_tensor_set_async(
                     backend_.get(), blob, state.params.back().data(), 0, params_span);
             } else {
-                ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
+                { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(blob, params_host.data(), 0, params_span); }
             }
             const uint64_t params_elapsed =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -18879,7 +19234,7 @@ private:
                 if (submit_async_) {
                     synchronize_async(&request_stats);
                 } else {
-                    ggml_backend_synchronize(backend_.get());
+                    { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_.get()); }
                 }
                 gc->persistent_plan = create_persistent_plan(graph);
             }
@@ -19112,7 +19467,7 @@ private:
             }
         }
         {
-            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            auto lock = wp_lock_timed(cpu_tier_mu_);
             if (cpu_tier_threads_.empty()) {
                 const size_t n_io = (size_t) ExpertSlotPool::cpu_tier_env_u64("WP_EXPERT_CPU_TIER_IO", 4);
                 for (size_t t = 0; t < n_io; ++t) {
@@ -19157,7 +19512,7 @@ private:
             job->request = request;
         } else {
             try {
-                std::lock_guard<std::mutex> lock(job->m);
+                auto lock = wp_lock_timed(job->m);
                 if (!job->error) {
                     job->error = std::make_exception_ptr(
                         std::runtime_error("cpu tier job cancelled"));
@@ -19166,7 +19521,7 @@ private:
             }
         }
         {
-            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            auto lock = wp_lock_timed(cpu_tier_mu_);
             cpu_tier_compute_q_.push_back(job);
         }
         cpu_tier_cv_.notify_all();
@@ -19185,8 +19540,8 @@ private:
     }
 
     void wait_cpu_tier(CpuTierJob & job) noexcept {
-        std::unique_lock<std::mutex> lock(job.m);
-        job.cv.wait(lock, [&] { return job.finished; });
+        auto lock = wp_lock_timed(job.m);
+        wp_cv_wait(WP_S_CPU_WAIT, job.cv, lock, [&] { return job.finished; });
     }
 
     // Waits for the job, then adds its partials into `sum` in assignment order.
@@ -19219,13 +19574,13 @@ private:
 
     void stop_cpu_tier() noexcept {
         {
-            std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+            auto lock = wp_lock_timed(cpu_tier_mu_);
             cpu_tier_stop_ = true;
         }
         cpu_tier_cv_.notify_all();
         for (std::thread & t : cpu_tier_threads_) {
             if (t.joinable()) {
-                t.join();
+                wp_join(WP_S_IDLE, t);
             }
         }
         cpu_tier_threads_.clear();
@@ -19236,7 +19591,7 @@ private:
                          std::exception_ptr err) {
         pool_.cpu_tier_demand_end();   // pairs with cpu_tier_demand_begin at submit
         {
-            std::lock_guard<std::mutex> lock(job.m);
+            auto lock = wp_lock_timed(job.m);
             if (job.reads[k]) {
                 job.reads[k]->settled = true;   // no more early gate/up pushes
             }
@@ -19273,7 +19628,7 @@ private:
             } catch (...) {
                 err = std::current_exception();
                 pr.failed.store(true, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lock(job->m);
+                auto lock = wp_lock_timed(job->m);
                 if (!job->error) {
                     job->error = err;
                 }
@@ -19287,7 +19642,7 @@ private:
             if (gu_fire) {
                 bool queued = false;
                 {
-                    std::lock_guard<std::mutex> lock(job->m);
+                    auto lock = wp_lock_timed(job->m);
                     if (!pr.settled && !job->error) {
                         job->gu_ready.push_back(k);
                         queued = true;
@@ -19305,7 +19660,7 @@ private:
         } else {
             // The compute thread may be reading the in-flight page (early gate/up):
             // let it finish before the entry is dropped for reuse.
-            std::lock_guard<std::mutex> gu_lock(pr.gu_mu);
+            auto gu_lock = wp_lock_timed(pr.gu_mu);
             pool_.finish_host_read(*pr.page, pr.hp, ok);
         }
         if (ok) {
@@ -19336,11 +19691,13 @@ private:
     }
 
     void cpu_tier_io_loop() {
+        WpThreadScope wp_thread(WP_ROLE_CPU_TIER_IO);
+        WpReadOriginScope rd_origin(WP_RD_CPUTIER);
         for (;;) {
             CpuTierIoTask task;
             {
-                std::unique_lock<std::mutex> lock(cpu_tier_mu_);
-                cpu_tier_cv_.wait(lock, [&] { return cpu_tier_stop_ || !cpu_tier_io_q_.empty(); });
+                auto lock = wp_lock_timed(cpu_tier_mu_);
+                wp_cv_wait(WP_S_IDLE, cpu_tier_cv_, lock, [&] { return cpu_tier_stop_ || !cpu_tier_io_q_.empty(); });
                 if (cpu_tier_io_q_.empty()) {
                     return;
                 }
@@ -19368,7 +19725,7 @@ private:
                     ExpertSlotPool::HostPage hp = pool_.acquire_host_page(page, job->fds[k], job->n_tokens);
                     if (job->demand_rec) { job->demand_rec->src[job->index[k]] = hp.src; }
                     {
-                        std::lock_guard<std::mutex> lock(job->m);
+                        auto lock = wp_lock_timed(job->m);
                         job->holds[k] = hp;
                     }
                     cpu_tier_settle(*job, k, true, hp.ram_hit, nullptr);
@@ -19382,7 +19739,7 @@ private:
                 if (job->demand_rec) { job->demand_rec->src[job->index[k]] = pr->hp.src; }
                 if (hit) {
                     {
-                        std::lock_guard<std::mutex> lock(job->m);
+                        auto lock = wp_lock_timed(job->m);
                         job->holds[k] = pr->hp;
                     }
                     cpu_tier_settle(*job, k, true, true, nullptr);
@@ -19419,7 +19776,7 @@ private:
                 {
                     // Front of the queue: finish this page before starting
                     // other pages, so compute can begin on it sooner.
-                    std::lock_guard<std::mutex> lock(cpu_tier_mu_);
+                    auto lock = wp_lock_timed(cpu_tier_mu_);
                     for (size_t c = n; c-- > 1;) {
                         cpu_tier_io_q_.push_front(CpuTierIoTask{job, k, (int) c});
                     }
@@ -19571,11 +19928,11 @@ private:
             if (sl.input == nullptr) {
                 continue;
             }
-            ggml_backend_tensor_set(sl.input, sl.x.data(), 0, ggml_nbytes(sl.input));
-            ggml_backend_tensor_set(sl.route, sl.w.data(), 0, ggml_nbytes(sl.route));
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(sl.input, sl.x.data(), 0, ggml_nbytes(sl.input)); }
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(sl.route, sl.w.data(), 0, ggml_nbytes(sl.route)); }
         }
         const auto t_graph = std::chrono::steady_clock::now();
-        if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
+        if (wp_graph_compute(WP_S_COMPUTE_CPU, cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
         }
         job.ns_graph += (uint64_t) std::chrono::duration_cast<
@@ -19589,7 +19946,7 @@ private:
             job.n_rows  += (uint64_t) m;
             job.n_m_ge3 += m >= 3 ? 1 : 0;
             sl.y.resize((size_t) m * (size_t) n_embd);
-            ggml_backend_tensor_get(sl.weighted, sl.y.data(), 0, sl.y.size() * sizeof(float));
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(sl.weighted, sl.y.data(), 0, sl.y.size() * sizeof(float)); }
             std::vector<float> & out = job.partials[ks[i]];
             for (int64_t r = 0; r < m; ++r) {
                 std::memcpy(out.data() + (size_t) sl.rows[r] * n_embd, sl.y.data() + (size_t) r * n_embd,
@@ -19599,6 +19956,7 @@ private:
     }
 
     void cpu_tier_compute_loop() {
+        WpThreadScope wp_thread(WP_ROLE_CPU_TIER_COMPUTE);
         // Own backend on this thread: ggml applies the threadpool's settings to
         // OpenMP thread 0, which is the calling thread -- never a GPU thread here.
         // Declared before the backend so it is destroyed after it.
@@ -19637,8 +19995,8 @@ private:
         for (;;) {
             std::shared_ptr<CpuTierJob> job;
             {
-                std::unique_lock<std::mutex> lock(cpu_tier_mu_);
-                cpu_tier_cv_.wait(lock, [&] { return cpu_tier_stop_ || !cpu_tier_compute_q_.empty(); });
+                auto lock = wp_lock_timed(cpu_tier_mu_);
+                wp_cv_wait(WP_S_IDLE, cpu_tier_cv_, lock, [&] { return cpu_tier_stop_ || !cpu_tier_compute_q_.empty(); });
                 if (cpu_tier_compute_q_.empty()) {
                     return;
                 }
@@ -19650,8 +20008,8 @@ private:
                 size_t k = 0;
                 bool early = false;
                 {
-                    std::unique_lock<std::mutex> lock(job->m);
-                    job->cv.wait(lock, [&] {
+                    auto lock = wp_lock_timed(job->m);
+                    wp_cv_wait(WP_S_READ_WAIT, job->cv, lock, [&] {
                         return !job->landed.empty() || !job->gu_ready.empty() ||
                                job->n_settled == n;
                     });
@@ -19685,7 +20043,7 @@ private:
                     // it, and only the gate/up chunks, which have all landed.
                     bool skip = false;
                     {
-                        std::lock_guard<std::mutex> lock(job->m);
+                        auto lock = wp_lock_timed(job->m);
                         skip = job->error != nullptr;
                     }
                     if (!skip) {
@@ -19694,17 +20052,19 @@ private:
                             if (!cpu || !galloc) {
                                 throw std::runtime_error("failed to initialize the CPU tier backend");
                             }
-                            std::lock_guard<std::mutex> gu_lock(pr.gu_mu);
+                            auto gu_lock = wp_lock_timed(pr.gu_mu);
                             if (!pr.failed.load(std::memory_order_relaxed)) {
+                                WpStateScope cs(WP_S_COMPUTE_CPU, job->span_layer, job->span_seq, 0,
+                                                job->pages[k]->layer);
                                 const auto t0 = std::chrono::steady_clock::now();
                                 cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(), 1, pr.data);
-                                job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[k]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
-                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert);
+                                job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->span_layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert, job->pages[k]->layer);
                                 job->gu_done[k] = 1;
                                 ++job->n_gu_early;
                             }
                         } catch (...) {
-                            std::lock_guard<std::mutex> lock(job->m);
+                            auto lock = wp_lock_timed(job->m);
                             if (!job->error) {
                                 job->error = std::current_exception();
                             }
@@ -19714,7 +20074,7 @@ private:
                 }
                 bool failed = false;
                 {
-                    std::lock_guard<std::mutex> lock(job->m);
+                    auto lock = wp_lock_timed(job->m);
                     failed = job->error != nullptr;
                 }
                 if (batch_on) {
@@ -19725,12 +20085,15 @@ private:
                             if (!cpu || !galloc) {
                                 throw std::runtime_error("failed to initialize the CPU tier backend");
                             }
+                            WpStateScope cs(WP_S_COMPUTE_CPU, job->span_layer, job->span_seq, 0,
+                                            job->pages[batch_ks[0]]->layer);
                             const auto t0 = std::chrono::steady_clock::now();
                             cpu_tier_compute_batch(*job, batch_ks, cpu.get(), galloc.get(), *batch_state);
-                            job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[batch_ks[0]]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
-                                std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), (int64_t) batch_ks.size());
+                            job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->span_layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), (int64_t) batch_ks.size(),
+                                job->pages[batch_ks[0]]->layer);
                         } catch (...) {
-                            std::lock_guard<std::mutex> lock(job->m);
+                            auto lock = wp_lock_timed(job->m);
                             if (!job->error) {
                                 job->error = std::current_exception();
                             }
@@ -19746,13 +20109,16 @@ private:
                         if (!cpu || !galloc) {
                             throw std::runtime_error("failed to initialize the CPU tier backend");
                         }
+                        WpStateScope cs(WP_S_COMPUTE_CPU, job->span_layer, job->span_seq, 0,
+                                        job->pages[k]->layer);
                         const auto t0 = std::chrono::steady_clock::now();
                         cpu_tier_compute_one(*job, k, cpu.get(), galloc.get(),
                                              job->gu_done[k] ? 2 : 0, job->holds[k].data);
-                        job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->pages[k]->layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
-                            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert);
+                        job->ns_compute += wp_span_took(WP_SPAN_CPU_TIER_JOB, job->span_layer, job->span_seq, (uint64_t) std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(), job->pages[k]->expert,
+                            job->pages[k]->layer);
                     } catch (...) {
-                        std::lock_guard<std::mutex> lock(job->m);
+                        auto lock = wp_lock_timed(job->m);
                         if (!job->error) {
                             job->error = std::current_exception();
                         }
@@ -19761,7 +20127,7 @@ private:
                 pool_.release_host_page(*job->pages[k], job->holds[k]);
             }
             {
-                std::lock_guard<std::mutex> lock(job->m);
+                auto lock = wp_lock_timed(job->m);
                 job->finished = true;
             }
             job->cv.notify_all();
@@ -19874,15 +20240,15 @@ private:
             throw std::runtime_error("failed to allocate CPU tier graph");
         }
         if (input != nullptr) {
-            ggml_backend_tensor_set(input, x.data(), 0, ggml_nbytes(input));
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(input, x.data(), 0, ggml_nbytes(input)); }
         } else {
-            ggml_backend_tensor_set(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden));
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden)); }
         }
         if (route != nullptr) {
-            ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route));
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(route, w.data(), 0, ggml_nbytes(route)); }
         }
         const auto t_graph = std::chrono::steady_clock::now();
-        if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
+        if (wp_graph_compute(WP_S_COMPUTE_CPU, cpu, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("CPU tier graph compute failed");
         }
         job.ns_graph += (uint64_t) std::chrono::duration_cast<
@@ -19894,11 +20260,11 @@ private:
         cpu_tier_log_team_once();
         if (stage == 1) {
             job.hidden[k].resize((size_t) ggml_nelements(hidden));
-            ggml_backend_tensor_get(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden));
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(hidden, job.hidden[k].data(), 0, ggml_nbytes(hidden)); }
             return;
         }
         std::vector<float> y((size_t) m * (size_t) n_embd);
-        ggml_backend_tensor_get(weighted, y.data(), 0, y.size() * sizeof(float));
+        { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(weighted, y.data(), 0, y.size() * sizeof(float)); }
         for (int64_t r = 0; r < m; ++r) {
             std::memcpy(out.data() + (size_t) rows[r] * n_embd, y.data() + (size_t) r * n_embd,
                         (size_t) n_embd * sizeof(float));
@@ -20842,8 +21208,8 @@ private:
                 std::chrono::steady_clock::now() - params_started).count();
         } else {
             const auto params_started = std::chrono::steady_clock::now();
-            ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
-            ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float));
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t)); }
+            { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float)); }
             params_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
         }
@@ -21406,7 +21772,7 @@ private:
         begin_work_input_trace(
             request, pages, batch, trace_selected, /* use_gather = */ false, -1);
         const auto params_started = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span); }
         const uint64_t params_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
@@ -21699,7 +22065,7 @@ private:
         begin_work_input_trace(
             request, pages, batch, trace_selected, /* use_gather = */ false, -1);
         const auto params_started = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span); }
         const uint64_t params_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
@@ -22014,7 +22380,7 @@ private:
         std::memcpy(params_host.data(), ids_host.data(), ids_bytes);
         std::memcpy(params_host.data() + route_offset, route_host.data(), route_bytes);
         const auto params_started = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span);
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(entry.blob, params_host.data(), 0, params_span); }
         const uint64_t params_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - params_started).count();
@@ -22071,7 +22437,7 @@ private:
                         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
                     }
                 }
-                const auto result = ggml_backend_graph_compute(backend_.get(), entry.graph);
+                const auto result = wp_graph_compute(WP_S_GPU_SUBMIT, backend_.get(), entry.graph);
                 restore_graph_env();
                 if (submit_async_ && is_cuda_backend() && result == GGML_STATUS_SUCCESS) {
                     enqueue_work_input_trace();
@@ -22246,8 +22612,8 @@ private:
             }
         }
         const auto readback_started = std::chrono::steady_clock::now();
-        ggml_backend_tensor_get(
-            output, result_dst, 0, result_bytes);
+        { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_tensor_get(
+            output, result_dst, 0, result_bytes); }
         if (result_dst != result.data()) {
             std::memcpy(result.data(), result_dst, result_bytes);
         }
@@ -22274,8 +22640,8 @@ private:
         ggml_tensor * output = make_io_tensor(
             ctx.get(), (uint32_t) (partial.size() /
                 (size_t) catalog_.descriptor.hparams.n_embd), offset);
-        ggml_backend_tensor_set(
-            output, partial.data(), 0, partial.size() * sizeof(float));
+        { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+            output, partial.data(), 0, partial.size() * sizeof(float)); }
     }
 
     // *** WP_EXPERT_RESIDENT_FIRST support: per-slot IO layout + the final
@@ -22625,8 +22991,8 @@ private:
                     continue;
                 }
                 ggml_tensor * t = rotation_h_a_.at({ layer_kv.first, role_kv.first });
-                ggml_backend_tensor_set(
-                    t, role.rotation.h_a.data(), 0, role.rotation.h_a.size() * sizeof(float));
+                { WpStateScope wss(WP_S_H2D, -1, 0); ggml_backend_tensor_set(
+                    t, role.rotation.h_a.data(), 0, role.rotation.h_a.size() * sizeof(float)); }
             }
         }
     }
@@ -22673,7 +23039,7 @@ private:
     mutable std::mutex             ml8_special_log_mu_;
     mutable std::set<std::pair<int, std::string>> ml8_special_logged_;
     void log_ml8_special_fallback(int layer, const char * path_name) const {
-        std::lock_guard<std::mutex> lock(ml8_special_log_mu_);
+        auto lock = wp_lock_timed(ml8_special_log_mu_);
         if (ml8_special_logged_.emplace(layer, path_name).second) {
             std::fprintf(stderr,
                 "INFO wp expert worker: layer %d is ml8-special (rotation and/or ML8_4); "
@@ -23348,6 +23714,7 @@ public:
                     break;   // nothing evictable: the arena is full of pins
                 }
                 bool ok = false;
+                WpStateScope rd_state(WP_S_READ, -1, 0, 0, page.layer);
                 const int fd = ::open(page.blob.c_str(), O_RDONLY | O_CLOEXEC);
                 if (fd >= 0) {
                     if (test_hooks != nullptr && test_hooks->read_started) {
@@ -23611,7 +23978,7 @@ public:
     }
     void conn_opened() { conn_open_.fetch_add(1, std::memory_order_acq_rel); }
     bool parked_now() {
-        std::lock_guard<std::mutex> lock(park_mu_);
+        auto lock = wp_lock_timed(park_mu_);
         return park_state_ == ParkState::Parked;
     }
     void conn_closed(bool real) noexcept {
@@ -23658,7 +24025,7 @@ public:
         }
         // Computed before park_mu_ (device mutex, never nested inside it).
         const bool mid_txn = stream_active || has_split_dispatch(conn_index);
-        std::unique_lock<std::mutex> lock(park_mu_);
+        auto lock = wp_lock_timed(park_mu_);
         for (;;) {
             if (park_state_ == ParkState::Active) {
                 break;
@@ -23673,7 +24040,7 @@ public:
                 }
                 continue;
             }
-            park_cv_.wait(lock);
+            wp_cv_wait(WP_S_IDLE, park_cv_, lock);
         }
         ++park_inflight_;
         park_inflight_atomic_.store(park_inflight_, std::memory_order_relaxed);
@@ -23691,7 +24058,7 @@ public:
             return;
         }
         {
-            std::lock_guard<std::mutex> lock(park_mu_);
+            auto lock = wp_lock_timed(park_mu_);
             --park_inflight_;
             park_inflight_atomic_.store(park_inflight_, std::memory_order_relaxed);
             if (txn_open) {
@@ -23710,7 +24077,7 @@ public:
         }
         try {
             {
-                std::lock_guard<std::mutex> lock(park_mu_);
+                auto lock = wp_lock_timed(park_mu_);
                 park_txn_conns_.erase(conn_index);
             }
             park_cv_.notify_all();
@@ -23723,8 +24090,8 @@ public:
     // serving thread) waits for it to finish and is then applied, never
     // dropped. Requests on the control thread are serialized by the pipe.
     bool park(const char * why) {
-        std::unique_lock<std::mutex> lock(park_mu_);
-        park_cv_.wait(lock, [&] {
+        auto lock = wp_lock_timed(park_mu_);
+        wp_cv_wait(WP_S_IDLE, park_cv_, lock, [&] {
             return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
         });
         if (park_state_ != ParkState::Active) {
@@ -23747,7 +24114,7 @@ public:
         // serving thread; taking seed_mu_ waits out a chunk in progress).
         {
             lock.unlock();
-            std::lock_guard<std::mutex> seed_lock(seed_mu_);
+            auto seed_lock = wp_lock_timed(seed_mu_);
             seed_active_.store(false, std::memory_order_release);
             log_ram_phase_end("cancelled");
             lock.lock();
@@ -23780,7 +24147,7 @@ public:
                 park_cv_.notify_all();
                 return false;
             }
-            park_cv_.wait_for(lock, std::chrono::milliseconds(20));
+            wp_cv_wait_for(WP_S_IDLE, park_cv_, lock, std::chrono::milliseconds(20));
         }
         lock.unlock();
         const bool ok = do_park(why);
@@ -23792,8 +24159,8 @@ public:
     }
 
     bool unpark(const char * why) {
-        std::unique_lock<std::mutex> lock(park_mu_);
-        park_cv_.wait(lock, [&] {
+        auto lock = wp_lock_timed(park_mu_);
+        wp_cv_wait(WP_S_IDLE, park_cv_, lock, [&] {
             return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
         });
         if (park_state_ != ParkState::Parked) {
@@ -23831,9 +24198,9 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(quiesce_ms);
         bool timed_out = false;
         {
-            std::unique_lock<std::mutex> lock(park_mu_);
+            auto lock = wp_lock_timed(park_mu_);
             // A park/unpark transition on another thread: let it finish (bounded).
-            if (!park_cv_.wait_until(lock, deadline, [&] {
+            if (!wp_cv_wait_until(WP_S_IDLE, park_cv_, lock, deadline, [&] {
                     return park_state_ == ParkState::Active || park_state_ == ParkState::Parked;
                 })) {
                 timed_out = true;
@@ -23842,7 +24209,7 @@ public:
                 set_park_state(ParkState::Parking);
                 {
                     lock.unlock();
-                    std::lock_guard<std::mutex> seed_lock(seed_mu_);
+                    auto seed_lock = wp_lock_timed(seed_mu_);
                     seed_active_.store(false, std::memory_order_release);
                     log_ram_phase_end("cancelled");
                     lock.lock();
@@ -23864,7 +24231,7 @@ public:
                         timed_out = true;
                         break;
                     }
-                    park_cv_.wait_for(lock, std::chrono::milliseconds(20));
+                    wp_cv_wait_for(WP_S_IDLE, park_cv_, lock, std::chrono::milliseconds(20));
                 }
             }
             // else: already Parked -- park_rows_ hold the snapshot; do not unpark.
@@ -23882,7 +24249,7 @@ public:
             for (int k = 0; k < 500 && !got; ++k) {   // <= 5 s; never block forever
                 got = dlock.try_lock();
                 if (!got) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    wp_sleep_for(WP_S_IDLE, std::chrono::milliseconds(10));
                 }
             }
             if (!got) {
@@ -23954,7 +24321,7 @@ public:
             size_t ram = 0;
             size_t host = 0;
             {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 dev.seed_prepare_from_file_rows(it->second, sel, ram, ram_phase, host);
             }
             total += sel;
@@ -23972,7 +24339,7 @@ public:
                      total, total_ram);
         if (total_host != 0) {
             {
-                std::lock_guard<std::mutex> seed_lock(seed_mu_);
+                auto seed_lock = wp_lock_timed(seed_mu_);
                 ram_phase_ = RamPhase{};
                 ram_phase_.active = true;
                 ram_phase_.planned = total_host;
@@ -24013,7 +24380,7 @@ public:
         if (busy && slice_ms == 0) {
             return false;
         }
-        std::lock_guard<std::mutex> seed_lock(seed_mu_);
+        auto seed_lock = wp_lock_timed(seed_mu_);
         if (!seed_active_.load(std::memory_order_acquire)) {
             return false;
         }
@@ -24029,7 +24396,7 @@ public:
             bool     host_phase = false;
             bool     ram_full = false;
             run_on_device(i, [&] {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 if (dev.parked() || !dev.seed_pending()) {
                     return;
                 }
@@ -24151,7 +24518,7 @@ private:
         if (park_fast_inflight_.fetch_sub(1, std::memory_order_seq_cst) == 1 &&
                 park_armed_.load(std::memory_order_seq_cst)) {
             {
-                std::lock_guard<std::mutex> lock(park_mu_);   // no lost wakeup
+                auto lock = wp_lock_timed(park_mu_);   // no lost wakeup
             }
             park_cv_.notify_all();
         }
@@ -24159,12 +24526,12 @@ private:
 
     bool split_pending_any() {
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             if (devices_[i]->has_any_split_dispatch()) {
                 return true;
             }
         }
-        std::lock_guard<std::mutex> lock(split_mutex_);
+        auto lock = wp_lock_timed(split_mutex_);
         return !split_pending_by_conn_.empty();
     }
 
@@ -24199,7 +24566,7 @@ private:
             std::string reason;
             bool ok = false;
             run_on_device(i, [&] {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 try {
                     ok = dev.park(st, reason);
                 } catch (const std::exception & e) {
@@ -24259,7 +24626,7 @@ private:
             std::string e;
             bool ok = false;
             run_on_device(i, [&] {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 ok = dev.unpark(realloc_ms, e);
                 if (ok) {
                     dev.seed_prepare_from_park_rows(sel, ram);
@@ -24307,7 +24674,7 @@ private:
         for (size_t i = 0; i < devices_.size(); ++i) {
             bool pending = false;
             {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 pending = devices_[i]->seed_pending();
             }
             if (pending) {
@@ -24320,7 +24687,7 @@ private:
         if (!any) {
             return;
         }
-        std::lock_guard<std::mutex> seed_lock(seed_mu_);
+        auto seed_lock = wp_lock_timed(seed_mu_);
         seed_run_ = SeedRun{};
         seed_run_.t_start = std::chrono::steady_clock::now();
         seed_run_.reason = why;
@@ -24402,11 +24769,11 @@ public:
             if (hip_graph_executor_needed(i)) {
                 ensure_device_executor(i);
                 device_exec_[i]->run([this, i] {
-                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    auto lock = wp_lock_timed(device_mutexes_[i]);
                     devices_[i]->keepalive_tick();
                 });
             } else {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 devices_[i]->keepalive_tick();
             }
         }
@@ -24442,7 +24809,7 @@ public:
             return true;
         }
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             if (devices_[i]->has_spec_work()) {
                 return true;
             }
@@ -24458,7 +24825,7 @@ public:
             return true;
         }
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             if (devices_[i]->has_spec_submit_work()) {
                 return true;
             }
@@ -24468,7 +24835,7 @@ public:
 
     void drop_spec_work() {
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             devices_[i]->drop_spec_work();
         }
     }
@@ -24483,12 +24850,12 @@ public:
                 ensure_device_executor(i);
                 bool did_work = false;
                 device_exec_[i]->run([this, i, harvest, &did_work] {
-                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    auto lock = wp_lock_timed(device_mutexes_[i]);
                     did_work = devices_[i]->spec_pagein_step(harvest);
                 });
                 result |= did_work;
             } else {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 result |= devices_[i]->spec_pagein_step(harvest);
             }
         }
@@ -24503,11 +24870,11 @@ public:
             if (hip_graph_executor_needed(i)) {
                 ensure_device_executor(i);
                 device_exec_[i]->run([this, i] {
-                    std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                    auto lock = wp_lock_timed(device_mutexes_[i]);
                     devices_[i]->spec_pagein_after_dispatch();
                 });
             } else {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 devices_[i]->spec_pagein_after_dispatch();
             }
         }
@@ -24591,25 +24958,25 @@ public:
             }
             pipe_expert_prefetch_hint sub = hint;
             sub.expert_ids = std::move(ids[i]);
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             devices_[i]->note_prefetch_hint(sub);
         }
     }
 
     void note_prefetch_hint_bad() {
-        std::lock_guard<std::mutex> lock(device_mutexes_.front());
+        auto lock = wp_lock_timed(device_mutexes_.front());
         devices_.front()->note_prefetch_hint_bad();
     }
 
     void log_reference(int32_t layer,
                        const std::vector<pipe_expert_assignment> & assignments) {
-        std::lock_guard<std::mutex> lock(device_mutexes_.front());
+        auto lock = wp_lock_timed(device_mutexes_.front());
         devices_.front()->log_reference(layer, assignments);
     }
 
     void report_prefetch_hints() const {
         for (size_t i = 0; i < devices_.size(); ++i) {
-            std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+            auto lock = wp_lock_timed(device_mutexes_[i]);
             devices_[i]->report_prefetch_hints();
         }
     }
@@ -24622,7 +24989,7 @@ public:
             uint64_t trace_req = 0,
             const worker_stream_callback & stream_callback = {}) {
         if (prepared.has_value() || !multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             pipe_expert_partial result = devices_.front()->dispatch(
                 request, request_stats, std::move(prepared), conn_index, trace_req);
             snapshot_device_reqlog_one(request_stats, request.assignments.size());
@@ -24686,7 +25053,7 @@ public:
                         const AssignmentGroup & group = groups[gi];
                         pipe_expert_dispatch_req sub =
                             make_subrequest(request, group);
-                        std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                        auto lock = wp_lock_timed(device_mutexes_[group.device]);
                         partials[gi] = devices_[group.device]->dispatch(
                             sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
                         const auto ready_at = std::chrono::steady_clock::now();
@@ -24701,7 +25068,7 @@ public:
                         }
                         if (streaming) {
                             {
-                                std::lock_guard<std::mutex> stream_lock(stream_mutex);
+                                auto stream_lock = wp_lock_timed(stream_mutex);
                                 stream_ready.push_back({ gi, ready_at });
                             }
                             stream_cv.notify_one();
@@ -24710,7 +25077,7 @@ public:
                 } catch (...) {
                     if (streaming) {
                         {
-                            std::lock_guard<std::mutex> stream_lock(stream_mutex);
+                            auto stream_lock = wp_lock_timed(stream_mutex);
                             if (!stream_error) {
                                 stream_error = std::current_exception();
                             }
@@ -24820,8 +25187,8 @@ public:
                 while (streaming && n_ready < target && !first_error) {
                     stream_ready_item ready;
                     {
-                        std::unique_lock<std::mutex> stream_lock(stream_mutex);
-                        stream_cv.wait(stream_lock, [&] {
+                        auto stream_lock = wp_lock_timed(stream_mutex);
+                        wp_cv_wait(WP_S_IDLE, stream_cv, stream_lock, [&] {
                             return !stream_ready.empty() || stream_error != nullptr;
                         });
                         if (stream_ready.empty()) {
@@ -24869,7 +25236,7 @@ public:
             for (size_t gi = 0; gi < groups.size(); ++gi) {
                 const AssignmentGroup & group = groups[gi];
                 pipe_expert_dispatch_req sub = make_subrequest(request, group);
-                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                auto lock = wp_lock_timed(device_mutexes_[group.device]);
                 partials[gi] = devices_[group.device]->dispatch(
                     sub, sub_stats[gi], std::nullopt, conn_index, trace_req);
                 if (wp_worker_hash_trace_enabled()) {
@@ -24904,7 +25271,7 @@ public:
                               int conn_index = -1,
                               std::unique_lock<std::mutex> * gpu_lock = nullptr) {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             devices_.front()->begin_split_dispatch(begin, seq_id, conn_index, gpu_lock);
             return;
         }
@@ -24915,7 +25282,7 @@ public:
         request.swiglu_clamp = begin.swiglu_clamp;
         validate_dispatch(request);
         {
-            std::lock_guard<std::mutex> lock(split_mutex_);
+            auto lock = wp_lock_timed(split_mutex_);
             if (split_pending_by_conn_.count(conn_index) != 0) {
                 throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                           "expert dispatch BEGIN arrived before ACTS");
@@ -24929,7 +25296,7 @@ public:
             groups.push_back({0, {}});
         }
         {
-            std::lock_guard<std::mutex> lock(split_mutex_);
+            auto lock = wp_lock_timed(split_mutex_);
             if (split_pending_by_conn_.count(conn_index) != 0) {
                 throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                           "expert dispatch BEGIN arrived before ACTS");
@@ -24945,13 +25312,13 @@ public:
             uint64_t trace_req = 0,
             const worker_stream_callback & stream_callback = {}) {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             return devices_.front()->finish_split_dispatch(
                 acts, seq_id, request_stats, conn_index, trace_req);
         }
         SplitPending pending;
         {
-            std::lock_guard<std::mutex> lock(split_mutex_);
+            auto lock = wp_lock_timed(split_mutex_);
             const auto it = split_pending_by_conn_.find(conn_index);
             if (it == split_pending_by_conn_.end()) {
                 throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
@@ -24990,7 +25357,7 @@ public:
                 ensure_device_executor(group.device);
                 device_exec_[group.device]->run([this, &sub_request, &sub_stats, &partial,
                                                  &group, conn_index, trace_req, trace_layer] {
-                    std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                    auto lock = wp_lock_timed(device_mutexes_[group.device]);
                     partial = devices_[group.device]->dispatch(
                         sub_request, sub_stats, std::nullopt, conn_index, trace_req);
                     if (wp_worker_hash_trace_enabled()) {
@@ -25004,7 +25371,7 @@ public:
                     }
                 });
             } else {
-                std::lock_guard<std::mutex> lock(device_mutexes_[group.device]);
+                auto lock = wp_lock_timed(device_mutexes_[group.device]);
                 partial = devices_[group.device]->dispatch(
                     sub_request, sub_stats, std::nullopt, conn_index, trace_req);
                 if (wp_worker_hash_trace_enabled()) {
@@ -25034,12 +25401,12 @@ public:
 
     void abandon_split_dispatch(int conn_index = -1) noexcept {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             devices_.front()->abandon_split_dispatch(conn_index);
             return;
         }
         {
-            std::lock_guard<std::mutex> lock(split_mutex_);
+            auto lock = wp_lock_timed(split_mutex_);
             const auto it = split_pending_by_conn_.find(conn_index);
             if (it == split_pending_by_conn_.end()) {
                 return;
@@ -25050,25 +25417,25 @@ public:
 
     bool has_split_dispatch(int conn_index = -1) const {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             return devices_.front()->has_split_dispatch(conn_index);
         }
-        std::lock_guard<std::mutex> lock(split_mutex_);
+        auto lock = wp_lock_timed(split_mutex_);
         return split_pending_by_conn_.count(conn_index) != 0;
     }
 
     uint32_t split_n_tokens(int conn_index = -1) const {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             return devices_.front()->split_n_tokens(conn_index);
         }
-        std::lock_guard<std::mutex> lock(split_mutex_);
+        auto lock = wp_lock_timed(split_mutex_);
         return split_pending_by_conn_.at(conn_index).begin.n_tokens;
     }
 
     bool split_arena_eligible(int conn_index = -1) const {
         if (!multi_device()) {
-            std::lock_guard<std::mutex> lock(device_mutexes_.front());
+            auto lock = wp_lock_timed(device_mutexes_.front());
             return devices_.front()->split_arena_eligible(conn_index);
         }
         return false;
@@ -26146,7 +26513,7 @@ private:
                 for (size_t j = 0; j < pages[i].size(); ++j) {
                     keys_with_counts.emplace_back(pages[i][j], pages_counts[i][j]);
                 }
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 loaded += devices_[i]->seed_pages(keys_with_counts, keys_with_counts.size());
             }
             wp_log_seed_end("*", loaded, seed_bytes, seed_started);
@@ -26157,7 +26524,7 @@ private:
                       << " demand_hits=0" << std::endl;
         } else {
             for (size_t i = 0; i < pages.size(); ++i) {
-                std::lock_guard<std::mutex> lock(device_mutexes_[i]);
+                auto lock = wp_lock_timed(device_mutexes_[i]);
                 loaded += devices_[i]->pin_pages(pages[i], pages[i].size());
             }
             std::cerr << "WARN wp expert worker: pin_file=" << pin_path
@@ -26394,20 +26761,22 @@ private:
         // and this is the only place the tier's thread can be placed at all.
         void start(bool pin = false) {
             thread = std::thread([this, pin] {
+                WpThreadScope wp_thread(WP_ROLE_CPU_EXEC);
                 if (pin) {
                     wp_cpu_tier_pin_self();
                 }
                 for (;;) {
                     std::function<void()> job;
                     {
-                        std::unique_lock<std::mutex> lock(mu);
-                        cv_task.wait(lock, [this] { return has_task || stop; });
+                        auto lock = wp_lock_timed(mu);
+                        wp_cv_wait(WP_S_IDLE, cv_task, lock, [this] { return has_task || stop; });
                         if (stop) { return; }
                         job = std::move(task);
                         has_task = false;
                     }
                     std::exception_ptr caught;
                     try {
+                        WpStateScope cs(WP_S_COMPUTE_CPU, -1, 0);
                         job();
                     } catch (...) {
                         caught = std::current_exception();
@@ -26419,7 +26788,7 @@ private:
                         wp_cpu_tier_pin_self();
                     }
                     {
-                        std::lock_guard<std::mutex> lock(mu);
+                        auto lock = wp_lock_timed(mu);
                         error = caught;
                         idle  = true;
                     }
@@ -26430,7 +26799,7 @@ private:
         }
         void submit(std::function<void()> job) {
             {
-                std::lock_guard<std::mutex> lock(mu);
+                auto lock = wp_lock_timed(mu);
                 task     = std::move(job);
                 has_task = true;
                 idle     = false;
@@ -26440,10 +26809,10 @@ private:
             cv_task.notify_one();
         }
         void run(std::function<void()> job) {
-            std::lock_guard<std::mutex> own_lock(own);
+            auto own_lock = wp_lock_timed(own);
             {
-                std::unique_lock<std::mutex> lock(mu);
-                cv_done.wait(lock, [this] { return idle; });
+                auto lock = wp_lock_timed(mu);
+                wp_cv_wait(WP_S_CPU_WAIT, cv_done, lock, [this] { return idle; });
                 task     = std::move(job);
                 has_task = true;
                 idle     = false;
@@ -26477,12 +26846,16 @@ private:
                 const long v = std::strtol(e, nullptr, 10);
                 return v < 0 ? 0 : (int) v;
             }();
-            for (int i = 0; i < spin_rounds; ++i) {
-                if (idle_flag.load(std::memory_order_acquire)) { break; }
-                std::this_thread::yield();
+            {
+                // One state for the whole spin (a per-yield scope would flood the ring).
+                WpStateScope spin(WP_S_CPU_WAIT, -1, 0);
+                for (int i = 0; i < spin_rounds; ++i) {
+                    if (idle_flag.load(std::memory_order_acquire)) { break; }
+                    std::this_thread::yield();
+                }
             }
-            std::unique_lock<std::mutex> lock(mu);
-            cv_done.wait(lock, [this] { return idle; });
+            auto lock = wp_lock_timed(mu);
+            wp_cv_wait(WP_S_CPU_WAIT, cv_done, lock, [this] { return idle; });
             if (error) {
                 std::exception_ptr e = error;
                 error = nullptr;
@@ -26492,9 +26865,9 @@ private:
         }
         ~DeviceExecutor() {
             if (!thread.joinable()) { return; }
-            { std::lock_guard<std::mutex> lock(mu); stop = true; }
+            { auto lock = wp_lock_timed(mu); stop = true; }
             cv_task.notify_all();
-            thread.join();
+            wp_join(WP_S_IDLE, thread);
         }
     };
     mutable std::vector<std::unique_ptr<DeviceExecutor>> device_exec_;
@@ -26669,7 +27042,7 @@ std::optional<std::vector<float>> subscribe(uint64_t seq_id, int32_t layer, uint
             error = "shm segment never appeared";
             return std::nullopt;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        wp_sleep_for(WP_S_IDLE, std::chrono::milliseconds(5));
     }
     struct stat st{};
     const size_t expect = sizeof(ShmHeader) + (size_t) n_tokens * (size_t) n_embd * sizeof(float);
@@ -26691,7 +27064,7 @@ std::optional<std::vector<float>> subscribe(uint64_t seq_id, int32_t layer, uint
             ready = true;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        wp_sleep_for(WP_S_IDLE, std::chrono::milliseconds(5));
     }
     if (!ready || hdr->n_tokens != n_tokens || hdr->n_embd != n_embd) {
         munmap(mapped, expect);
@@ -27015,7 +27388,7 @@ public:
     // already exactly right, so the resize() inside
     // pipe_decode_expert_dispatch_req_impl() that follows does no work.
     std::vector<float> acquire() {
-        std::lock_guard<std::mutex> lock(mu_);
+        auto lock = wp_lock_timed(mu_);
         if (free_.empty()) {
             return {};
         }
@@ -27028,7 +27401,7 @@ public:
     // so a pathological burst of in-flight chunks cannot pin unbounded
     // memory in the free list; buffers over the cap are simply freed.
     void release(std::vector<float> && buf) {
-        std::lock_guard<std::mutex> lock(mu_);
+        auto lock = wp_lock_timed(mu_);
         if (free_.size() < WP_WORKER_ACT_POOL_MAX) {
             free_.push_back(std::move(buf));
         }
@@ -27131,8 +27504,8 @@ public:
     // the reader against itself: an empty queue must always accept one item.
     // Returns immediately, without pushing, once closed.
     void push(T item, size_t item_bytes = 0) {
-        std::unique_lock<std::mutex> lock(mu_);
-        not_full_.wait(lock, [&] {
+        auto lock = wp_lock_timed(mu_);
+        wp_cv_wait(WP_S_IDLE, not_full_, lock, [&] {
             return closed_ || items_.empty() ||
                    (items_.size() < max_depth_ &&
                     (byte_cap_ == 0 || bytes_queued_ + item_bytes <= byte_cap_));
@@ -27153,8 +27526,8 @@ public:
     // pipe_recv_frame(...) == false contract the compute loop already
     // handles on every existing exit path.
     bool pop(T & out) {
-        std::unique_lock<std::mutex> lock(mu_);
-        not_empty_.wait(lock, [&] { return !items_.empty() || closed_; });
+        auto lock = wp_lock_timed(mu_);
+        wp_cv_wait(WP_S_IDLE, not_empty_, lock, [&] { return !items_.empty() || closed_; });
         if (items_.empty()) {
             return false;
         }
@@ -27170,7 +27543,7 @@ public:
     // outliving the connection. Idempotent; safe to call from teardown even
     // if the queue was never used.
     void close() {
-        std::lock_guard<std::mutex> lock(mu_);
+        auto lock = wp_lock_timed(mu_);
         closed_ = true;
         not_empty_.notify_all();
         not_full_.notify_all();
@@ -27215,11 +27588,15 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
                                       bool decode_ahead, int32_t n_embd,
                                       WpPipelineQueue<WpPipelineFrame> & frames,
                                       bool act_pool_enabled, WpActivationPool * act_pool) {
+    WpThreadScope wp_thread(WP_ROLE_PIPE_READER);
     for (;;) {
         WpPipelineFrame f;
         uint64_t hdr_done_ns = 0;
+        wp_state(WP_S_IDLE, -1, 0);
         f.ok = pipe_recv_frame(socket, f.type, f.seq_id, f.payload,
-                               time_recv ? &hdr_done_ns : nullptr);
+                               (time_recv || wp_span_on()) ? &hdr_done_ns : nullptr);
+        wp_state_recv_split(hdr_done_ns);
+        wp_state(WP_S_BOOKKEEP, -1, 0);
         f.hdr_done_ns = hdr_done_ns;
         if (wp_span_on()) { f.span_arrive_ns = wp_now_realtime_ns(); }
         if (time_recv && hdr_done_ns != 0) {
@@ -27236,6 +27613,7 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
             const auto t_decode_start = time_recv
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
+            WpStateScope dec_state(WP_S_DECODE, -1, (uint32_t) f.seq_id);
             std::vector<float> reuse_activations = act_pool_enabled ? act_pool->acquire()
                                                                      : std::vector<float>();
             try {
@@ -27266,7 +27644,7 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
         }
         const bool eof = !f.ok;
         const size_t bytes = f.payload.size();
-        frames.push(std::move(f), bytes);
+        frames.push(std::move(f), bytes);   // full-queue wait is S_IDLE (inside push)
         if (eof) {
             return;
         }
@@ -27283,6 +27661,7 @@ void wp_worker_pipeline_reader_thread(pipe_socket_t & socket, bool time_recv, bo
 void wp_worker_pipeline_writer_thread(pipe_socket_t & socket,
                                       WpPipelineQueue<WpPipelineResponse> & responses,
                                       std::atomic<bool> & write_failed) {
+    WpThreadScope wp_thread(WP_ROLE_PIPE_WRITER);
     for (;;) {
         WpPipelineResponse r;
         if (!responses.pop(r)) {
@@ -27291,6 +27670,7 @@ void wp_worker_pipeline_writer_thread(pipe_socket_t & socket,
         if (write_failed.load(std::memory_order_acquire)) {
             continue;
         }
+        WpStateScope send_state(WP_S_SEND, -1, (uint32_t) r.seq_id);
         if (!pipe_send_frame(socket, r.type, r.seq_id, r.payload.data(), r.payload.size())) {
             write_failed.store(true, std::memory_order_release);
             responses.close();
@@ -27299,6 +27679,7 @@ void wp_worker_pipeline_writer_thread(pipe_socket_t & socket,
 }
 
 int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -1) {
+    WpThreadScope wp_thread(WP_ROLE_SERVE);
     struct PendingCleanup {
         Worker & worker;
         int      conn_index;
@@ -27325,7 +27706,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             // every one of them was still hitting the single Worker-wide
             // split_pending_ this fix removes.
             if (g_worker_gpu_mutex != nullptr) {
-                std::lock_guard<std::mutex> lock(*g_worker_gpu_mutex);
+                auto lock = wp_lock_timed(*g_worker_gpu_mutex);
                 worker.abandon_split_dispatch(conn_index);
             } else {
                 worker.abandon_split_dispatch(conn_index);
@@ -27354,10 +27735,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         bool alive = fd >= 0;
         if (alive) {
             struct pollfd pfd { fd, POLLIN, 0 };
-            const int pr = ::poll(&pfd, 1, (int) grace_ms);
+            int pr = 0;
+            {
+                WpStateScope idle(WP_S_IDLE, -1, 0);
+                pr = ::poll(&pfd, 1, (int) grace_ms);
+            }
             if (pr > 0) {
                 char c = 0;
-                const ssize_t n = ::recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                ssize_t n = 0;
+                {
+                    WpStateScope idle(WP_S_IDLE, -1, 0);
+                    n = ::recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                }
                 alive = n > 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
             }
         }
@@ -27368,15 +27757,22 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     }
     const pipe_expert_hello mine = worker.hello();
     const std::vector<uint8_t> hello_payload = pipe_encode_expert_hello(mine);
-    if (!pipe_send_frame(
-            socket, PIPE_HELLO, 0, hello_payload.data(), hello_payload.size())) {
+    const bool hello_sent = [&] {
+        WpStateScope hs(WP_S_SEND, -1, 0);
+        return pipe_send_frame(socket, PIPE_HELLO, 0, hello_payload.data(), hello_payload.size());
+    }();
+    if (!hello_sent) {
         return 1;
     }
 
     pipe_frame_type type;
     uint64_t seq_id = 0;
     std::vector<uint8_t> payload;
-    if (!pipe_recv_frame(socket, type, seq_id, payload)) {
+    const bool hello_recvd = [&] {
+        WpStateScope hr(WP_S_IDLE, -1, 0);   // waiting for the client's HELLO
+        return pipe_recv_frame(socket, type, seq_id, payload);
+    }();
+    if (!hello_recvd) {
         return 1;
     }
     if (type != PIPE_HELLO || seq_id != 0) {
@@ -27723,7 +28119,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 ns = 1000000L;   // seed pending but not runnable (txn open): do not spin
             }
             struct timespec ts { ns / 1000000000L, ns % 1000000000L };
-            const int r = ::ppoll(&pfd, 1, &ts, nullptr);
+            int r = 0;
+            {
+                WpStateScope idle(WP_S_IDLE, -1, 0);
+                r = ::ppoll(&pfd, 1, &ts, nullptr);
+            }
             if (r != 0) {
                 // A REAL REQUEST BEATS A PREFETCH, ALWAYS. Whatever is still
                 // queued stays queued -- if it is still worth reading, the next
@@ -27857,8 +28257,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             socket.shutdown();
             frames.close();
             responses.close();
-            if (reader.joinable()) { reader.join(); }
-            if (writer.joinable()) { writer.join(); }
+            if (reader.joinable()) { wp_join(WP_S_IDLE, reader); }
+            if (writer.joinable()) { wp_join(WP_S_IDLE, writer); }
         }
     } pipeline_threads{ socket, pipeline_frames, pipeline_responses };
 
@@ -27894,6 +28294,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     const auto send_response_frame = [&](pipe_frame_type resp_type, uint64_t resp_seq,
                                          const uint8_t * data, size_t len) -> bool {
         if (!pipeline_on) {
+            WpStateScope ss(WP_S_SEND, -1, (uint32_t) resp_seq);
             return pipe_send_frame(socket, resp_type, resp_seq, data, len);
         }
         if (pipeline_write_failed.load(std::memory_order_acquire)) {
@@ -27913,6 +28314,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     const auto send_response_error = [&](uint64_t resp_seq, pipe_error_code code,
                                          const std::string & msg) -> bool {
         if (!pipeline_on) {
+            WpStateScope ss(WP_S_SEND, -1, (uint32_t) resp_seq);
             return pipe_send_error(socket, resp_seq, code, msg);
         }
         pipe_error e;
@@ -27937,6 +28339,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // already the correct signal for "is a request pending", so there is no
     // reason for the compute thread to also poll the fd. Popping the frame
     // queue directly waits on exactly the right condition instead.
+    // Direct path recv: header wait is S_IDLE, body is S_RECV (split at hdr_done).
+    const auto recv_direct_frame = [&]() -> bool {
+        wp_state(WP_S_IDLE, -1, 0);
+        const bool ok = pipe_recv_frame(socket, type, seq_id, payload,
+                                        (time_recv || wp_span_on()) ? &hdr_done_ns : nullptr);
+        wp_state_recv_split(hdr_done_ns);
+        wp_state(WP_S_BOOKKEEP, -1, 0);
+        return ok;
+    };
     while (pipeline_on
                ? [&] {
                      WpPipelineFrame f;
@@ -27964,9 +28375,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                      pipeline_ns_req_decode_ahead = f.ns_req_decode_ahead;
                      return true;
                  }()
-               : (await_request(),
-                  pipe_recv_frame(socket, type, seq_id, payload,
-                                  time_recv ? &hdr_done_ns : nullptr))) {
+               : (await_request(), recv_direct_frame())) {
         // Bracket this whole iteration -- see FrameResidency above. Declared
         // FIRST so it spans every branch below, including the ones that
         // `continue` (PING, PREFETCH_HINT, BEGIN) and the ones that return.
@@ -28090,7 +28499,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         // stay locked, immediately after the relock.
         std::unique_lock<std::mutex> gpu_lock;
         if (g_worker_gpu_mutex != nullptr) {
-            gpu_lock = std::unique_lock<std::mutex>(*g_worker_gpu_mutex);
+            gpu_lock = wp_lock_timed(*g_worker_gpu_mutex);
         }
         // Declared after gpu_lock, so it runs while gpu_lock is still held:
         // records whether this connection is mid-transaction (locked park path
@@ -28135,6 +28544,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 if (measure_stream && stream_first_sent == std::chrono::steady_clock::time_point()) {
                     stream_first_sent = send_started;
                 }
+                WpStateScope enc_st_3(WP_S_PACK, -1, (uint32_t) seq_id);
                 pipe_encode_expert_partial_stream_into(
                     encode_buf, (uint32_t) part_index, (uint32_t) part_count, partial);
                 const std::vector<uint8_t> & stream_encoded = encode_buf;
@@ -28170,6 +28580,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         const auto send_legacy_response = [&](const pipe_expert_partial & response,
                                               RequestStats & stats) {
             pipe_ml8_pack_timing pack_t;
+            WpStateScope enc_st_4(WP_S_PACK, -1, (uint32_t) seq_id);
             pipe_encode_expert_partial_into(encode_buf, response,
                                             worker.stats_enabled() ? &pack_t : nullptr);
             stats.ns_pack_lock        += pack_t.ns_lock;
@@ -28187,6 +28598,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     }
                     return false;
                 }
+                WpStateScope enc_st_5(WP_S_ENCODE, -1, (uint32_t) seq_id);
                 const std::vector<uint8_t> control = pipe_encode_expert_shm_ref(ref);
                 return send_response_frame(PIPE_EXPERT_SHM_PARTIAL, seq_id,
                                             control.data(), control.size());
@@ -28223,6 +28635,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         // PIPE_EXPERT_SCORE_SUMMARY (type 28): response-free, like the hint.
         if (type == PIPE_EXPERT_SCORE_SUMMARY) {
             try {
+                WpStateScope dec_st_6(WP_S_DECODE, -1, (uint32_t) seq_id);
                 worker.note_score_summary(
                     pipe_decode_expert_score_summary(payload.data(), payload.size()));
             } catch (const pipe_protocol_error & error) {
@@ -28233,6 +28646,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         }
         if (type == PIPE_EXPERT_PREFETCH_HINT) {
             try {
+                WpStateScope dec_st_7(WP_S_DECODE, -1, (uint32_t) seq_id);
                 const pipe_expert_prefetch_hint hint =
                     pipe_decode_expert_prefetch_hint(payload.data(), payload.size());
                 worker.note_prefetch_hint(hint);
@@ -28249,6 +28663,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
                                               "shared-memory request received without a local ring");
                 }
+                WpStateScope dec_st_8(WP_S_DECODE, -1, (uint32_t) seq_id);
                 const pipe_expert_shm_ref ref =
                     pipe_decode_expert_shm_ref(payload.data(), payload.size());
                 if (!worker.local_shm()->read_request(ref, &shm_request_data)) {
@@ -28266,6 +28681,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
         }
         if (type == PIPE_EXPERT_DISPATCH_BEGIN) {
             try {
+                WpStateScope dec_st_9(WP_S_DECODE, -1, (uint32_t) seq_id);
                 split_log_begin = pipe_decode_expert_dispatch_begin(payload.data(), payload.size());
                 // WP_HOST_TIER_SCORE_FROM_REQ: BEGIN carries the routing rows.
                 worker.note_request_scores(split_log_begin.layer, split_log_begin.assignments,
@@ -28322,6 +28738,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                         stream_callback(0, 1, znull, std::chrono::steady_clock::now(),
                                         split_log_stats);
                     } else {
+                        WpStateScope enc_st_10(WP_S_ENCODE, -1, (uint32_t) seq_id);
                         const std::vector<uint8_t> zenc = pipe_encode_expert_partial(znull);
                         if (!send_response_frame(PIPE_EXPERT_PARTIAL, seq_id,
                                                  zenc.data(), zenc.size())) {
@@ -28342,6 +28759,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto t_acts_decode_start = time_recv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                WpStateScope dec_st_11(WP_S_DECODE, -1, (uint32_t) seq_id);
                 const pipe_expert_dispatch_acts acts = pipe_decode_expert_dispatch_acts(
                     payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
                 const uint64_t ns_req_decode_frame = time_recv
@@ -28425,6 +28843,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto t_pub_decode_start = time_recv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                WpStateScope dec_st_12(WP_S_DECODE, -1, (uint32_t) seq_id);
                 pipe_expert_dispatch_acts_publish publish = pipe_decode_expert_dispatch_acts_publish(
                     payload.data(), payload.size(), worker.split_n_tokens(conn_index), mine.n_embd);
                 // Decode only. The wp_dedup::publish() shm write below is a
@@ -28539,6 +28958,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 const auto t_ref_decode_start = time_recv
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                WpStateScope dec_st_14(WP_S_DECODE, -1, (uint32_t) seq_id);
                 const pipe_expert_dispatch_acts_ref ref =
                     pipe_decode_expert_dispatch_acts_ref(payload.data(), payload.size());
                 if (ref.n_tokens != worker.split_n_tokens(conn_index)) {
@@ -28662,6 +29082,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                     // fully done with it, alongside the decode-ahead case.
                     std::vector<float> reuse_activations = act_pool_enabled
                         ? activation_pool.acquire() : std::vector<float>();
+                    WpStateScope dec_st_15(WP_S_DECODE, -1, (uint32_t) seq_id);
                     chunk = pipe_decode_expert_dispatch_chunk(
                         payload.data(), payload.size(), mine.n_embd,
                         act_pool_enabled ? &reuse_activations : nullptr);
@@ -28741,6 +29162,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
                 response.token_start = chunk.token_start;
                 response.token_end = chunk.token_end;
                 response.partial = partial;
+                WpStateScope enc_st_16(WP_S_ENCODE, -1, (uint32_t) seq_id);
                 const std::vector<uint8_t> encoded = pipe_encode_expert_partial_chunk(response);
                 const auto send_started = worker.stats_enabled()
                     ? std::chrono::steady_clock::now()
@@ -29009,7 +29431,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
     // that touches Worker state (see PendingCleanup above for the same
     // reasoning on abandon_split_dispatch()).
     if (g_worker_gpu_mutex != nullptr) {
-        std::lock_guard<std::mutex> lock(*g_worker_gpu_mutex);
+        auto lock = wp_lock_timed(*g_worker_gpu_mutex);
         worker.report_prefetch_hints();
     } else {
         worker.report_prefetch_hints();
@@ -29111,7 +29533,7 @@ bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us) {
 void self_bench_tick(ggml_backend_t backend) {
     if (!g_probe.ready || g_probe.backend != backend) return;
     const auto t0 = std::chrono::steady_clock::now();
-    ggml_backend_graph_compute(backend, g_probe.graph);
+    { WpStateScope wss(WP_S_GPU_SUBMIT, -1, 0); ggml_backend_graph_compute(backend, g_probe.graph); }
     const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - t0).count();
     if (ns < g_probe.min_ns) g_probe.min_ns = ns;
@@ -29251,9 +29673,14 @@ struct ParkControl {
         installed = true;
         const int read_fd = g_park_pipe[0];
         thread = std::thread([this, read_fd] {
+            WpThreadScope wp_thread(WP_ROLE_PARK);
             for (;;) {
                 char c = 0;
-                const ssize_t n = ::read(read_fd, &c, 1);
+                ssize_t n = 0;
+                {
+                    WpStateScope idle(WP_S_IDLE, -1, 0);
+                    n = ::read(read_fd, &c, 1);
+                }
                 if (n < 0 && errno == EINTR) {
                     continue;
                 }
@@ -29328,7 +29755,7 @@ struct ParkControl {
             (void) r;
         }
         if (thread.joinable()) {
-            thread.join();
+            wp_join(WP_S_IDLE, thread);
         }
         if (wfd >= 0) {
             ::close(wfd);
@@ -29686,8 +30113,13 @@ int run(const Options & options) {
         pipe_socket_t * const server_raw = server.get();
         for (int i = 0; i < multi_conn_n; ++i) {
             threads.emplace_back([server_raw, &worker, i] {
+                WpThreadScope wp_thread(WP_ROLE_ACCEPT_SERVE);
                 for (;;) {
-                    pipe_socket_ptr client = server_raw->accept();
+                    pipe_socket_ptr client;
+                    {
+                        WpStateScope idle(WP_S_IDLE, -1, 0);
+                        client = server_raw->accept();
+                    }
                     if (!client) {
                         // Listening socket is gone (closed/errored): this
                         // slot has nothing left to do. Other slots may
@@ -29706,7 +30138,7 @@ int run(const Options & options) {
         }
         // Runs until the process is killed (see SHUTDOWN above) -- these
         // threads never return on their own in normal operation.
-        for (auto & t : threads) { t.join(); }
+        for (auto & t : threads) { wp_join(WP_S_IDLE, t); }
         g_worker_gpu_mutex = nullptr;
         return 0;
     }
