@@ -3247,6 +3247,10 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
         wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_CHUNK, it_asg);
 
         std::vector<pipe_expert_assignment> full_assignments;
+        // WP_SPINE_ROW_GROUPS: keeps the group's own assignments for the request while
+        // the hint block runs over the union (see rg_union below).
+        std::vector<pipe_expert_assignment> rg_group_assignments;
+        std::unique_ptr<ggml_context, void (*)(ggml_context *)> rg_union_ctx(nullptr, ggml_free);
         std::function<void()> post_send_hints; // WP_ISSUE_HINTS_AFTER_SEND
         const std::vector<pipe_expert_assignment> * layer_assignments = nullptr;
         uint32_t layer_n_tokens = 0;
@@ -3257,7 +3261,7 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
                 ? context->full_selected_experts : selected_experts;
             const ggml_tensor * full_weights = context->full_weights != nullptr
                 ? context->full_weights : weights;
-            const int64_t full_tokens = full_activations->ne[1];
+            int64_t full_tokens = full_activations->ne[1];
             const uint64_t it_fa = wp_issue_trace::mark();
             std::vector<float> full_wire_activations((size_t) n_embd * (size_t) full_tokens);
             if (ggml_is_contiguous(full_activations)) {
@@ -3274,6 +3278,71 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
             wp_issue_trace::add(wp_issue_trace::PH_ASSIGN_FULL, it_af);
             layer_assignments = &full_assignments;
             layer_n_tokens = (uint32_t) full_tokens;
+
+            // WP_SPINE_ROW_GROUPS: predictor/hint bookkeeping is per LAYER, not per group.
+            // Group A (issued first for the layer) stashes its routing and emits nothing.
+            // Group B (issued second) emits the hints ONCE over the union of both groups'
+            // rows (token order A then B). Without a stash (A not issued) B uses its own
+            // rows only. The request (begin_dispatch) always carries the group's own rows.
+            const bool rg_stage   = context->group >= 0;
+            const bool hint_owner = !rg_stage || context->group == 1;
+            if (rg_stage && context->group == 0) {
+                rg_hint_stash & st = owner->rg_hint_stash_;
+                st.layer    = context->layer;
+                st.n_tokens = full_tokens;
+                st.wire     = full_wire_activations;
+                st.selected.resize((size_t) ggml_nelements(full_selected));
+                st.weights.resize((size_t) ggml_nelements(full_weights));
+                for (size_t i = 0; i < st.selected.size(); ++i) {
+                    st.selected[i] = ggml_get_i32_1d(full_selected, (int) i);
+                }
+                for (size_t i = 0; i < st.weights.size(); ++i) {
+                    st.weights[i] = ggml_get_f32_1d(full_weights, (int) i);
+                }
+            }
+            if (rg_stage && context->group == 1 && owner->rg_hint_stash_.layer == context->layer) {
+                rg_hint_stash & st = owner->rg_hint_stash_;
+                const int64_t n_a     = st.n_tokens;
+                const int64_t n_b     = full_tokens;
+                const int64_t R       = n_a + n_b;
+                const int64_t n_sel_a = (int64_t) st.selected.size();
+                const int64_t n_wt_a  = (int64_t) st.weights.size();
+                const int64_t n_sel_b = ggml_nelements(full_selected);
+                const int64_t n_wt_b  = ggml_nelements(full_weights);
+                ggml_init_params ip = {};
+                ip.mem_size = 4 * ggml_tensor_overhead() + (size_t) (n_sel_a + n_sel_b + n_wt_a + n_wt_b) * 4 + 4096;
+                ip.no_alloc = false;
+                ggml_context * uctx = ggml_init(ip);
+                if (uctx != nullptr) {
+                    rg_union_ctx.reset(uctx);
+                    ggml_tensor * u_sel = ggml_new_tensor_2d(uctx, GGML_TYPE_I32, n_expert_used, R);
+                    ggml_tensor * u_wt  = ggml_new_tensor_3d(uctx, GGML_TYPE_F32, 1, n_expert_used, R);
+                    for (int64_t i = 0; i < n_sel_a; ++i) {
+                        ggml_set_i32_1d(u_sel, (int) i, st.selected[(size_t) i]);
+                    }
+                    for (int64_t i = 0; i < n_sel_b; ++i) {
+                        ggml_set_i32_1d(u_sel, (int) (n_sel_a + i), ggml_get_i32_1d(full_selected, (int) i));
+                    }
+                    for (int64_t i = 0; i < n_wt_a; ++i) {
+                        ggml_set_f32_1d(u_wt, (int) i, st.weights[(size_t) i]);
+                    }
+                    for (int64_t i = 0; i < n_wt_b; ++i) {
+                        ggml_set_f32_1d(u_wt, (int) (n_wt_a + i), ggml_get_f32_1d(full_weights, (int) i));
+                    }
+                    std::vector<pipe_expert_assignment> union_assignments = make_assignments(u_sel, u_wt, R, 0);
+                    std::vector<float> union_wire(st.wire);
+                    union_wire.insert(union_wire.end(), full_wire_activations.begin(), full_wire_activations.end());
+
+                    rg_group_assignments   = std::move(full_assignments);
+                    full_assignments       = std::move(union_assignments);
+                    full_wire_activations  = std::move(union_wire);
+                    full_selected          = u_sel;
+                    full_weights           = u_wt;
+                    full_tokens            = R;
+                    layer_assignments      = &rg_group_assignments;
+                }
+                owner->rg_hint_stash_.layer = -1;
+            }
             // WP_ISSUE_HINTS_AFTER_SEND (default ON, 0 restores the old order):
             // the hint bookkeeping used to sit in front of begin_dispatch (issue_v
             // mean 18.9 ms/step vs median 6). Move the parts that never touch a
@@ -3303,72 +3372,74 @@ void graph_dispatcher::compute_issue_impl(ggml_tensor *       dst,
                 const char * e = std::getenv("WP_HINT_FLUSH_AFTER_SEND");
                 return e != nullptr && e[0] == '1';
             }();
-            owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
-            if (!hints_after_send) {
-                if (owner->router2_topm() > 0) {
-                    owner->flush_predicted_hints();
-                    owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
-                }
-                owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
-                                   full_weights, n_expert_used);
-                owner->pscore_note_routing(context->layer, full_selected, full_tokens, n_expert_used);
-                owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
-                ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
-                                     full_tokens, n_embd, n_expert_used);
-                if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
-                    capture_prefix != nullptr && capture_prefix[0] != '\0') {
-                    owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
-                                           full_selected, full_tokens, n_expert_used);
-                }
-                owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
-            } else {
-                const bool defer_sock = hint_inflight || hint_flush_after_send;
-                if (!defer_sock) {
-                    // socket-touching hints stay ahead of the send (in_flight == 0)
-                    // flush before enqueue, as before
-                    const uint64_t it_hf = wp_issue_trace::mark();
+            if (hint_owner) {
+                owner->pscore_note_step(context->layer, full_tokens);   // before any enqueue_prediction below
+                if (!hints_after_send) {
                     if (owner->router2_topm() > 0) {
                         owner->flush_predicted_hints();
+                        owner->enqueue_prediction(context->layer, full_wire_activations, full_tokens);
                     }
-                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_FLUSH, it_hf);
-                    const uint64_t it_hp = wp_issue_trace::mark();
-                    owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
-                    wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_PREFETCH, it_hp);
-                }
-                const int32_t layer_id = context->layer;
-                post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
-                                   defer_sock, &full_assignments,
-                                   wire = std::move(full_wire_activations)]() {
-                    const uint64_t it_ph = wp_issue_trace::mark();
-                    if (owner->router2_topm() > 0) {
-                        const uint64_t it_pf = wp_issue_trace::mark();
-                        if (defer_sock) {
-                            const hint_inflight_scope in_flight_ok;
-                            owner->flush_predicted_hints();
-                        }
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
-                        const uint64_t it_pe = wp_issue_trace::mark();
-                        owner->enqueue_prediction(layer_id, wire, full_tokens);
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_ENQUEUE_PRED, it_pe);
-                    }
-                    owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
-                    owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
-                    owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
-                    ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
+                    owner->trace_layer(context->layer, full_wire_activations, full_tokens, full_selected,
+                                       full_weights, n_expert_used);
+                    owner->pscore_note_routing(context->layer, full_selected, full_tokens, n_expert_used);
+                    owner->note_dispatched_experts(context->layer, full_assignments, (uint32_t) full_tokens);
+                    ml8_probe_maybe_dump(context->layer, full_wire_activations, full_selected, full_weights,
                                          full_tokens, n_embd, n_expert_used);
                     if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
                         capture_prefix != nullptr && capture_prefix[0] != '\0') {
-                        owner->capture_routing(capture_prefix, layer_id, wire,
+                        owner->capture_routing(capture_prefix, context->layer, full_wire_activations,
                                                full_selected, full_tokens, n_expert_used);
                     }
-                    if (defer_sock) {
-                        const uint64_t it_pp = wp_issue_trace::mark();
-                        const hint_inflight_scope in_flight_ok;
-                        owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
-                        wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
+                    owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                } else {
+                    const bool defer_sock = hint_inflight || hint_flush_after_send;
+                    if (!defer_sock) {
+                        // socket-touching hints stay ahead of the send (in_flight == 0)
+                        // flush before enqueue, as before
+                        const uint64_t it_hf = wp_issue_trace::mark();
+                        if (owner->router2_topm() > 0) {
+                            owner->flush_predicted_hints();
+                        }
+                        wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_FLUSH, it_hf);
+                        const uint64_t it_hp = wp_issue_trace::mark();
+                        owner->prefetch_layer_ahead(context->layer, (uint32_t) full_tokens);
+                        wp_issue_trace::add(wp_issue_trace::PH_HINT_PRE_PREFETCH, it_hp);
                     }
-                    wp_issue_trace::add(wp_issue_trace::PH_POST_SEND_HINTS, it_ph);
-                };
+                    const int32_t layer_id = context->layer;
+                    post_send_hints = [owner, layer_id, full_tokens, full_selected, full_weights, n_embd, n_expert_used,
+                                       defer_sock, &full_assignments,
+                                       wire = std::move(full_wire_activations)]() {
+                        const uint64_t it_ph = wp_issue_trace::mark();
+                        if (owner->router2_topm() > 0) {
+                            const uint64_t it_pf = wp_issue_trace::mark();
+                            if (defer_sock) {
+                                const hint_inflight_scope in_flight_ok;
+                                owner->flush_predicted_hints();
+                            }
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_FLUSH_HINTS, it_pf);
+                            const uint64_t it_pe = wp_issue_trace::mark();
+                            owner->enqueue_prediction(layer_id, wire, full_tokens);
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_ENQUEUE_PRED, it_pe);
+                        }
+                        owner->trace_layer(layer_id, wire, full_tokens, full_selected, full_weights, n_expert_used);
+                        owner->pscore_note_routing(layer_id, full_selected, full_tokens, n_expert_used);
+                        owner->note_dispatched_experts(layer_id, full_assignments, (uint32_t) full_tokens);
+                        ml8_probe_maybe_dump(layer_id, wire, full_selected, full_weights,
+                                             full_tokens, n_embd, n_expert_used);
+                        if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+                            capture_prefix != nullptr && capture_prefix[0] != '\0') {
+                            owner->capture_routing(capture_prefix, layer_id, wire,
+                                                   full_selected, full_tokens, n_expert_used);
+                        }
+                        if (defer_sock) {
+                            const uint64_t it_pp = wp_issue_trace::mark();
+                            const hint_inflight_scope in_flight_ok;
+                            owner->prefetch_layer_ahead(layer_id, (uint32_t) full_tokens);
+                            wp_issue_trace::add(wp_issue_trace::PH_POST_PREFETCH, it_pp);
+                        }
+                        wp_issue_trace::add(wp_issue_trace::PH_POST_SEND_HINTS, it_ph);
+                    };
+                }
             }
         }
 

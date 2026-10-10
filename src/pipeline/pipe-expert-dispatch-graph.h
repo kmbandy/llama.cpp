@@ -358,6 +358,16 @@ class graph_dispatcher {
     void wait_stop_thread() noexcept;
     void check_wait_gpu_failures();    // dispatch thread: GPU spin timeouts -> latch_failure
     std::map<int32_t, wait_slot>      wait_slots_;   // key = wait_slot_key(layer, group)
+    // WP_SPINE_ROW_GROUPS hint bookkeeping: group A's routing for `layer`, consumed by
+    // group B's issue (see compute_issue_impl). layer -1 = empty.
+    struct rg_hint_stash {
+        int32_t              layer = -1;
+        int64_t              n_tokens = 0;
+        std::vector<float>   wire;
+        std::vector<int32_t> selected;
+        std::vector<float>   weights;
+    };
+    rg_hint_stash rg_hint_stash_;
     std::thread                       wait_thread_;
     std::mutex                        wait_mu_;
     std::condition_variable           wait_cv_;
