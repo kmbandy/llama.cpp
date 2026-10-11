@@ -837,15 +837,15 @@ std::optional<std::filesystem::file_time_type> server_models::get_models_preset_
     return mtime;
 }
 
-void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
+bool server_models::reload_models_preset_if_changed(server_model_meta & meta) {
     if (!meta.replica_of.empty()) {
-        return; // a replica is made from its alias's current meta each time it is brought up
+        return false; // a replica is made from its alias's current meta each time it is brought up
     }
     const auto mtime_before = get_models_preset_mtime();
     const auto applied_mtime = models_preset_applied_mtimes.find(meta.name);
     if (!mtime_before.has_value() ||
             (applied_mtime != models_preset_applied_mtimes.end() && *mtime_before == applied_mtime->second)) {
-        return;
+        return false;
     }
 
     try {
@@ -861,7 +861,7 @@ void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
         if (!mtime_after.has_value() || *mtime_before != *mtime_after) {
             SRV_WRN("models preset '%s' changed while reloading; keeping last-known-good preset for model '%s'\n",
                 base_params.models_preset.c_str(), meta.name.c_str());
-            return;
+            return false;
         }
 
         cached_models  = ctx_preset.cascade(global, cached_models);
@@ -902,10 +902,12 @@ void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
         meta.update_caps(base_params);
         models_preset_applied_mtimes[meta.name] = *mtime_after;
         SRV_INF("reloaded models preset '%s' for child model '%s'\n", base_params.models_preset.c_str(), meta.name.c_str());
+        return true;
     } catch (const std::exception & e) {
         SRV_WRN("failed to reload models preset '%s' for child model '%s': %s; keeping last-known-good preset\n",
             base_params.models_preset.c_str(), meta.name.c_str(), e.what());
     }
+    return false;
 }
 
 void server_models::instance_t::request_exit() const {
@@ -4007,7 +4009,18 @@ bool server_models::load_impl(const std::string & name, const load_options & opt
     }
 
     if (!opts.custom_meta.has_value()) {
-        reload_models_preset_if_changed(meta);
+        if (reload_models_preset_if_changed(meta)) {
+            // Write the refreshed meta back to the registry. The applied mtime is now recorded,
+            // so a load that queues below and retries later would otherwise see the stale mapping
+            // meta and never reload. `mutex` is held here (lk above, no unlock before this point),
+            // and the local copy was taken under that same lock, so only the preset-derived fields
+            // (preset, source, placement, env_overrides, args, caps, ...) differ from the mapping;
+            // runtime fields (status, last_used, port, progress, ...) are unchanged.
+            auto it = mapping.find(name);
+            if (it != mapping.end()) {
+                it->second.meta = meta;
+            }
+        }
     }
 
     bool marked_loading = false;

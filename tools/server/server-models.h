@@ -412,7 +412,8 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
     std::optional<std::filesystem::file_time_type> get_models_preset_mtime() const;
-    void reload_models_preset_if_changed(server_model_meta & meta);
+    // returns true iff a new preset was applied to meta
+    bool reload_models_preset_if_changed(server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
     void unload_lru();
