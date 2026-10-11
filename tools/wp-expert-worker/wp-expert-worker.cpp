@@ -2428,6 +2428,7 @@ struct RequestStats {
     uint64_t n_cpu_tier = 0;   // WP_EXPERT_CPU_TIER
     uint64_t n_cpu_tier_ram_hit = 0;   // WP_EXPERT_CPU_TIER
     uint64_t n_cpu_tier_gu_early = 0;   // WP_EXPERT_CPU_TIER_CHUNK_COMPUTE
+    uint64_t n_cpu_tier_miss_gpu = 0;   // WP_EXPERT_CPU_TIER_MISS_GPU
     uint64_t ns_cpu_tier_compute = 0;   // WP_EXPERT_CPU_TIER
     uint64_t ns_cpu_tier_wait = 0;   // WP_EXPERT_CPU_TIER
     // Instrumentation only (no behavior). ns_cpu_graph is the subset of
@@ -2817,6 +2818,7 @@ public:
         n_cpu_tier_ += request.n_cpu_tier;
         n_cpu_tier_ram_hit_ += request.n_cpu_tier_ram_hit;
         n_cpu_tier_gu_early_ += request.n_cpu_tier_gu_early;
+        n_cpu_tier_miss_gpu_ += request.n_cpu_tier_miss_gpu;
         ns_cpu_tier_compute_ += request.ns_cpu_tier_compute;
         ns_cpu_tier_wait_ += request.ns_cpu_tier_wait;
         ns_cpu_graph_ += request.ns_cpu_graph;
@@ -3137,6 +3139,7 @@ private:
                   << " n_d3_bounce=" << n_d3_bounce_
                   << " n_batch_mmid_hit=" << n_batch_mmid_hit_
                   << " n_cpu_tier=" << n_cpu_tier_
+                  << " n_cpu_tier_miss_gpu=" << n_cpu_tier_miss_gpu_
                   << " n_cpu_tier_ram_hit=" << n_cpu_tier_ram_hit_
                   << " n_cpu_tier_gu_early=" << n_cpu_tier_gu_early_
                   << " ns_cpu_tier_compute=" << ns_cpu_tier_compute_
@@ -3341,6 +3344,7 @@ private:
     uint64_t          n_cpu_tier_ = 0;
     uint64_t          n_cpu_tier_ram_hit_ = 0;
     uint64_t          n_cpu_tier_gu_early_ = 0;
+    uint64_t          n_cpu_tier_miss_gpu_ = 0;
     uint64_t          ns_cpu_tier_compute_ = 0;
     uint64_t          ns_cpu_tier_wait_ = 0;
     uint64_t          ns_cpu_graph_ = 0;
@@ -6713,6 +6717,9 @@ public:
         size_t n_cpu_tier() const {
             return n_cpu_tier_;
         }
+        size_t n_cpu_tier_miss_gpu() const {
+            return n_cpu_tier_miss_gpu_;
+        }
         const std::shared_ptr<DemandRec> & demand_rec() const { return demand_rec_; }
 
         // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
@@ -6912,6 +6919,7 @@ public:
         uint64_t                   n_resident_     = 0;
         uint64_t                   n_pagein_    = 0;
         size_t                     n_cpu_tier_  = 0;
+        size_t                     n_cpu_tier_miss_gpu_ = 0;
         uint64_t                   n_pagein_reserved_ = 0;
         uint64_t                   n_pagein_general_ = 0;
         uint64_t                   bytes_read_ = 0;
@@ -7208,6 +7216,9 @@ public:
             // nondeterministic). Capacity = the slots demand pages can occupy
             // = all carved slots minus the startup-pinned ones.
             const bool shadow_active = cpu_tier_dev_on_ && cpu_tier_deterministic() && count_demand && !spec_call;
+            // WP_EXPERT_CPU_TIER_MISS_GPU: a VRAM-miss CPU-tier page stays on the
+            // CPU only if ram_shadow_ (host arena residency) holds it.
+            const bool miss_gpu_active = shadow_active && cpu_tier_miss_gpu();
             if (shadow_active) {
                 const size_t shadow_cap =
                     slots_.size() > n_pinned_ ? slots_.size() - n_pinned_ : 0;
@@ -7217,6 +7228,19 @@ public:
                         "wp: WP_EXPERT_CPU_TIER_DETERMINISTIC: shadow residency capacity=%zu "
                         "(slots=%zu pinned=%zu)\n",
                         shadow_cap, slots_.size(), n_pinned_);
+                }
+            }
+            if (miss_gpu_active) {
+                // Host arena retention cap in whole entries (the arena's own
+                // tier_bytes / entry_bytes convention; entry = largest page).
+                const size_t ram_cap = arena_.entry_bytes() != 0 ?
+                    arena_.tier_bytes() / arena_.entry_bytes() : 0;
+                if (!ram_shadow_.init || ram_shadow_.cap != ram_cap) {
+                    ram_shadow_.reset(ram_cap);
+                    std::fprintf(stderr,
+                        "wp: WP_EXPERT_CPU_TIER_MISS_GPU: RAM shadow residency capacity=%zu "
+                        "(tier_bytes=%zu entry_bytes=%zu)\n",
+                        ram_cap, arena_.tier_bytes(), arena_.entry_bytes());
                 }
             }
 
@@ -7262,15 +7286,32 @@ public:
                     if (cpu_eligible && !shadow_hit &&
                             (uint64_t) cpu_refs + 1 < cpu_tier_promote() &&
                             batch.n_cpu_tier_ < cpu_tier_max()) {
-                        batch.entries_[i].cpu_tier = true;
-                        batch.entries_[i].ready    = true;
-                        batch.entries_[i].cpu_fd   = fd_for(page.blob);
-                        ++batch.n_cpu_tier_;
-                        continue;
+                        // MISS_GPU: not in the host RAM shadow -> fall through to the GPU path.
+                        if (!miss_gpu_active || ram_shadow_.contains(skey)) {
+                            if (miss_gpu_active) {
+                                ram_shadow_.touch(skey);
+                            }
+                            batch.entries_[i].cpu_tier = true;
+                            batch.entries_[i].ready    = true;
+                            batch.entries_[i].cpu_fd   = fd_for(page.blob);
+                            ++batch.n_cpu_tier_;
+                            continue;
+                        }
+                        ++batch.n_cpu_tier_miss_gpu_;
                     }
                     if (!page.is_resident &&
                             (shadow_pinned_.empty() || shadow_pinned_.count(skey) == 0)) {
-                        shadow_.touch(skey);
+                        if (miss_gpu_active) {
+                            // VRAM eviction demotes the victim to host RAM (WP_HOST_TIER_VICTIM);
+                            // a page entering VRAM leaves RAM (the tiers are exclusive).
+                            uint64_t victim = 0;
+                            if (shadow_.touch(skey, &victim)) {
+                                ram_shadow_.touch(victim);
+                            }
+                            ram_shadow_.erase(skey);
+                        } else {
+                            shadow_.touch(skey);
+                        }
                     }
                 }
                 const size_t slot_index = find_slot(page);
@@ -8960,6 +9001,7 @@ private:
         std::unordered_map<uint64_t, uint32_t> map;
         std::vector<uint64_t> key;
         std::vector<uint32_t> prev, next;
+        std::vector<uint32_t> free_;   // unused node indices (erase() returns nodes here)
         uint32_t head = NIL, tail = NIL;
         size_t   cap  = 0;
         bool     init = false;
@@ -8972,6 +9014,9 @@ private:
             key.assign(cap, 0);
             prev.assign(cap, NIL);
             next.assign(cap, NIL);
+            // Popped from the back: node 0 is handed out first.
+            free_.clear();
+            for (size_t i = cap; i-- > 0;) { free_.push_back((uint32_t) i); }
             map.reserve(cap * 2 + 16);
         }
         bool contains(uint64_t k) const { return map.find(k) != map.end(); }
@@ -8987,24 +9032,39 @@ private:
             if (tail == NIL) { tail = n; }
         }
         // Hit: move to MRU. Miss: insert at MRU, evicting the LRU when full.
-        void touch(uint64_t k) {
-            if (cap == 0) { return; }
+        // Returns true and sets *evicted when a resident key was evicted.
+        bool touch(uint64_t k, uint64_t * evicted = nullptr) {
+            if (cap == 0) { return false; }
             const auto it = map.find(k);
             if (it != map.end()) {
                 if (head != it->second) { unlink(it->second); push_front(it->second); }
-                return;
+                return false;
             }
             uint32_t n;
-            if (map.size() < cap) {
-                n = (uint32_t) map.size();
+            bool did_evict = false;
+            if (!free_.empty()) {
+                n = free_.back();
+                free_.pop_back();
             } else {
                 n = tail;
+                if (evicted != nullptr) { *evicted = key[n]; }
+                did_evict = true;
                 map.erase(key[n]);
                 unlink(n);
             }
             key[n] = k;
             map.emplace(k, n);
             push_front(n);
+            return did_evict;
+        }
+        // Drops k if resident; its node index goes back on the free stack.
+        void erase(uint64_t k) {
+            const auto it = map.find(k);
+            if (it == map.end()) { return; }
+            const uint32_t n = it->second;
+            unlink(n);
+            map.erase(it);
+            free_.push_back(n);
         }
     };
 
@@ -9452,6 +9512,17 @@ private:
     // ~97 ms/step vs ~28 ms of compute. 1 = one whole-page pread (old behaviour).
     static size_t cpu_tier_read_chunks() {
         static const size_t v = (size_t) cpu_tier_env_u64("WP_EXPERT_CPU_TIER_READ_CHUNKS", 4);
+        return v;
+    }
+    // WP_EXPERT_CPU_TIER_MISS_GPU=1: under WP_EXPERT_CPU_TIER_DETERMINISTIC, a
+    // CPU-eligible page that VRAM-misses goes to the CPU tier only if the host
+    // RAM shadow holds it; otherwise it takes the GPU path (NVMe -> arena -> H2D).
+    // Ignored without deterministic mode (see the startup banner). Default 0.
+    static bool cpu_tier_miss_gpu() {
+        static const bool v = [] {
+            const char * e = std::getenv("WP_EXPERT_CPU_TIER_MISS_GPU");
+            return e != nullptr && e[0] == '1';
+        }();
         return v;
     }
     // WP_EXPERT_CPU_TIER_EARLY_IO=1: start the tier's NVMe reads at the split
@@ -12620,6 +12691,8 @@ private:
     uint64_t                    n_pinned_demand_hits_ = 0;
     // WP_EXPERT_CPU_TIER_DETERMINISTIC shadow residency (see ShadowLru).
     ShadowLru                   shadow_;
+    // WP_EXPERT_CPU_TIER_MISS_GPU: host RAM arena residency, same demand-only feed.
+    ShadowLru                   ram_shadow_;
     std::unordered_set<uint64_t> shadow_pinned_;   // pages pinned at startup: always shadow-resident
     // WP_EXPERT_PIN_MODE=seed: preload the hot-expert set like pin mode does,
     // but leave slot.pinned false and instead seed slot.uses (and, when history
@@ -13007,6 +13080,7 @@ uint64_t ExpertSlotPool::park_release_arenas() {
     n_pinned_ = 0;
     shadow_pinned_.clear();
     shadow_.init = false;
+    ram_shadow_.init = false;
     n_spec_pending_ = 0;
     arena_layout_.reset();
     // buffer_ptr's deleter is ggml_backend_buffer_free: this is the VRAM free.
@@ -13252,6 +13326,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     n_resident_(other.n_resident_),
     n_pagein_(other.n_pagein_),
     n_cpu_tier_(other.n_cpu_tier_),
+    n_cpu_tier_miss_gpu_(other.n_cpu_tier_miss_gpu_),
     n_pagein_reserved_(other.n_pagein_reserved_),
     n_pagein_general_(other.n_pagein_general_),
     bytes_read_(other.bytes_read_),
@@ -16100,6 +16175,7 @@ public:
             request_stats.n_pagein_reserved = batch.n_pagein_reserved();
             request_stats.n_pagein_general = batch.n_pagein_general();
             request_stats.n_host_hit = batch.n_host_hit();
+            request_stats.n_cpu_tier_miss_gpu = batch.n_cpu_tier_miss_gpu();
             // n_host_demote/ns_host_get/ns_demote: no longer produced.
             // Every NVMe read lands in the arena and stays there -- there is
             // no D2H demotion and no separate host-tier restore step to time
@@ -20192,7 +20268,7 @@ private:
                 std::fprintf(stderr,
                     "wp: WP_EXPERT_CPU_TIER=1: promote=%u max=%zu max_tokens=%u io=%zu "
                     "compute_threads=%d halflife=%llu halflife_calls=%llu read_chunks=%zu early_io=%d "
-                    "chunk_compute=%d hits_inline=%d deterministic=%d batch=%d batch_max=%zu\n",
+                    "chunk_compute=%d hits_inline=%d deterministic=%d batch=%d batch_max=%zu miss_gpu=%d\n",
                     ExpertSlotPool::cpu_tier_promote(), ExpertSlotPool::cpu_tier_max(),
                     ExpertSlotPool::cpu_tier_max_tokens(), n_io, cpu_tier_compute_threads(),
                     (unsigned long long) ExpertSlotPool::cpu_tier_halflife(),
@@ -20202,7 +20278,12 @@ private:
                     (int) ExpertSlotPool::cpu_tier_chunk_compute(),
                     (int) ExpertSlotPool::cpu_tier_hits_inline(),
                     (int) ExpertSlotPool::cpu_tier_deterministic(),
-                    (int) ExpertSlotPool::cpu_tier_batch(), ExpertSlotPool::cpu_tier_batch_max());
+                    (int) ExpertSlotPool::cpu_tier_batch(), ExpertSlotPool::cpu_tier_batch_max(),
+                    (int) ExpertSlotPool::cpu_tier_miss_gpu());
+                if (ExpertSlotPool::cpu_tier_miss_gpu() && !ExpertSlotPool::cpu_tier_deterministic()) {
+                    std::fprintf(stderr,
+                        "wp: WARN: WP_EXPERT_CPU_TIER_MISS_GPU=1 requires WP_EXPERT_CPU_TIER_DETERMINISTIC=1; ignored\n");
+                }
             }
             for (size_t k = 0; k < job->index.size(); ++k) {
                 if (inline_hit[k]) {
@@ -24006,6 +24087,7 @@ static void accumulate_request_stats(RequestStats & dst, const RequestStats & sr
     dst.n_cpu_tier += src.n_cpu_tier;
     dst.n_cpu_tier_ram_hit += src.n_cpu_tier_ram_hit;
     dst.n_cpu_tier_gu_early += src.n_cpu_tier_gu_early;
+    dst.n_cpu_tier_miss_gpu += src.n_cpu_tier_miss_gpu;
     dst.ns_cpu_tier_compute += src.ns_cpu_tier_compute;
     dst.ns_cpu_tier_wait += src.ns_cpu_tier_wait;
     dst.ns_cpu_graph += src.ns_cpu_graph;
