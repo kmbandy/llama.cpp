@@ -8545,6 +8545,12 @@ public:
     // the request would issue a SECOND read of the same page. Searches every
     // live batch -- with WP_EXPERT_SPEC_MAX_INFLIGHT > 1 the page could be in
     // any of them, not just "the" batch.
+    // WP_ROUTE_TAIL_SKIP_W: the page is in VRAM now (statically resident, or it
+    // holds a slot -- including one whose read is already in flight).
+    bool in_vram(const ExpertPage & page) const {
+        return page.is_resident || find_slot(page) != slots_.size();
+    }
+
     bool spec_in_flight_for(const ExpertPage & page) const {
         for (const SpecBatch & entry : spec_batches_) {
             for (const ExpertPage * p : entry.inflight) {
@@ -15347,6 +15353,86 @@ public:
         return hello;
     }
 
+    // WP_ROUTE_TAIL_SKIP_W=<tau> (Strata's route-tail skip, weight form; off when
+    // unset or 0). On a decode/verify request (n_tokens <= WP_ROUTE_TAIL_SKIP_MAX_TOKENS,
+    // default 8), drop every assigned expert that is NOT in VRAM and whose router
+    // weight is < tau for EVERY token of the request: no read, no compute, zero
+    // contribution, and the other experts keep their weights (no renormalisation).
+    // If that would drop every assignment, the largest-weight one is kept.
+    //
+    // Decided ONCE, at the site that plans the request (serial decode, split BEGIN,
+    // lookahead prepare), by editing the request's assignments in place -- so the
+    // plan, the compute and a prepared N+1 all see the same set. Re-deciding later
+    // would not be safe: the plan itself changes what is in VRAM. CHANGES OUTPUTS.
+    static float tail_skip_tau() {
+        static const float tau = [] {
+            const char * e = std::getenv("WP_ROUTE_TAIL_SKIP_W");
+            return e != nullptr ? std::strtof(e, nullptr) : 0.0f;
+        }();
+        return tau;
+    }
+    static uint32_t tail_skip_max_tokens() {
+        static const uint32_t n = [] {
+            const char * e = std::getenv("WP_ROUTE_TAIL_SKIP_MAX_TOKENS");
+            return e != nullptr ? (uint32_t) std::strtoul(e, nullptr, 10) : 8u;
+        }();
+        return n;
+    }
+    void tail_skip_filter(pipe_expert_dispatch_req & request) {
+        const float tau = tail_skip_tau();
+        if (tau <= 0.0f || request.n_tokens == 0 || request.n_tokens > tail_skip_max_tokens() ||
+                request.assignments.empty()) {
+            return;
+        }
+        std::vector<pipe_expert_assignment> & as = request.assignments;
+        std::vector<char> drop(as.size(), 0);
+        size_t n_drop = 0;
+        size_t keep   = 0;
+        float  keep_w = -1.0f;
+        for (size_t i = 0; i < as.size(); ++i) {
+            float w_max = 0.0f;
+            for (const float w : as[i].weights) {
+                w_max = std::max(w_max, w);
+            }
+            if (w_max > keep_w) {
+                keep_w = w_max;
+                keep   = i;
+            }
+            const auto it = catalog_.pages.find({ request.layer, as[i].expert_id });
+            if (w_max < tau && it != catalog_.pages.end() && !pool_.in_vram(it->second)) {
+                drop[i] = 1;
+                ++n_drop;
+            }
+        }
+        tail_skip_seen_ += as.size();
+        if (n_drop == as.size()) {
+            drop[keep] = 0;
+            --n_drop;
+        }
+        if (n_drop > 0) {
+            size_t out = 0;
+            for (size_t i = 0; i < as.size(); ++i) {
+                if (!drop[i]) {
+                    if (out != i) {
+                        as[out] = std::move(as[i]);
+                    }
+                    ++out;
+                }
+            }
+            as.resize(out);
+            tail_skip_skipped_ += n_drop;
+        }
+        if (++tail_skip_requests_ % 20000 == 0) {
+            std::fprintf(stderr, "route tail skip (w<%.3g): %llu of %llu assignments skipped over %llu requests\n",
+                         tau, (unsigned long long) tail_skip_skipped_,
+                         (unsigned long long) tail_skip_seen_,
+                         (unsigned long long) tail_skip_requests_);
+        }
+    }
+    uint64_t tail_skip_seen_     = 0;
+    uint64_t tail_skip_skipped_  = 0;
+    uint64_t tail_skip_requests_ = 0;
+
     void validate_dispatch(const pipe_expert_dispatch_req & request) const {
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
             throw pipe_protocol_error(
@@ -15735,6 +15821,8 @@ public:
             request = pipe_decode_expert_dispatch_req(
                 pk.data, pk.len, catalog_.descriptor.hparams.n_embd);
             validate_dispatch(request);
+            // Stored in slot.request below; the serial take uses it as-is.
+            tail_skip_filter(request);
         } catch (const std::exception &) {
             // Serial processing reports the same protocol error when N+1 is reached.
             lookahead_decline(slot, WP_LA_DECLINE_INELIGIBLE, ord, seq, cur_layer, true);
@@ -16735,6 +16823,7 @@ public:
         request.assignments = begin.assignments;
         request.swiglu_clamp = begin.swiglu_clamp;
         validate_dispatch(request);
+        tail_skip_filter(request);   // ACTS only adds activations to pending.request
         pool_.set_current_layer(request.layer);
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
@@ -26232,6 +26321,14 @@ public:
         devices_.front()->lookahead_peek_   = nullptr;
         devices_.front()->lookahead_scores_ = nullptr;
     }
+    // WP_ROUTE_TAIL_SKIP_W on the serial decode path (single device only).
+    void tail_skip_filter(pipe_expert_dispatch_req & request) {
+        if (multi_device() || DeviceWorker::tail_skip_tau() <= 0.0f) {
+            return;
+        }
+        auto lock = wp_lock_timed(device_mutexes_.front());
+        devices_.front()->tail_skip_filter(request);
+    }
     bool lookahead_take(int conn_index, uint64_t ord, DeviceWorker::LookaheadSlot & out,
                         bool & notes_done) {
         auto lock = wp_lock_timed(device_mutexes_.front());
@@ -30242,11 +30339,14 @@ int serve_connection(pipe_socket_t & socket, Worker & worker, int conn_index = -
             const bool la_taken = lookahead_on && !shm_request &&
                                   worker.lookahead_take(conn_index, pipeline_ord, la_slot,
                                                         la_notes_done);
-            const pipe_expert_dispatch_req la_decoded = la_taken
+            pipe_expert_dispatch_req la_decoded = la_taken
                 ? pipe_expert_dispatch_req()
                 : (shm_request
                     ? pipe_decode_expert_dispatch_req_view(request_data, request_length, mine.n_embd)
                     : pipe_decode_expert_dispatch_req(request_data, request_length, mine.n_embd));
+            if (!la_taken) {
+                worker.tail_skip_filter(la_decoded);   // a prepared N+1 was filtered at prepare
+            }
             const pipe_expert_dispatch_req & request = la_taken ? *la_slot.request : la_decoded;
             const std::chrono::steady_clock::time_point t_decoded =
                 seg_trace ? std::chrono::steady_clock::now()
