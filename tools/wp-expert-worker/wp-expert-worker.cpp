@@ -8540,17 +8540,28 @@ public:
         return out;
     }
 
+    // WP_ROUTE_TAIL_SKIP_W's "is it in VRAM" test. Under WP_EXPERT_CPU_TIER_DETERMINISTIC
+    // it is the same shadow-residency answer the CPU-tier split uses (demand-stream-only
+    // LRU, see ShadowLru), so the skip is a function of the request stream and never of
+    // read/prefetch timing. Otherwise: live slot state (statically resident, or holding a
+    // slot -- including one whose read is in flight), which is NOT deterministic.
+    bool tail_skip_resident(const ExpertPage & page) const {
+        if (page.is_resident) {
+            return true;
+        }
+        if (cpu_tier_dev_on_ && cpu_tier_deterministic()) {
+            const uint64_t skey = slot_key(page.layer, page.expert);
+            return (!shadow_pinned_.empty() && shadow_pinned_.count(skey) != 0) ||
+                   (shadow_.init && shadow_.contains(skey));
+        }
+        return find_slot(page) != slots_.size();
+    }
+
     // Is `page` currently being read speculatively? The demand path has to ask,
     // because an in-flight slot is not yet valid, so find_slot cannot see it and
     // the request would issue a SECOND read of the same page. Searches every
     // live batch -- with WP_EXPERT_SPEC_MAX_INFLIGHT > 1 the page could be in
     // any of them, not just "the" batch.
-    // WP_ROUTE_TAIL_SKIP_W: the page is in VRAM now (statically resident, or it
-    // holds a slot -- including one whose read is already in flight).
-    bool in_vram(const ExpertPage & page) const {
-        return page.is_resident || find_slot(page) != slots_.size();
-    }
-
     bool spec_in_flight_for(const ExpertPage & page) const {
         for (const SpecBatch & entry : spec_batches_) {
             for (const ExpertPage * p : entry.inflight) {
@@ -15399,7 +15410,7 @@ public:
                 keep   = i;
             }
             const auto it = catalog_.pages.find({ request.layer, as[i].expert_id });
-            if (w_max < tau && it != catalog_.pages.end() && !pool_.in_vram(it->second)) {
+            if (w_max < tau && it != catalog_.pages.end() && !pool_.tail_skip_resident(it->second)) {
                 drop[i] = 1;
                 ++n_drop;
             }
