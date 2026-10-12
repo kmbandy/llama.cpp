@@ -15422,7 +15422,7 @@ public:
             as.resize(out);
             tail_skip_skipped_ += n_drop;
         }
-        if (++tail_skip_requests_ % 20000 == 0) {
+        if (++tail_skip_requests_ % 2000 == 0) {
             std::fprintf(stderr, "route tail skip (w<%.3g): %llu of %llu assignments skipped over %llu requests\n",
                          tau, (unsigned long long) tail_skip_skipped_,
                          (unsigned long long) tail_skip_seen_,
