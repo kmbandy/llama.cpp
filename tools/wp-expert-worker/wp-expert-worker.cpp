@@ -5913,7 +5913,17 @@ struct DemandRec {
     uint32_t           n_tokens = 0;
     std::vector<int>   expert;
     std::vector<char>  src;
+    // WP_DEMAND_LOG_WEIGHTS=1: per-token router weight of each demanded expert,
+    // as received on the wire (empty when off). Emitted as a W line after D.
+    std::vector<std::pair<int, std::vector<float>>> weights;
     std::atomic<bool>  emitted{false};
+    static bool weights_enabled() {
+        static const bool on = [] {
+            const char * e = std::getenv("WP_DEMAND_LOG_WEIGHTS");
+            return e != nullptr && e[0] == '1';
+        }();
+        return on;
+    }
     void emit() {
         if (emitted.exchange(true)) { return; }
         DemandLog * l = DemandLog::get();
@@ -5928,6 +5938,22 @@ struct DemandRec {
             line += src[i];
         }
         line += '\n';
+        //   W <seq> <layer> <n_tokens> <n_experts> <expert>:<w0>,<w1>,... (one weight per token)
+        if (!weights.empty()) {
+            line += "W " + std::to_string(seq) + " " + std::to_string(layer) + " " +
+                    std::to_string(n_tokens) + " " + std::to_string(weights.size());
+            char buf[32];
+            for (const auto & [e, w] : weights) {
+                line += ' ';
+                line += std::to_string(e);
+                line += ':';
+                for (size_t t = 0; t < w.size(); ++t) {
+                    std::snprintf(buf, sizeof(buf), t ? ",%.6g" : "%.6g", w[t]);
+                    line += buf;
+                }
+            }
+            line += '\n';
+        }
         l->write(line.data(), line.size());
     }
     ~DemandRec() { emit(); }
@@ -16085,7 +16111,14 @@ public:
         // WP_DEMAND_LOG: stamp the wire seq_id; emit the D line once the request
         // is fully settled (destroyed after the CPU-tier wait guard below,
         // before batch).
-        if (batch.demand_rec()) { batch.demand_rec()->seq = trace_req; }
+        if (batch.demand_rec()) {
+            batch.demand_rec()->seq = trace_req;
+            if (DemandRec::weights_enabled()) {
+                for (const pipe_expert_assignment & a : request.assignments) {
+                    batch.demand_rec()->weights.emplace_back(a.expert_id, a.weights);
+                }
+            }
+        }
         struct DemandEmitGuard {
             const std::shared_ptr<DemandRec> & rec;
             ~DemandEmitGuard() { if (rec) { rec->emit(); } }
