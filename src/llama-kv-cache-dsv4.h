@@ -89,6 +89,9 @@ private:
 // FIXME: currently the cache only supports non-unified mode even if unified flag is passed
 // FIXME: we currently conflate token_pos and buffer contents. See https://github.com/ggml-org/llama.cpp/pull/25521#discussion_r3558173819
 
+// number of compressed K rows a state save keeps for a seq whose max position is pos_max
+uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size);
+
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
     llama_kv_cache_dsv4(
@@ -167,6 +170,10 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // compression ratios the compressed caches are sized with: rows = (pos + 1)/ratio
+    uint32_t comp_ratio_csa = 0; // kv_csa and kv_lid
+    uint32_t comp_ratio_hca = 0; // kv_hca
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
