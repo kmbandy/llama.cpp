@@ -499,6 +499,13 @@ target_compile_definitions(test-wp-expert-dispatcher PRIVATE
 target_compile_features(test-wp-expert-dispatcher PRIVATE cxx_std_17)
 llama_test(test-wp-expert-dispatcher)
 
+# DSV4 state save row counts per compression ratio (CPU only, no model)
+add_executable(test-dsv4-state-rows test-dsv4-state-rows.cpp)
+target_include_directories(test-dsv4-state-rows PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-dsv4-state-rows PRIVATE llama)
+target_compile_features(test-dsv4-state-rows PRIVATE cxx_std_17)
+llama_test(test-dsv4-state-rows)
+
 # WP_SPINE_ROW_GROUPS: compressor-plan split equivalence (CPU only, no model)
 add_executable(test-dsv4-comp-plan-split test-dsv4-comp-plan-split.cpp)
 target_include_directories(test-dsv4-comp-plan-split PRIVATE ${CMAKE_SOURCE_DIR}/src)
