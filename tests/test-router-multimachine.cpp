@@ -147,9 +147,9 @@ static void test_remote_ledger() {
     ledger_slot full = { "x/y", "0000:03:00.0", 5000 * MB, 4000 * MB };
     assert(router_node_free_vram(p, full) == 0);
 
-    // RAM per machine: the node's MemAvailable minus headroom (same formula as the local machine's)
-    assert(ledger_free_ram(p.mem_available, 4096 * MB) == 40000000000LL - 4096 * MB);
-    assert(ledger_free_ram(-1, 4096 * MB) == -1); // unknown never gates
+    // RAM per machine: the node's MemAvailable as read (same rule as the local machine's)
+    assert(ledger_free_ram(p.mem_available) == 40000000000LL);
+    assert(ledger_free_ram(-1) == -1); // unknown never gates
 
     // garbage / empty state: not ok, nothing invented
     assert(!router_node_probe_from_state(json::array()).ok);

@@ -75,25 +75,20 @@ int main() {
         assert(ledger_free_vram(s, -5 * MB, 4000 * MB) == 12000 * MB);
     }
 
-    // RAM: MemAvailable minus headroom
+    // RAM: free is MemAvailable as read (no reserve); unreadable => unknown
     {
-        const int64_t headroom = 4096 * MB;
-        assert(ledger_free_ram(40000 * MB, headroom) == 40000 * MB - headroom);
-        assert(ledger_free_ram(1000 * MB, headroom) == 0);  // below headroom clamps
-        assert(ledger_free_ram(-1, headroom) == -1);        // unreadable => unknown
+        assert(ledger_free_ram(40000 * MB) == 40000 * MB);
+        assert(ledger_free_ram(0) == 0);
+        assert(ledger_free_ram(-1) == -1);  // unreadable => unknown
     }
 
-    // RAM fit refusal + headroom respected
+    // RAM fit: a load whose ram-mb equals the free memory is admitted, one MB more is refused
     {
-        const int64_t headroom = 4096 * MB;
-        const int64_t avail    = 20000 * MB;
-        const int64_t free_ram = ledger_free_ram(avail, headroom); // 15904 MB
-        assert(ledger_ram_fits(free_ram, 15904 * MB));             // exactly fits
-        assert(!ledger_ram_fits(free_ram, 15905 * MB));            // 1 MB into headroom: refused
-        assert(!ledger_ram_fits(free_ram, 20000 * MB));            // would fit raw MemAvailable only
+        const int64_t avail    = 15904 * MB;
+        const int64_t free_ram = ledger_free_ram(avail);
+        assert(ledger_ram_fits(free_ram, 15904 * MB));  // exactly fits
+        assert(!ledger_ram_fits(free_ram, 15905 * MB)); // 1 MB more: refused
         assert(ledger_ram_fits(free_ram, 0));
-        // a larger headroom shrinks what fits
-        assert(!ledger_ram_fits(ledger_free_ram(avail, 8192 * MB), 15000 * MB));
         // unknown free RAM never blocks
         assert(ledger_ram_fits(-1, 999999 * MB));
     }
