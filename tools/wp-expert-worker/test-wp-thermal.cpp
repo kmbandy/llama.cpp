@@ -194,6 +194,7 @@ static Config base_cfg() {
     c.t2 = 80.0;
     c.t3 = 85.0;
     c.floor_bps = 200 * MB;
+    c.hysteresis_c = 1.0;   // the transition tests below are written against a 1 C band
     return c;
 }
 
@@ -320,6 +321,31 @@ static void test_cap_ceiling() {
         f.tick(78.5);
     }
     CHECK_NEAR(c.snapshot().cap_bps, 200 * MB, 1.0);
+}
+
+// Live 2026-10-14: the SN850X reports in ~2 C steps (76.8 <-> 78.8). With a 1 C band the
+// state flapped COOL<->WARM every few seconds; the default 2 C band must hold WARM across one step.
+static void test_default_hysteresis_holds_one_sensor_step() {
+    Config cfg = base_cfg();
+    cfg.hysteresis_c = Config().hysteresis_c;
+    CHECK(cfg.hysteresis_c >= 2.0);
+    cfg.t1 = 78.2;
+    cfg.t2 = 80.0;
+    cfg.t3 = 85.4;
+    Controller c(cfg);
+    Feeder f{ c };
+    f.tick(76.8);
+    CHECK(c.state() == State::COOL);
+    f.tick(78.8);
+    CHECK(c.state() == State::WARM);
+    for (int i = 0; i < 5; ++i) {   // the observed one-step bounce no longer leaves WARM
+        f.tick(76.8);
+        CHECK(c.state() == State::WARM);
+        f.tick(78.8);
+        CHECK(c.state() == State::WARM);
+    }
+    f.tick(75.8);                   // a second step down does
+    CHECK(c.state() == State::COOL);
 }
 
 static void test_spec_waits_behind_demand() {
@@ -475,6 +501,7 @@ int main(int argc, char ** argv) {
     test_state_transitions();
     test_format_transition();
     test_aimd();
+    test_default_hysteresis_holds_one_sensor_step();
     test_spec_waits_behind_demand();
     test_cap_ceiling();
     test_token_bucket_large_read();

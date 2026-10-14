@@ -310,7 +310,7 @@ struct Config {
     double t3 = 85.0;
     double floor_bps = 200e6;     // WP_THERMAL_FLOOR_MBPS, bytes/s
     double pause_release_s = 45.0;
-    double hysteresis_c = 1.0;
+    double hysteresis_c = 2.0;    // > one sensor step (the SN850X reports ~2 C steps, e.g. 76.8 <-> 78.8)
     double md_factor = 0.8;       // HOT: cap *= md_factor per tick
     double ai_step_min_bps = 50e6;
     double ceiling_factor = 1.25; // cap <= measured rate * ceiling_factor
