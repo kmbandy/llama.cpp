@@ -30,9 +30,9 @@ int64_t ledger_foreign_vram(const std::vector<proc_vram> & usage, const std::set
 // at 0. sysfs_used < 0 means the card-wide reading failed and only the ledger term applies.
 int64_t ledger_free_vram(const ledger_slot & slot, int64_t foreign_bytes, int64_t sysfs_used);
 
-// Free host RAM: MemAvailable minus headroom, clamped at 0. mem_available < 0 (unreadable)
-// yields -1, which callers treat as "unknown, do not gate on RAM".
-int64_t ledger_free_ram(int64_t mem_available, int64_t headroom);
+// Free host RAM: MemAvailable as read. mem_available < 0 (unreadable) yields -1, which callers
+// treat as "unknown, do not gate on RAM".
+int64_t ledger_free_ram(int64_t mem_available);
 
 // Whether a load needing `need` bytes fits in `free_ram`. Unknown free (< 0) always fits.
 bool ledger_ram_fits(int64_t free_ram, int64_t need);

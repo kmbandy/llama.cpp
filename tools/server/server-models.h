@@ -495,7 +495,7 @@ private:
     };
     vram_snapshot take_vram_snapshot_locked() const;
     int64_t foreign_vram_bytes_locked(const server_gpu_slot & slot, const vram_snapshot & snap) const;
-    // MemAvailable - headroom - RAM of other still-loading models on `machine` ("" = this machine; another
+    // MemAvailable - RAM of other still-loading models on `machine` ("" = this machine; another
     // machine's from its node's probe); -1 = unknown
     int64_t free_ram_bytes_locked(const std::string & exclude, const std::string & machine = "") const;
     int64_t resident_ram_bytes_locked(const std::string & name) const; // rss (anon+shmem, from the model's node), else ram-mb, else 0

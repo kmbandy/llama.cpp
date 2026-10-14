@@ -310,6 +310,15 @@ int main() {
         r = decide_admission(in);
         check(r.verdict == ADMISSION_ADMIT, "ram unknown: admit", r);
 
+        // exact fit admits; one MB more is refused (no reserve on top of the free memory)
+        in.machines[0].free_ram = 8 * GB;
+        in.candidates[0].ram    = { { "m1", 8 * GB } };
+        r = decide_admission(in);
+        check(r.verdict == ADMISSION_ADMIT, "ram exact fit: admit", r);
+        in.candidates[0].ram = { { "m1", 8 * GB + 1024 * 1024 } };
+        r = decide_admission(in);
+        check(r.verdict != ADMISSION_ADMIT && r.blocked_on_ram, "ram one MB over: refused", r);
+
         // a busy resident holding the RAM: queue at middle, victim at highest
         in.machines[0].free_ram = 2 * GB;
         in.candidates[0].ram    = { { "m1", 8 * GB } };

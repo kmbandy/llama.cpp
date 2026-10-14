@@ -27,11 +27,8 @@ int64_t ledger_free_vram(const ledger_slot & slot, int64_t foreign_bytes, int64_
     return std::max<int64_t>(0, free);
 }
 
-int64_t ledger_free_ram(int64_t mem_available, int64_t headroom) {
-    if (mem_available < 0) {
-        return -1;
-    }
-    return std::max<int64_t>(0, mem_available - std::max<int64_t>(0, headroom));
+int64_t ledger_free_ram(int64_t mem_available) {
+    return mem_available < 0 ? -1 : mem_available;
 }
 
 bool ledger_ram_fits(int64_t free_ram, int64_t need) {

@@ -1575,8 +1575,7 @@ int64_t server_models::free_ram_bytes_locked(const std::string & exclude, const 
     } else {
         available = probe_mem_available("");
     }
-    const int64_t headroom = (int64_t) base_params.router_ram_headroom_mb * 1024LL * 1024LL;
-    int64_t free = ledger_free_ram(available, headroom);
+    int64_t free = ledger_free_ram(available);
     if (free < 0) {
         return -1;
     }
@@ -1700,7 +1699,6 @@ json server_models::machines_json() {
         {"machine", local_machine},
         {"online", true},
         {"ram_available_mb", probe_mem_available("") < 0 ? -1 : probe_mem_available("") / (1024 * 1024)},
-        {"ram_headroom_mb", base_params.router_ram_headroom_mb},
         {"ram_free_mb", ram_free < 0 ? -1 : ram_free / (1024 * 1024)},
     });
     for (const auto & [machine, link] : remote_nodes) {
@@ -1711,7 +1709,6 @@ json server_models::machines_json() {
             {"machine", machine},
             {"online", !machine_offline_locked(machine)},
             {"ram_available_mb", probe.mem_available < 0 ? -1 : probe.mem_available / (1024 * 1024)},
-            {"ram_headroom_mb", base_params.router_ram_headroom_mb},
             {"ram_free_mb", free < 0 ? -1 : free / (1024 * 1024)},
         });
     }
@@ -2034,7 +2031,7 @@ admission_result server_models::decide_admission_locked(const std::string & name
                                    std::to_string(need / (1024 * 1024)) + " MB, free " +
                                    std::to_string(std::max<int64_t>(0, free_ram_bytes_locked(name, res.blocked_on)) / (1024 * 1024)) +
                                    " MB" + (res.blocked_on.empty() ? std::string() : " on machine '" + res.blocked_on + "'") +
-                                   " after headroom, and no idle model can be evicted to make room");
+                                   ", and no idle model can be evicted to make room");
     }
     switch (res.blocked) {
         case ADMISSION_BLOCK_PINNED:
