@@ -290,23 +290,56 @@ static void test_aimd() {
     CHECK_NEAR(c.snapshot().cap_bps, 200 * MB, 1.0);
 
     // Below T2-1 -> WARM, and the additive step applies: max(floor/2, 50 MB/s) = 100 MB/s.
+    // Heavy traffic keeps the measured-rate ceiling out of the way.
+    c.account_read((uint64_t) (50000 * MB));
     f.tick(78.5);
     CHECK(c.state() == State::WARM);
     CHECK_NEAR(c.snapshot().cap_bps, 300 * MB, 1.0);
     // WARM below T2 keeps recovering additively.
+    c.account_read((uint64_t) (50000 * MB));
     f.tick(78.5);
     CHECK_NEAR(c.snapshot().cap_bps, 400 * MB, 1.0);
 }
 
-static void test_spec_held_in_warm() {
+static void test_cap_ceiling() {
     Controller c(base_cfg());
     Feeder f{ c };
-    f.tick(78.5);   // WARM
+    // WARM with ~400 MB/s of traffic: the additive step stops at 1.25x the measured rate.
+    for (int i = 0; i < 10; ++i) {
+        c.account_read((uint64_t) (400 * MB));
+        f.tick(70.0);
+    }
+    for (int i = 0; i < 20; ++i) {
+        c.account_read((uint64_t) (400 * MB));
+        f.tick(78.5);
+    }
     CHECK(c.state() == State::WARM);
-    // Speculative reads are refused while the gate is active.
-    const Admission a = c.admit(ReadClass::SPEC, 1 * MB, f.now);
+    CHECK_NEAR(c.snapshot().cap_bps, 500 * MB, 1.0);
+    // Traffic stops: the ceiling falls with the measured rate, down to the floor.
+    for (int i = 0; i < 12; ++i) {
+        f.tick(78.5);
+    }
+    CHECK_NEAR(c.snapshot().cap_bps, 200 * MB, 1.0);
+}
+
+static void test_spec_waits_behind_demand() {
+    Controller c(base_cfg());
+    Feeder f{ c };
+    f.tick(78.5);   // WARM, cap = floor 200 MB/s, depth 50 MB
+    CHECK(c.state() == State::WARM);
+    const double t0 = f.now;
+    // A full bucket admits a speculative read (demand is leaving budget unused).
+    CHECK(c.admit(ReadClass::SPEC, 1 * MB, t0).pass);
+    // Demand drains the bucket; speculative reads then wait for it to refill completely.
+    CHECK(c.admit(ReadClass::DEMAND, 49 * MB, t0).pass);
+    const Admission a = c.admit(ReadClass::SPEC, 1 * MB, t0);
     CHECK(!a.pass);
     CHECK(a.sleep_s > 0.0 && a.sleep_s <= 0.010 + 1e-12);
+    // The bucket is empty now, so demand waits too.
+    CHECK(!c.admit(ReadClass::DEMAND, 1 * MB, t0).pass);
+    // With no demand for a full bucket's worth of time (0.25 s), spec passes: a demand
+    // step blocked on that very speculative read can never deadlock it.
+    CHECK(c.admit(ReadClass::SPEC, 1 * MB, t0 + 0.26).pass);
     // Exempt reads always pass.
     CHECK(c.admit(ReadClass::EXEMPT, 1 * MB, f.now).pass);
 }
@@ -352,24 +385,20 @@ static void test_gate_cool_noop() {
     CHECK(c.snapshot().demand_throttled_ns == 0);
 }
 
-static void test_gate_spec_released_on_cool() {
+static void test_gate_spec_admitted_on_refill() {
     Controller c(base_cfg());
     Feeder f{ c };
-    f.tick(78.5);   // WARM
-    double clock = 10.0;
+    f.tick(78.5);   // WARM, depth 50 MB at 200 MB/s
+    double clock = f.now;
+    CHECK(c.admit(ReadClass::DEMAND, 50 * MB, clock).pass);   // bucket empty
     int sleeps = 0;
-    // Each sleep advances the clock. After three slices the drive cools to COOL.
+    // Still WARM throughout: the speculative read passes once the bucket refills (~0.25 s).
     gate(c, ReadClass::SPEC, 1 * MB,
          [&] { return clock; },
-         [&](double s) {
-             clock += s;
-             if (++sleeps == 3) {
-                 f.now += 1.0;
-                 c.on_sample(70000, f.now);
-             }
-         });
-    CHECK(sleeps == 3);
-    CHECK(c.state() == State::COOL);
+         [&](double s) { clock += s; ++sleeps; });
+    CHECK(c.state() == State::WARM);
+    CHECK(sleeps >= 25 && sleeps <= 260);
+    CHECK(clock - f.now > 0.24 && clock - f.now < 0.3);
     CHECK(c.snapshot().n_spec_held == 1);   // one read held, counted once
 }
 
@@ -393,7 +422,7 @@ static void test_gate_pause_release_after_45s() {
         f.tick(86.0);
     }
     CHECK(c.state() == State::PAUSE);
-    // Released: demand passes at the floor rate, spec is still held.
+    // Released: demand passes at the floor rate; spec waits behind it.
     Admission a{ false, 0.0 };
     double now = f.now;
     for (int i = 0; i < 1000 && !a.pass; ++i) {
@@ -446,10 +475,11 @@ int main(int argc, char ** argv) {
     test_state_transitions();
     test_format_transition();
     test_aimd();
-    test_spec_held_in_warm();
+    test_spec_waits_behind_demand();
+    test_cap_ceiling();
     test_token_bucket_large_read();
     test_gate_cool_noop();
-    test_gate_spec_released_on_cool();
+    test_gate_spec_admitted_on_refill();
     test_gate_pause_release_after_45s();
     test_bucket_rate();
 

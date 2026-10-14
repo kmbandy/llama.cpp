@@ -59,7 +59,7 @@ inline const char * state_name(State s) {
 // How the gate treats a read. The caller maps WpReadOrigin onto this.
 enum class ReadClass : uint8_t {
     EXEMPT,  // never gated (KV-park / seed landing)
-    SPEC,    // speculative / prefetch / landing: held whenever the gate is active
+    SPEC,    // speculative / prefetch / landing: runs only on a full bucket while gated
     DEMAND,  // request-driven: token bucket while WARM/HOT, held while PAUSE
 };
 
@@ -313,6 +313,7 @@ struct Config {
     double hysteresis_c = 1.0;
     double md_factor = 0.8;       // HOT: cap *= md_factor per tick
     double ai_step_min_bps = 50e6;
+    double ceiling_factor = 1.25; // cap <= measured rate * ceiling_factor
     double bucket_depth_s = 0.25; // bucket depth = cap * bucket_depth_s
     double slice_s = 0.005;       // sleep slice for held reads (clamped to [1 ms, 10 ms])
 };
@@ -378,12 +379,16 @@ public:
         const State prev = state_.load(std::memory_order_relaxed);
         const State next = next_state(prev, temp_c);
 
+        // The cap never runs far above what the drive is actually being asked for, so a long
+        // WARM stretch can't leave HOT starting from an unreachable rate.
+        const double ceiling = std::max(cfg_.floor_bps, measured_bps * cfg_.ceiling_factor);
         if (prev == State::COOL && next != State::COOL) {
             cap_bps_ = std::max(cfg_.floor_bps, measured_bps);
         } else if (temp_c >= cfg_.t2) {
-            cap_bps_ = std::max(cfg_.floor_bps, cap_bps_ * cfg_.md_factor);
+            cap_bps_ = std::max(cfg_.floor_bps, std::min(cap_bps_, ceiling) * cfg_.md_factor);
         } else if (next == State::WARM) {
-            cap_bps_ += std::max(cfg_.floor_bps / 2.0, cfg_.ai_step_min_bps);
+            cap_bps_ = std::min(cap_bps_ + std::max(cfg_.floor_bps / 2.0, cfg_.ai_step_min_bps),
+                                ceiling);
         }
 
         Transition tr;
@@ -419,9 +424,6 @@ public:
         if (s == State::COOL) {
             return { true, 0.0 };
         }
-        if (cls == ReadClass::SPEC) {
-            return { false, slice() };
-        }
         if (s == State::PAUSE && !pause_release_) {
             return { false, slice() };
         }
@@ -440,6 +442,13 @@ public:
         tokens_ = std::min(tokens_, depth);
         // A read larger than the bucket waits for a full bucket and then goes into debt.
         // Waiting on min(bytes, depth) keeps every read admissible, so nothing deadlocks.
+        // Speculative reads are not held outright: a demand step may be waiting on one
+        // (ensure_batch interlock, CPU-tier in-flight wait). They run only on a full bucket,
+        // i.e. when demand is leaving budget unused, which is also the case while demand
+        // is blocked on that very read.
+        if (cls == ReadClass::SPEC && tokens_ < depth) {
+            return { false, std::min(std::max((depth - tokens_) / cap, 0.001), kMaxSliceS) };
+        }
         const double need = std::min((double) bytes, depth);
         if (tokens_ >= need) {
             tokens_ -= (double) bytes;
