@@ -1,5 +1,6 @@
 #include "pipe-ml8-pack-cpu.h"
 #include "wp-expert-worker.h"
+#include "wp-thermal.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -156,6 +157,7 @@ enum WpReadOrigin : uint8_t {
     WP_RD_CPUTIER,     // CPU-tier IO thread
     WP_RD_PF,          // cpu_pf_loop
     WP_RD_LANDING,     // cold landing thread
+    WP_RD_SEED,        // RAM-tier seed landing (seed_land_host); exempt from the thermal gate
 };
 
 // Thread roles (ROLE record aux). Names printed in the TSV header.
@@ -493,6 +495,25 @@ struct WpReadOriginScope {
     explicit WpReadOriginScope(uint8_t o) : prev(wp_read_origin_tls) { wp_read_origin_tls = o; }
     ~WpReadOriginScope() { wp_read_origin_tls = prev; }
 };
+
+// WP_THERMAL governor (see wp-thermal.h). Set once in run() before any worker thread
+// exists, cleared before the controller is destroyed. Null => governor off, and every
+// read path below is a single pointer test.
+static wp_thermal::Controller * g_wp_thermal = nullptr;
+
+// Gate a read of `len` bytes with origin `rd_origin`. Caller checked g_wp_thermal != nullptr.
+static void wp_thermal_gate_read(uint8_t rd_origin, uint64_t len) {
+    wp_thermal::ReadClass cls = wp_thermal::ReadClass::DEMAND;   // WP_RD_OTHER and unknown: demand
+    if (rd_origin == WP_RD_SEED) {
+        cls = wp_thermal::ReadClass::EXEMPT;
+    } else if (rd_origin == WP_RD_SPEC || rd_origin == WP_RD_PF || rd_origin == WP_RD_LANDING) {
+        cls = wp_thermal::ReadClass::SPEC;
+    }
+    wp_thermal::gate(*g_wp_thermal, cls, len, wp_thermal::steady_seconds, [](double s) {
+        std::this_thread::sleep_for(std::chrono::duration<double>(s));
+    });
+    g_wp_thermal->account_read(len);
+}
 
 // Thread begin/end. begin records the ROLE once per thread (idempotent: a second
 // call on the same thread, e.g. serve_connection inside a multi-conn slot thread,
@@ -3210,6 +3231,18 @@ private:
                 std::cout << g_worker_conn_request_counts[i].load(std::memory_order_relaxed);
             }
             std::cout << ']';
+        }
+        // Thermal fields only when WP_THERMAL=1, so the default line is unchanged.
+        if (g_wp_thermal != nullptr) {
+            const wp_thermal::Snapshot t = g_wp_thermal->snapshot();
+            char temp_buf[32];
+            std::snprintf(temp_buf, sizeof(temp_buf), "%.1f", t.temp_c);
+            std::cout << " thermal_temp_c=" << temp_buf
+                      << " thermal_state=" << wp_thermal::state_name(t.state)
+                      << " thermal_cap_mbps=" << (uint64_t) (t.cap_bps / 1e6)
+                      << " thermal_ns_demand_throttled=" << t.demand_throttled_ns
+                      << " thermal_n_pauses=" << t.n_pauses
+                      << " thermal_n_spec_held=" << t.n_spec_held;
         }
         std::cout << " n_begin_unlocked_reads="
                   << g_worker_n_begin_unlocked_reads.load(std::memory_order_relaxed);
@@ -11528,6 +11561,11 @@ private:
         const uint32_t rd_seq = state != nullptr ? state->span_seq : wp_span_ctx_seq;
         const uint8_t  rd_origin = state != nullptr
             ? (state->speculative ? WP_RD_SPEC : WP_RD_DEMAND) : wp_read_origin_tls;
+        // Thermal gate (WP_THERMAL=1 only): may delay the read, never skips or fails it.
+        // Runs before read_started so a throttled wait is not billed as device time.
+        if (g_wp_thermal != nullptr) {
+            wp_thermal_gate_read(rd_origin, len);
+        }
         const std::chrono::steady_clock::time_point read_started =
             measure_read || span_read ? std::chrono::steady_clock::now() :
                             std::chrono::steady_clock::time_point();
@@ -13203,7 +13241,11 @@ size_t ExpertSlotPool::seed_land_host(const std::vector<SeedItem> & list, size_t
             if (test_hooks_ != nullptr && test_hooks_->read_started) {
                 test_hooks_->read_started(page->layer, page->expert);
             }
-            read_page_range(*page, fd, data, 0, (size_t) page->size);
+            {
+                // Seed landing is exempt from the thermal gate (WP_RD_SEED).
+                WpReadOriginScope seed_origin(WP_RD_SEED);
+                read_page_range(*page, fd, data, 0, (size_t) page->size);
+            }
             if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                 test_hooks_->read_finished(page->layer, page->expert);
             }
@@ -30920,6 +30962,113 @@ void apply_other_cpus_early() {
 #endif
 }
 
+// NVMe temperature sensor for the WP_THERMAL governor. Polls the drive once per second
+// and feeds wp_thermal::Controller. Built only when WP_THERMAL=1. Declared before the
+// Worker in run(), so it is joined after the Worker is gone.
+class WpThermalSensor {
+public:
+    explicit WpThermalSensor(const std::string & blob_path) {
+        const char * on = std::getenv("WP_THERMAL");
+        if (on == nullptr || std::strcmp(on, "1") != 0) {
+            return;
+        }
+        wp_thermal::SensorPaths paths;
+        std::string why;
+        bool found = false;
+        const char * ovr = std::getenv("WP_THERMAL_HWMON");
+        if (ovr != nullptr && *ovr != '\0') {
+            found = wp_thermal::sensor_from_override(ovr, paths);
+            if (!found) {
+                why = std::string("WP_THERMAL_HWMON=") + ovr + " is neither a directory nor a file";
+            }
+        } else {
+            found = wp_thermal::discover_nvme_sensor(blob_path, "/sys", paths, why);
+        }
+        if (!found) {
+            std::fprintf(stderr, "wp thermal: governor off, no sensor (%s)\n", why.c_str());
+            return;
+        }
+        int64_t max_mdeg = 0;
+        if (!paths.temp_max.empty()) {
+            wp_thermal::read_i64_file(paths.temp_max, max_mdeg);
+        }
+        const wp_thermal::Thresholds th = wp_thermal::derive_thresholds(
+            std::getenv("WP_THERMAL_PCT"), std::getenv("WP_THERMAL_C"), max_mdeg);
+        if (!th.warning.empty()) {
+            std::fprintf(stderr, "wp thermal: %s\n", th.warning.c_str());
+        }
+        double floor_mbps = 200.0;
+        if (const char * env = std::getenv("WP_THERMAL_FLOOR_MBPS"); env != nullptr) {
+            const double v = std::strtod(env, nullptr);
+            if (v > 0.0) {
+                floor_mbps = v;
+            }
+        }
+        wp_thermal::Config cfg;
+        cfg.t1 = th.t[0];
+        cfg.t2 = th.t[1];
+        cfg.t3 = th.t[2];
+        cfg.floor_bps = floor_mbps * 1e6;
+        std::copy(th.t, th.t + 3, t_);
+        paths_ = paths;
+        ctl_ = std::make_unique<wp_thermal::Controller>(cfg);
+        std::fprintf(stderr,
+                     "wp thermal: on sensor=%s source=%s T=(%.1f,%.1f,%.1f) [%s] floor=%.0f MB/s\n",
+                     paths_.temp_input.c_str(), paths_.source.c_str(), t_[0], t_[1], t_[2],
+                     th.source.c_str(), floor_mbps);
+        g_wp_thermal = ctl_.get();
+        thread_ = std::thread([this] { loop(); });
+    }
+
+    WpThermalSensor(const WpThermalSensor &) = delete;
+    WpThermalSensor & operator=(const WpThermalSensor &) = delete;
+
+    ~WpThermalSensor() {
+        g_wp_thermal = nullptr;
+        if (thread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                stop_ = true;
+            }
+            cv_.notify_all();
+            thread_.join();
+        }
+    }
+
+private:
+    void loop() {
+        bool warned_read = false;
+        for (;;) {
+            int64_t temp = 0;
+            if (wp_thermal::read_i64_file(paths_.temp_input, temp)) {
+                const wp_thermal::Transition tr = ctl_->on_sample(temp, wp_thermal::steady_seconds());
+                if (tr.changed) {
+                    const wp_thermal::Snapshot snap = ctl_->snapshot();
+                    std::fprintf(stderr, "%s\n",
+                                 wp_thermal::format_transition(tr, (double) temp / 1000.0, t_,
+                                                               snap.cap_bps).c_str());
+                }
+            } else if (!warned_read) {
+                warned_read = true;
+                std::fprintf(stderr, "wp thermal: cannot read %s; holding last state\n",
+                             paths_.temp_input.c_str());
+            }
+            std::unique_lock<std::mutex> lk(mu_);
+            if (cv_.wait_for(lk, std::chrono::seconds(1), [this] { return stop_; })) {
+                return;
+            }
+        }
+    }
+
+    std::unique_ptr<wp_thermal::Controller> ctl_;
+    wp_thermal::SensorPaths                 paths_;
+    double                                  t_[3] = { 0.0, 0.0, 0.0 };
+    std::mutex                              mu_;
+    std::condition_variable                 cv_;
+    bool                                    stop_ = false;
+    std::thread                             thread_;
+};
+
 int run(const Options & options) {
     std::vector<std::string> devices = options.devices;
     if (devices.empty() && !options.device.empty()) {
@@ -30950,8 +31099,13 @@ int run(const Options & options) {
     }
     const fs::path manifest = fs::canonical(options.shard_manifest);
     const fs::path descriptor = fs::canonical(options.descriptor);
+    Catalog catalog = load_catalog(manifest, descriptor);
+    // Thermal sensor (WP_THERMAL=1 only). Discovery stats a model blob on the same disk.
+    // Declared before the Worker, so it is joined after the Worker is destroyed.
+    WpThermalSensor thermal_sensor(catalog.pages.empty() ? std::string()
+                                                         : catalog.pages.begin()->second.blob.string());
     Worker worker(
-        load_catalog(manifest, descriptor),
+        std::move(catalog),
         devices,
         device_slots,
         options.host_budget_bytes,
