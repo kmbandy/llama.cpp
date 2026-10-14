@@ -1919,9 +1919,15 @@ struct router_queue_signal {
     std::optional<router_board_claim_result> raced; // the claim POST that found the resource taken (already queued on it)
 };
 
+// Thrown out of placement instead of a host-RAM refusal on another machine: admit_locked() refreshes
+// that node's probe with the lock released and decides once more.
+struct router_ram_probe_stale {
+    std::string machine;
+};
+
 admission_result server_models::decide_admission_locked(const std::string & name, const server_model_meta & meta,
                                                         std::vector<admission_candidate> candidates, bool exclusive,
-                                                        const load_options & opts) {
+                                                        const load_options & opts, bool ram_probe_fresh) {
     std::set<std::string> cand_slots;
     for (const auto & c : candidates) {
         for (const auto & v : c.vram) {
@@ -2016,6 +2022,9 @@ admission_result server_models::decide_admission_locked(const std::string & name
         throw router_queue_signal{ res }; // load() records the queued load (lock released)
     }
     // never fits as configured, or a pin / hold is in the way: refuse now
+    if (res.blocked_on_ram && !ram_probe_fresh && remote_nodes.count(res.blocked_on) > 0) {
+        throw router_ram_probe_stale{ res.blocked_on };
+    }
     if (res.blocked_on_ram) {
         int64_t need = 0;
         for (const auto & r : in.candidates[res.candidate].ram) {
@@ -2051,8 +2060,21 @@ admission_result server_models::admit_locked(const std::string & name, const ser
     // the rest for the resident later, and releases what it does not need).
     admission_result res;
     bool claim = true;
+    bool ram_probe_fresh = false;
     for (int attempt = 0; ; ++attempt) {
-        res = decide_admission_locked(name, meta, candidates, exclusive, opts);
+        try {
+            res = decide_admission_locked(name, meta, candidates, exclusive, opts, ram_probe_fresh);
+        } catch (const router_ram_probe_stale & stale) {
+            // the cached MemAvailable can predate a model that stopped there moments ago
+            // (an unload followed at once by a reload): ask the node now, then decide again
+            const auto link = remote_nodes.at(stale.machine);
+            lk.unlock();
+            link->refresh_probe();
+            lk.lock();
+            ram_probe_fresh = true;
+            --attempt;
+            continue;
+        }
         if (!claim || attempt >= 2) {
             break;
         }

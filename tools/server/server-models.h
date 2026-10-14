@@ -443,10 +443,12 @@ private:
     void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
     // gathers the inputs for decide_admission() (server-router-admission.h) and runs it. A
     // `queue` verdict throws: router_queue_signal when the load waits (a foreign board claim or
-    // a busy resident), router_refused_error otherwise, naming what is in the way.
+    // a busy resident), router_refused_error otherwise, naming what is in the way. A host-RAM
+    // refusal on another machine throws router_ram_probe_stale first unless ram_probe_fresh: that
+    // machine's MemAvailable is a cached probe that can predate a model that just stopped there.
     admission_result decide_admission_locked(const std::string & name, const server_model_meta & meta,
                                              std::vector<admission_candidate> candidates, bool exclusive,
-                                             const load_options & opts);
+                                             const load_options & opts, bool ram_probe_fresh = false);
     // decide_admission_locked(), then the board claims for the chosen placement (taken with the
     // lock released, then decided again against the current state)
     admission_result admit_locked(const std::string & name, const server_model_meta & meta,
