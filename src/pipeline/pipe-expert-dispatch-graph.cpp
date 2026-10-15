@@ -2830,52 +2830,56 @@ void graph_dispatcher::end_decode() noexcept {
 
     remote.end_deferral_window();
 
-    const deferral_stats & dstats = remote.get_deferral_stats();
-    // Always log mechanism counters at WARN so they are visible under the
-    // llama-server default logger threshold (3); INFO is filtered.
-    LLAMA_LOG_WARN(
-        "expert dispatch deferral: WP_DEFER_K=%d nvme_util_pct=%.1f ns_gap=%.2f ms "
-        "n_deferred=%llu n_deferred_late=%llu\n",
-        dstats.defer_k,
-        dstats.nvme_util_pct,
-        dstats.ns_gap * 1.0e-6,
-        (unsigned long long) dstats.n_deferred,
-        (unsigned long long) dstats.n_deferred_late);
-
-    // Same treatment for the prefetch hint, and for the same reason: these are
-    // the spine's side of the mechanism, and they are what tells a run that
-    // "prefetch did nothing" apart from "prefetch was never offered". Silent
-    // when the feature is off, so a config-of-record run's log is unchanged.
-    if (hint_enabled() || router2_topm() > 0 || ngram_table_ != nullptr) {
-        const prefetch_hint_stats & hstats = remote.get_prefetch_hint_stats();
+    // Both lines below fire once per decode (every token), so they are gated on
+    // WP_DISPATCH_STATS like the predictor line above; ungated they flood the
+    // router journal at several lines per second.
+    if (collect_stats_) {
+        const deferral_stats & dstats = remote.get_deferral_stats();
+        // WARN so they are visible under the llama-server default logger
+        // threshold (3); INFO is filtered.
         LLAMA_LOG_WARN(
-            "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
-            "sent_in_flight=%llu send_failed=%llu no_route=%llu "
-            "skip_dynamic=%llu skip_in_flight=%llu score_frames=%llu score_skipped=%llu\n",
-            oracle_.layers().size(),
-            (unsigned long long) hstats.n_frames,
-            (unsigned long long) hstats.n_experts,
-            (unsigned long long) hstats.n_sent_in_flight,
-            (unsigned long long) hstats.n_send_failed,
-            (unsigned long long) hstats.n_no_oracle,
-            (unsigned long long) hstats.n_skipped_dynamic,
-            (unsigned long long) hstats.n_skipped_in_flight,
-            (unsigned long long) hstats.n_score_frames,
-            (unsigned long long) hstats.n_score_skipped);
-        if (router2_pscore() != nullptr) {
-            // Cumulative since process start. admit_by_d lists d=2..K+1; admit_by_p
-            // is deciles of P (0.0-0.1 ... 0.9-1.0; only >= PMIN are nonzero).
-            std::string by_d, by_p;
-            for (int d = 2; d < 64 && d <= router2_lookahead() + 1; ++d) {
-                by_d += (by_d.empty() ? "" : ",") + std::to_string(pscore_admitted_d_[d].load());
+            "expert dispatch deferral: WP_DEFER_K=%d nvme_util_pct=%.1f ns_gap=%.2f ms "
+            "n_deferred=%llu n_deferred_late=%llu\n",
+            dstats.defer_k,
+            dstats.nvme_util_pct,
+            dstats.ns_gap * 1.0e-6,
+            (unsigned long long) dstats.n_deferred,
+            (unsigned long long) dstats.n_deferred_late);
+
+        // Same treatment for the prefetch hint: these are the spine's side of the
+        // mechanism, and they are what tells a run that "prefetch did nothing"
+        // apart from "prefetch was never offered".
+        if (hint_enabled() || router2_topm() > 0 || ngram_table_ != nullptr) {
+            const prefetch_hint_stats & hstats = remote.get_prefetch_hint_stats();
+            LLAMA_LOG_WARN(
+                "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
+                "sent_in_flight=%llu send_failed=%llu no_route=%llu "
+                "skip_dynamic=%llu skip_in_flight=%llu score_frames=%llu score_skipped=%llu\n",
+                oracle_.layers().size(),
+                (unsigned long long) hstats.n_frames,
+                (unsigned long long) hstats.n_experts,
+                (unsigned long long) hstats.n_sent_in_flight,
+                (unsigned long long) hstats.n_send_failed,
+                (unsigned long long) hstats.n_no_oracle,
+                (unsigned long long) hstats.n_skipped_dynamic,
+                (unsigned long long) hstats.n_skipped_in_flight,
+                (unsigned long long) hstats.n_score_frames,
+                (unsigned long long) hstats.n_score_skipped);
+            if (router2_pscore() != nullptr) {
+                // Cumulative since process start. admit_by_d lists d=2..K+1; admit_by_p
+                // is deciles of P (0.0-0.1 ... 0.9-1.0; only >= PMIN are nonzero).
+                std::string by_d, by_p;
+                for (int d = 2; d < 64 && d <= router2_lookahead() + 1; ++d) {
+                    by_d += (by_d.empty() ? "" : ",") + std::to_string(pscore_admitted_d_[d].load());
+                }
+                for (int i = 0; i < 10; ++i) {
+                    by_p += (by_p.empty() ? "" : ",") + std::to_string(pscore_admitted_dec_[i].load());
+                }
+                std::fprintf(stderr,
+                    "expert dispatch pscore: pmin=%.2f evaluated=%llu admit_by_d[2..]=%s admit_by_p[deciles]=%s\n",
+                    (double) router2_pmin(), (unsigned long long) pscore_evaluated_.load(),
+                    by_d.c_str(), by_p.c_str());
             }
-            for (int i = 0; i < 10; ++i) {
-                by_p += (by_p.empty() ? "" : ",") + std::to_string(pscore_admitted_dec_[i].load());
-            }
-            std::fprintf(stderr,
-                "expert dispatch pscore: pmin=%.2f evaluated=%llu admit_by_d[2..]=%s admit_by_p[deciles]=%s\n",
-                (double) router2_pmin(), (unsigned long long) pscore_evaluated_.load(),
-                by_d.c_str(), by_p.c_str());
         }
     }
 
