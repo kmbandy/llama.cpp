@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 #include "mma.cuh"
 #include "mt_gdn_r4d.cuh"
@@ -16,6 +17,8 @@ namespace mma = ggml_cuda_mma;
 // chunked kernel evaluates is <= 0 in exact arithmetic; the clamp only guards against a
 // pathological/NaN-free model producing a positive gate and overflowing f32.
 #define GGML_CUDA_GDN_EXP_CLAMP 30.0f
+
+#include <cstdint>
 
 constexpr int gdn_cols_per_warp = 4;
 
@@ -1894,8 +1897,45 @@ static void launch_gated_delta_net(
         }
         default:
             GGML_ABORT("fatal error");
-            break;
     }
+}
+
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+    };
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
@@ -1925,6 +1965,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(neq1 == nek1);
     const int64_t neqk1 = neq1;
 
+    GGML_ASSERT(neq3 > 0 && nev3 >= neq3 && nev3 % neq3 == 0);
+    GGML_ASSERT(nek3 == neq3);
     const int64_t rq3 = nev3 / neq3;
 
     const float * q_d = (const float *) src_q->data;
@@ -2298,6 +2340,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // entry for its own (see r4d_gdn_conv_prep_primed's header comment, mt_gdn_r4d.cu).
             r4d_gdn_conv_prep_release_primed(ctx.device, stream);
         }
+    } else if (!keep_rs && [&] {
+                   // upstream MMA chunked GDN (Ampere+/RDNA3.5 only; writes the final state, no K snapshots)
+                   ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                   args.state_out = state_d;
+                   return ggml_cuda_gdn_mma_launch(ctx.device, args, stream);
+               }()) {
+        // handled
     } else if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,

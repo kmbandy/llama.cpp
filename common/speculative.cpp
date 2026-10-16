@@ -1284,6 +1284,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    bool    is_lilicorr    = false;
+    int32_t lilicorr_top_k = 0;
+    size_t lilicorr_rows = 0;
+    std::vector<float> lilicorr_embd;
+    std::vector<llama_pos> lilicorr_pos;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1510,6 +1516,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             SPC_INF("DSpark prompt tail retention = %d tokens per sequence per process call\n", prefill_tail);
         }
+        char lilicorr_meta[32] = {};
+        lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
+                ? std::atoi(lilicorr_meta) : 0;
+        is_lilicorr = lilicorr_top_k > 0;
+        if (is_lilicorr) {
+            lilicorr_rows = (size_t) block_size + 1;
+            const size_t lilicorr_slots = (size_t) n_seq * lilicorr_rows;
+            lilicorr_embd.resize(lilicorr_slots * (size_t) n_embd_dec);
+            lilicorr_pos.assign(lilicorr_slots, -1);
+            // MAD-LAB: this fork drafts DFlash through llama_batch (common_batch_add), which has no
+            // per-token state slot for LiliCorr's anchor features; refuse rather than draft garbage
+            GGML_ABORT("LiliCorr draft models are not supported by this fork's DFlash path yet");
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
@@ -1679,7 +1698,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
         // (not in stochastic mode: the host needs the draft's full logits rows for q)
-        if (this->params.backend_sampling && !is_dflash2 && !sampling_stochastic) {
+        if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr && !sampling_stochastic) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1770,7 +1789,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         if (common_speculative_capture_enabled()) {
             llama_set_embeddings_layer_inp(ctx_dft, 0, true);
         }
@@ -2569,21 +2588,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 slot_conf.assign((size_t) n_block_tokens, 1.0f);
             }
 
-            if (is_dflash2) {
+            if (is_dflash2 || is_lilicorr) {
+                // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                    const float * scores = row + top_k + (size_t) predecessor * top_k;
 
                     predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + selector_top_k));
+                            std::max_element(scores, scores + top_k));
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
-                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                        for (int32_t k = 0; k < top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
                         if (1.0f / sum < params.p_min) {
@@ -4794,6 +4815,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // Leaving it 0 means "no per-seq limit beyond n_outputs_max" (llama-context
     // resolves 0 to cparams.n_outputs_max), which is the pre-sync behaviour.
     result.n_outputs_max_per_seq = 0;
+
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
 
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;

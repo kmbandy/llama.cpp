@@ -140,6 +140,7 @@ struct server_model_meta {
     server_model_placement placement;
     bool hidden = false; // hidden from GET /models, but still accept if requested
     json architecture = server_model_architecture_json(false, false, false, {"text"});
+    uint32_t n_ctx_train = 0; // trained context, read from the GGUF metadata; 0 when unknown
 
     // Parsed from the preset's `env` key, captured at placement-parse time for the same
     // reason as placement.vram_mb_override: update_args() calls unset_reserved_args(),

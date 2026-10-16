@@ -304,14 +304,19 @@ mt::InnerView llama_memory_hybrid::make_tier_view() const {
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    if (mem_attn) {
+        // the cache applies PARTIAL_ONLY itself
+        mem_attn->state_write(io, seq_id, flags);
+    } else if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // fork: the paged attn cache holds no partial state
         attn_base()->state_write(io, seq_id, flags);
     }
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    // fork: the paged attn cache holds no partial state; llama_kv_cache applies PARTIAL_ONLY itself
+    const bool read_attn = mem_attn || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
 
     if (read_attn) {
         attn_base()->state_read(io, seq_id, flags);
@@ -320,14 +325,12 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     try {
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // the attention part is already restored - undo it
-        if (read_attn) {
-            if (mem_attn) {
-                mem_attn->state_clear(seq_id);
-            } else {
-                // fork: the paged attn cache has no state_clear; dropping the sequence is the same undo
-                attn_base()->seq_rm(seq_id, -1, -1);
-            }
+        // a failed restore leaves the sequence empty in both caches
+        if (mem_attn) {
+            mem_attn->state_clear(seq_id);
+        } else if (read_attn) {
+            // fork: the paged attn cache has no state_clear; dropping the sequence is the same undo
+            attn_base()->seq_rm(seq_id, -1, -1);
         }
 
         throw;
