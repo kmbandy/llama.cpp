@@ -128,11 +128,14 @@ static int decode_splits(const R4DArgs* a) {
     if (a->splits > 0) return a->splits;
     const int tiles = (a->max_ctx + D_TILE - 1) / D_TILE;
     const int units = max(1, a->kv_heads * a->num_seqs);
-    const int raw   = 192 / units;              // CU-fill target over the non-segment grid units
+    // fork 2026-10-16: target 256 (was 192) and floor 8 (was 16), re-swept on R9700 / ROCm 10.0.0
+    // (seqs 1..8 x ctx 4k..128k x q_len 1,4): the argmin was splits*units ~= 256 at every point,
+    // e.g. 1 seq 16k 67.8 -> 51.2 us, 2 seqs 128.5 -> 92.4 us, 6 seqs 433 -> 353 us.
+    const int raw   = 256 / units;              // CU-fill target over the non-segment grid units
     int s = 128;                                // ceiling: 256 measured worse at head_dim 256
-    while (s > 16 && s > raw) s >>= 1;
+    while (s > 8 && s > raw) s >>= 1;
     const int cap = tiles / 2;                  // >= 2 tiles per segment
-    while (s > 16 && s > cap) s >>= 1;
+    while (s > 8 && s > cap) s >>= 1;
     if (s > tiles) s = tiles;
     if (s < 1) s = 1;
     return s;
