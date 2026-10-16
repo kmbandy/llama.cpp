@@ -433,6 +433,45 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = idx;
 }
 
+bool llama_memory_recurrent::rs_view_set(llama_seq_id seq_id, uint32_t rollback) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_id >= size || rollback == 0 || rollback > n_rs_seq) {
+        return false;
+    }
+
+    // a view is already active, or a pending seq_rm rollback owns rs_idx
+    if (rs_idx[seq_id] != 0) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+
+    auto & cell = cells[tail_id];
+    if (cell.seq_id.size() != 1 || cell.pos < (llama_pos) rollback) {
+        return false;
+    }
+
+    cell.pos -= (llama_pos) rollback;
+    set_rs_idx(seq_id, rollback);
+
+    return true;
+}
+
+void llama_memory_recurrent::rs_view_clear(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_id >= size || rs_idx[seq_id] == 0) {
+        return;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id >= 0) {
+        cells[tail_id].pos += (llama_pos) rs_idx[seq_id];
+    }
+
+    set_rs_idx(seq_id, 0);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

@@ -505,3 +505,10 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+// recurrent-state rollback view: serialize the state `rollback` tokens back from the
+// last token of seq_id (uses the GDN snapshot slots, needs n_rs_seq >= rollback).
+// Metadata only; the view must be cleared before the seq is used again.
+LLAMA_API bool llama_memory_rs_view_supported(llama_memory_t mem);
+LLAMA_API bool llama_memory_rs_view_set(llama_memory_t mem, llama_seq_id seq_id, uint32_t rollback);
+LLAMA_API void llama_memory_rs_view_clear(llama_memory_t mem, llama_seq_id seq_id);

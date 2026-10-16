@@ -13,6 +13,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-kv-cache-paged.h"
 #include "memory-tier/mt-tiered.h"
 #include "llama-mmap.h"
@@ -9339,6 +9340,32 @@ llama_pos llama_memory_seq_pos_min(
     }
 
     return mem->seq_pos_min(seq_id);
+}
+
+// MAD-LAB snapshot checkpoints (llama-ext.h): recurrent memory behind mem, or null.
+// Paged attention keeps its own serialized state, so it is excluded.
+static llama_memory_recurrent * llama_memory_rs_view_target(llama_memory_t mem) {
+    if (auto * mh = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return mh->is_paged_attn() ? nullptr : mh->get_mem_recr();
+    }
+
+    return dynamic_cast<llama_memory_recurrent *>(mem);
+}
+
+bool llama_memory_rs_view_supported(llama_memory_t mem) {
+    return llama_memory_rs_view_target(mem) != nullptr;
+}
+
+bool llama_memory_rs_view_set(llama_memory_t mem, llama_seq_id seq_id, uint32_t rollback) {
+    auto * mr = llama_memory_rs_view_target(mem);
+
+    return mr != nullptr && mr->rs_view_set(seq_id, rollback);
+}
+
+void llama_memory_rs_view_clear(llama_memory_t mem, llama_seq_id seq_id) {
+    if (auto * mr = llama_memory_rs_view_target(mem)) {
+        mr->rs_view_clear(seq_id);
+    }
 }
 
 llama_pos llama_memory_seq_pos_max(

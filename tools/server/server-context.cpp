@@ -8,6 +8,7 @@
 #include "server-slot-store.h"
 #include "../src/llama-model.h"
 #include "../src/llama-context.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
@@ -752,6 +753,14 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // MAD-LAB: (prompt - 4) checkpoint pending from the GDN snapshots of this slot's batch.
+    // Set in pre_decode(), consumed in run_stream_decode_loop().
+    bool snap_ckpt_pending  = false;
+    int32_t snap_ckpt_batch = 0; // tokens in the batch that must be decoded in one call
+
+    // MAD-LAB: DFlash prompt catch-up deferred until after the first token is sampled
+    bool spec_prompt_deferred = false;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -865,6 +874,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        snap_ckpt_pending = false;
+        spec_prompt_deferred = false;
 
         paged_preempt_no_progress_count    = 0;  // MAD-141
 
@@ -4868,6 +4879,39 @@ private:
     // common_context_can_seq_rm() decodes a probe batch and clears the
     // memory -- it is an init-time-only call (see server_context_impl::init()),
     // never something to run per checkpoint.
+    // MAD-LAB: DFlash is the only draft type configured
+    bool spec_dflash_only() const {
+        const auto & types = params_base.speculative.types;
+
+        return !types.empty() && std::all_of(types.begin(), types.end(),
+                [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH; });
+    }
+
+    // MAD-LAB: prompt checkpoint at (prompt end - 4), read from the GDN rollback snapshot
+    // written by the batch that decoded the whole prompt (see snap_ckpt_* in server_slot).
+    void create_snapshot_checkpoint(server_slot & slot, common_context_seq_rm_type ctx_dft_seq_rm_type) {
+        const llama_memory_t mem  = llama_get_memory(slot.ctx_tgt);
+        const llama_seq_id seq_id = slot.stream_slot_idx;
+        const int64_t n_last      = 4;
+
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id) - (llama_pos) n_last;
+
+        if (!llama_memory_rs_view_set(mem, seq_id, (uint32_t) n_last)) {
+            SLT_WRN(slot, "%s", "snapshot checkpoint skipped: no recurrent rollback view\n");
+            return;
+        }
+
+        // the view must be dropped even if the capture throws
+        struct view_guard {
+            llama_memory_t mem;
+            llama_seq_id   seq_id;
+            ~view_guard() { llama_memory_rs_view_clear(mem, seq_id); }
+        } guard { mem, seq_id };
+
+        create_checkpoint(slot, n_last, pos_min, pos_max, ctx_dft_seq_rm_type);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
                             common_context_seq_rm_type ctx_dft_seq_rm_type,
                             wp_spec_prefill_stats_state * wp_pp_stats = nullptr) {
@@ -6132,6 +6176,20 @@ private:
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
+                    // MAD-LAB: snapshot checkpoints need the whole batch in this one decode call
+                    for (server_slot * slot_ptr : stream.slots) {
+                        server_slot & slot_ckpt = *slot_ptr;
+                        if (!slot_ckpt.snap_ckpt_pending) {
+                            continue;
+                        }
+
+                        slot_ckpt.snap_ckpt_pending = false;
+
+                        if (off == 0 && n_tokens == sbatch.size() && sbatch.size() == slot_ckpt.snap_ckpt_batch) {
+                            create_snapshot_checkpoint(slot_ckpt, stream.ctx_dft_seq_rm_type);
+                        }
+                    }
+
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(stream.ctx_tgt);
                 } else {
@@ -7145,18 +7203,21 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    // A context checkpoint exists to be RESTORED: either by a later
-                    // request reusing this prompt, or by a speculative rollback.
-                    // A task that caches nothing and has no speculator can never
-                    // reach either path, so every checkpoint written for it is
-                    // dead weight -- and on a recurrent model that weight is real:
-                    // 149.626 MiB of state serialized per checkpoint on
-                    // Qwen3.8-27B, twice per request, plus the chunk boundary it
-                    // forces. Measured on the 8404-token warm-server arm: 1113 ->
-                    // 1203 t/s prefill (+8.1%) with checkpointing off, and
-                    // llama_decode calls per request falling 3 -> 2.
-                    const bool checkpoints_reachable =
-                        slot.task->params.cache_prompt || slot.can_speculate();
+                    // A prompt context checkpoint exists to be RESTORED by a later request
+                    // that reuses this slot's prompt tokens, and that restore only runs for
+                    // cache_prompt=true (a cache_prompt=false task resets n_past to 0 at
+                    // the reuse step, and the speculative rollback restores slot.spec_ckpt,
+                    // a separate per-draft-cycle snapshot, never these checkpoints).
+                    // A task with cache_prompt=false therefore writes checkpoints that
+                    // nothing in its own request can use, and on a recurrent model that
+                    // weight is real: 149.626 MiB of state serialized per checkpoint on
+                    // Qwen3.8-27B, twice per request, plus the chunk boundary it forces.
+                    // Measured on the 8404-token warm-server arm: 1113 -> 1203 t/s prefill
+                    // (+8.1%) with checkpointing off, and llama_decode calls per request
+                    // falling 3 -> 2. The checkpoint break is what splits the final 4
+                    // prompt tokens into their own llama_decode, so skipping it here also
+                    // removes that second target forward pass from TTFT.
+                    const bool checkpoints_reachable = slot.task->params.cache_prompt;
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0 && checkpoints_reachable;
 
@@ -7295,6 +7356,26 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // MAD-LAB: take the (prompt - 4) checkpoint from the GDN rollback snapshots
+                    // of the batch that decodes the rest of the prompt, so it is not split.
+                    bool snap_eligible = false;
+                    if (do_checkpoint && !has_mtmd && slot.can_speculate() && n_swa == 0 &&
+                            llama_n_rs_seq(ctx_tgt) >= 5 &&
+                            ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                            ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                            slot.task->n_tokens_shared == 0 &&
+                            llama_memory_rs_view_supported(llama_get_memory(ctx_tgt))) {
+                        const int64_t n_remaining = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
+
+                        size_t n_active = 0;
+                        for (const server_slot * other_ptr : slots) {
+                            n_active += other_ptr->is_processing() ? 1 : 0;
+                        }
+
+                        snap_eligible = spec_dflash_only() && n_active == 1 &&
+                            n_remaining >= 5 && n_remaining <= n_batch_slot_cap;
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot_cap) {
                         // get next token to process
@@ -7376,6 +7457,9 @@ private:
                             bool should_break = false;
                             for (int io = 0; io < n_checkpoint_offsets; ++io) {
                                 const int offset = checkpoint_offsets[io];
+                                if (snap_eligible && offset == 4) {
+                                    continue; // MAD-LAB: taken from the snapshot slots, see below
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -7477,6 +7561,12 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, ctx_dft_seq_rm_type,
                             wp_spec_prefill_stats_enabled() ? &stream.wp_pp_stats : nullptr);
+                    }
+
+                    // MAD-LAB: the (prompt - 4) checkpoint is taken after this batch's decode
+                    if (snap_eligible && slot.state == SLOT_STATE_DONE_PROMPT && n_tokens_cur >= 5) {
+                        slot.snap_ckpt_pending = true;
+                        slot.snap_ckpt_batch   = (int32_t) n_tokens_cur;
                     }
                 }
 
@@ -7895,7 +7985,27 @@ private:
         }
         const int64_t t_proc0 = spec_phase ? ggml_time_us() : 0;
         const auto wp_pp_proc_t0 = wp_pp ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
-        if (spec) {
+        // MAD-LAB: DFlash catch-up of a prompt completed by this single call runs after the first token
+        // is sampled (post_decode). Only one active slot, DFlash-only, whole batch in this call.
+        server_slot * spec_defer_slot = nullptr;
+        if (spec && off == 0 && off + batch_view.n_tokens == batch.size() && spec_dflash_only() &&
+                !(segment_client && segment_client->has_remote_segments())) {
+            size_t n_active = 0;
+            server_slot * only = nullptr;
+            for (server_slot * other : slots) {
+                if (other->is_processing()) {
+                    ++n_active;
+                    only = other;
+                }
+            }
+            if (n_active == 1 && only->state == SLOT_STATE_DONE_PROMPT && only->can_speculate() &&
+                    only->task->type == SERVER_TASK_TYPE_COMPLETION) {
+                spec_defer_slot = only;
+                spec_defer_slot->spec_prompt_deferred = true;
+            }
+        }
+
+        if (spec && !spec_defer_slot) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec, batch_view); // MAD-LAB: spec is a raw ptr
@@ -7911,7 +8021,7 @@ private:
         if (spec_phase && spec) {
             SRV_INF("SPECPHASE process_us=%" PRId64 "\n", ggml_time_us() - t_proc0);
         }
-        if (wp_pp && spec) {
+        if (wp_pp && spec && !spec_defer_slot) {
             // buckets a/b/c: pulled from the impl's last-call snapshot (see
             // common_speculative_wp_prefill_last_call_stats() in
             // common/speculative.cpp). bucket d3: whatever this
@@ -8003,6 +8113,28 @@ private:
                 }
             }
         });
+
+        // MAD-LAB: DFlash prompt catch-up deferred from decode(), then the begin() it was ordered before
+        auto run_deferred_spec_prompt = [&](server_slot & slot) {
+            if (!slot.spec_prompt_deferred) {
+                return;
+            }
+
+            slot.spec_prompt_deferred = false;
+
+            bool ok = true;
+            queue_tasks.yield_to_queue([&]() {
+                ok = common_speculative_process(spec, batch_view); // MAD-LAB: spec is a raw ptr
+            });
+            if (!ok) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+                throw std::runtime_error("failed to process speculative batch");
+            }
+
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate()) {
+                common_speculative_begin(spec, slot.stream_slot_idx, slot.prompt.tokens.get_text_tokens()); // MAD-LAB: spec is a raw ptr
+            }
+        };
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -8107,7 +8239,7 @@ private:
                     st.active = false;
                 }
 
-                if (slot.can_speculate()) {
+                if (slot.can_speculate() && !slot.spec_prompt_deferred) {
                     common_speculative_begin(spec, slot.stream_slot_idx, slot.prompt.tokens.get_text_tokens()); // MAD-LAB: spec is a raw ptr
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -8153,7 +8285,11 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            // MAD-LAB: the first token is out before the deferred DFlash prompt catch-up runs
+            const bool keep_going = process_token(result, slot);
+            run_deferred_spec_prompt(slot);
+
+            if (!keep_going) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -8163,6 +8299,10 @@ private:
             }
 
             slot.print_timings_tg();
+        });
+
+        iterate(slots, [&](server_slot & slot) {
+            run_deferred_spec_prompt(slot);
         });
 
         // speculative decoding - main model sample and accept

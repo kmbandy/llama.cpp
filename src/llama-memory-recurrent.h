@@ -98,6 +98,10 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // serialize the state `rollback` tokens back (snapshot slot) without touching the live state
+    bool rs_view_set(llama_seq_id seq_id, uint32_t rollback);
+    void rs_view_clear(llama_seq_id seq_id);
+
     // computed before each graph build
     uint32_t n = 0;
 
