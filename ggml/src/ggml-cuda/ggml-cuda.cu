@@ -138,6 +138,12 @@ static inline bool rdna4_ml8_qrot_silu_mul_split_tiled(
     uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/) {
     return false;
 }
+static inline bool rdna4_ml8_qrot_silu_mul_split_tiled_bf16(
+    const void * /*gate*/, const void * /*up*/, const void * /*h_a*/,
+    int /*rot_kind*/, int /*a_dim*/, int /*b_dim*/, int /*M*/, int /*N*/,
+    uint8_t * /*A_tiled*/, float * /*a_scale*/, cudaStream_t /*stream*/) {
+    return false;
+}
 static inline bool rdna4_ml8_qrot_gated_norm_tiled(
     const float * /*o*/, const float * /*z*/, size_t /*z_nb1*/, size_t /*z_nb2*/,
     const float * /*norm_w*/, float /*norm_eps*/, int /*head_dim*/, int /*n_heads*/,
@@ -8934,10 +8940,15 @@ static int ggml_cuda_try_ml8_radiance_pattern_b_split(
             "(likely this layer's FFN weights are not ML8-quantized)");
         return 0;
     }
-    if (glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+    // gate/up/GLU are all F32 (default) or all BF16 (LLAMA_ACT_BF16 prefill:
+    // build_layer_ffn's ffn_up/ffn_gate GEMMs and swiglu emit bf16). Mixed
+    // types decline. The BF16 case dispatches the bf16-input split kernel.
+    const bool bsplit_bf16 = glu->type == GGML_TYPE_BF16 && gate->type == GGML_TYPE_BF16 && up->type == GGML_TYPE_BF16;
+    const bool bsplit_f32  = glu->type == GGML_TYPE_F32  && gate->type == GGML_TYPE_F32  && up->type == GGML_TYPE_F32;
+    if ((!bsplit_bf16 && !bsplit_f32) ||
         !ggml_is_contiguous(glu) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(up)) {
         ml8_4_radiance_fuse_log_once("decline-bsplit-types",
-            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "'): non-f32/non-contiguous gate/up/GLU");
+            "pattern B(split) decline ('" + std::string(ml8_radiance_tname(glu)) + "'): gate/up/GLU not all-f32 or all-bf16, or non-contiguous");
         return 0;
     }
 
@@ -9027,9 +9038,13 @@ static int ggml_cuda_try_ml8_radiance_pattern_b_split(
     uint8_t * a_tiled = qrot_direct ? (uint8_t *) qrot->data : (uint8_t *) g_ml8_radiance_scratch_slots[slot].ptr;
     float   * a_scale = (float *) (a_tiled + (size_t) M * (size_t) N);
 
-    const bool ok = rdna4_ml8_qrot_silu_mul_split_tiled(
-        (const float *) gate->data, (const float *) up->data, h_a ? h_a->data : nullptr, kind, a_dim, b_dim,
-        M, N, a_tiled, a_scale, cuda_ctx->stream());
+    const bool ok = bsplit_bf16
+        ? rdna4_ml8_qrot_silu_mul_split_tiled_bf16(
+              gate->data, up->data, h_a ? h_a->data : nullptr, kind, a_dim, b_dim,
+              M, N, a_tiled, a_scale, cuda_ctx->stream())
+        : rdna4_ml8_qrot_silu_mul_split_tiled(
+              (const float *) gate->data, (const float *) up->data, h_a ? h_a->data : nullptr, kind, a_dim, b_dim,
+              M, N, a_tiled, a_scale, cuda_ctx->stream());
     if (!ok) {
         if (slot >= 0) ml8_radiance_release_scratch_slot(slot);
         ml8_4_radiance_fuse_log_once("decline-bsplit-kernel",
@@ -12279,6 +12294,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
         case GGML_OP_GLU:
+            // The GLU kernels (unary.cu ggml_cuda_op_unary_gated) require
+            // dst, src0 and src1 to share one element type (F32/F16/BF16).
+            // Decline mixed types so they fall back instead of aborting.
+            if (op->type != op->src[0]->type ||
+                (op->src[1] != nullptr && op->src[1]->type != op->src[0]->type)) {
+                return false;
+            }
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
@@ -12428,7 +12450,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // M<=32 decode split-K kernel writes fp32 only.
                 if (op->type != GGML_TYPE_F32 &&
                     !(op->type == GGML_TYPE_BF16 &&
-                      ggml_cuda_ml8_4_mul_mat_supports_bf16_out(w->ne[1], x->ne[1]))) {
+                      ggml_cuda_ml8_4_mul_mat_supports_bf16_out(w->ne[1], x->ne[1] * x->ne[2] * x->ne[3]))) {
                     return false;
                 }
                 if (w->ne[0] % 64 != 0)               return false;

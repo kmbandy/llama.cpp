@@ -118,6 +118,12 @@ static inline bool rdna4_gemm_ml84_radiance(
     float * /*C_f32*/, int /*N*/, int /*K*/, hipStream_t /*stream*/) {
     return false;
 }
+static inline bool rdna4_gemm_ml84_radiance_bf16(
+    int /*M*/, const void * /*A_fp8*/, const float * /*a_scale*/, const uint8_t * /*B_nib*/,
+    const uint8_t * /*lut*/, const float * /*b_scale_g*/, const float * /*colscale*/,
+    uint16_t * /*C_bf16*/, int /*N*/, int /*K*/, hipStream_t /*stream*/) {
+    return false;
+}
 #endif
 
 // radiance_quant.h (also not this file's to create/edit): the bandwidth-
@@ -3511,9 +3517,15 @@ static bool ml8_4_radiance_gemm_tail(
     ggml_tensor *        dst,
     cudaStream_t         stream,
     const char *         log_tag) {
-    const bool gemm_ok = rdna4_gemm_ml84_radiance(
-        (int) M, a_tiled, a_scale, b_packed,
-        lut, b_scale_g, radiance_colscale, (float *) dst->data, N, K, stream);
+    // dst F32 -> fp32 epilogue; dst BF16 (LLAMA_ACT_BF16) -> the same kernel
+    // with a bf16 epilogue (RNE of the identical fp32 value, bitwise).
+    const bool gemm_ok = dst->type == GGML_TYPE_BF16
+        ? rdna4_gemm_ml84_radiance_bf16(
+              (int) M, a_tiled, a_scale, b_packed,
+              lut, b_scale_g, radiance_colscale, (uint16_t *) dst->data, N, K, stream)
+        : rdna4_gemm_ml84_radiance(
+              (int) M, a_tiled, a_scale, b_packed,
+              lut, b_scale_g, radiance_colscale, (float *) dst->data, N, K, stream);
     if (!gemm_ok) {
         return false;
     }
@@ -3793,8 +3805,8 @@ static void ml8_mul_mat_core(
             // treats a_fp8_ptr as row-major (and the retile below would
             // scramble an already-tiled buffer). Chain 228: greedy garbage
             // until this skip-retile landed.
-            GGML_ASSERT(dst->type == GGML_TYPE_F32 &&
-                "ML8_QROT_FLAG_TILED is only produced for the fp32 prefill-radiance path");
+            GGML_ASSERT((dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16) &&
+                "ML8_QROT_FLAG_TILED is only produced for the f32/bf16 prefill-radiance path");
             GGML_ASSERT(M > 32 && (M % 16) == 0 &&
                 "ML8_QROT_FLAG_TILED is only set when M>32 && M%16==0");
             const int prefill_radiance_mode = ggml_cuda_ml8_4_prefill_radiance_mode();
@@ -3978,10 +3990,10 @@ static void ml8_mul_mat_core(
         // expand+gemm_fp8_trfeed. 1 = build the per-(group,column) T table
         // and colscale from pool scratch on every call; 2 = build them once
         // per weight and cache (ml8_4_radiance_cache_get_or_build above),
-        // amortizing the prep kernel across calls. Only wired for fp32 dst
-        // -- like MT_ML8_4_PREFILL_FUSED above, the ported GEMM has no bf16
-        // epilogue, so a BF16 dst (LLAMA_ACT_BF16) falls through to the
-        // existing expand+frozen path, which does. Deliberately independent
+        // amortizing the prep kernel across calls. fp32 dst uses the fp32
+        // epilogue; BF16 dst (LLAMA_ACT_BF16) uses the same kernel with a
+        // bf16 epilogue (rdna4_gemm_ml84_radiance_bf16, bitwise rne of the
+        // fp32 value) instead of falling through to expand+frozen. Deliberately independent
         // of MT_ML8_4_EXPAND_CACHE: this path never reads that cache's
         // expanded-fp8 B_shuf (it dequantizes B on the fly via T/colscale,
         // same as the raw repack the frozen path's own expander reads from).
@@ -3992,7 +4004,7 @@ static void ml8_mul_mat_core(
             const char * e = std::getenv("MT_ML8_4_PREFILL_RADIANCE");
             return e ? std::atoi(e) : 0;
         }();
-        if (prefill_radiance_mode != 0 && dst->type == GGML_TYPE_F32) {
+        if (prefill_radiance_mode != 0 && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16)) {
             const float   * radiance_colscale = nullptr;
             ggml_cuda_pool_alloc<float>   radiance_colscale_scratch(ctx.pool());
             bool radiance_table_ready = false;

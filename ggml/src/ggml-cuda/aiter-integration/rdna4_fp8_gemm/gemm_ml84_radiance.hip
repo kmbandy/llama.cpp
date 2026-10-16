@@ -174,17 +174,38 @@ static __device__ __forceinline__ void radp_lds_barrier() {
 // that function is the one validated correct on hardware by
 // gemm_ml84_decode_v2.hip (v2_orcl ~1e-5..2e-3 across every shape).
 
+// Output store for the atiled epilogue. OutT=float stores the value unchanged
+// (codegen identical to the pre-template kernel). OutT=uint16_t stores the
+// bf16 bit pattern: round-to-nearest-even of the SAME fp32 value, so
+// bf16_out == rne(fp32_out) bitwise. NaN keeps the sign and sets the quiet bit.
+template <typename OutT>
+static __device__ __forceinline__ void radp_store_out(OutT* p, float v) {
+    if constexpr (sizeof(OutT) == 4) {
+        *p = v;
+    } else {
+        uint32_t u = __builtin_bit_cast(uint32_t, v);
+        uint16_t h;
+        if ((u & 0x7fffffffu) > 0x7f800000u) {
+            h = (uint16_t)((u >> 16) | 0x0040u);
+        } else {
+            u += 0x7fffu + ((u >> 16) & 1u);
+            h = (uint16_t)(u >> 16);
+        }
+        *p = h;
+    }
+}
+
 // ── radiance_mxfp4_fp8.hip:530-758, ported. Template drops WPERM (only the
 // true instantiation is ported, see header comment above) and keeps LBK so
 // the TN=2/TN=4 tile-size dependent K-slab width (128 vs 64) is preserved
 // verbatim from the original's RAD_AT macro (radiance_mxfp4_fp8.hip:1680:
 // `(TN_ == 2 ? 128 : 64)`). ──────────────────────────────────────────────
-template <int TN, int LBK>
+template <int TN, int LBK, typename OutT>
 __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ B_nib,
     const unsigned char *__restrict__ lut, const float *__restrict__ b_scale_g,
     const float *__restrict__ colscale,
-    const float *__restrict__ As, float *__restrict__ C, int M, int N, int K,
+    const float *__restrict__ As, OutT *__restrict__ C, int M, int N, int K,
     int pb1, int pb2, long astride) {
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + RADP_PAD;
@@ -542,7 +563,7 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
     rf[j] = (n < N) ? colscale[n] : 0.f;
   }
   {
-    float *__restrict__ Cb = C + (size_t)(m0 + wm * RADP_TM * 16) * N;
+    OutT *__restrict__ Cb = C + (size_t)(m0 + wm * RADP_TM * 16) * N;
     const float *__restrict__ Asb = As + m0 + wm * RADP_TM * 16;
     const bool full = (m0 + wm * RADP_TM * 16 + (RADP_TM - 1) * 16 + kb8 + 7 < M) &&
                       (n0 + wn * TN * 16 + (TN - 1) * 16 + col < N);
@@ -555,7 +576,7 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
           for (int e = 0; e < 8; ++e) {
             const int r = i * 16 + kb8 + e;
             const int n = n0 + wn * TN * 16 + j * 16 + col;
-            Cb[r * N + n] = acc[i][j][e] * rf[j] * Asb[r];
+            radp_store_out<OutT>(Cb + (size_t)r * N + n, acc[i][j][e] * rf[j] * Asb[r]);
           }
       return;
     }
@@ -568,7 +589,7 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
       for (int e = 0; e < 8; ++e) {
         const int m = m0 + wm * RADP_TM * 16 + i * 16 + kb8 + e;
         const int n = n0 + wn * TN * 16 + j * 16 + col;
-        if (m < M && n < N) C[(size_t)m * N + n] = acc[i][j][e] * rf[j] * As[m];
+        if (m < M && n < N) radp_store_out<OutT>(C + (size_t)m * N + n, acc[i][j][e] * rf[j] * As[m]);
       }
 }
 
@@ -577,12 +598,12 @@ __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
 // host launcher below still resolves the template name. The launcher can never
 // run on a non-gfx1201 device -- ml8.cu gates the radiance path on gfx1201 --
 // so no body is ever needed here. Same convention as trfeed_kernels.h.
-template <int TN, int LBK>
+template <int TN, int LBK, typename OutT>
 __global__ __launch_bounds__(RADP_NTHREADS) void radp_gemm_ml84_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ B_nib,
     const unsigned char *__restrict__ lut, const float *__restrict__ b_scale_g,
     const float *__restrict__ colscale,
-    const float *__restrict__ As, float *__restrict__ C, int M, int N, int K,
+    const float *__restrict__ As, OutT *__restrict__ C, int M, int N, int K,
     int pb1, int pb2, long astride);
 #endif   // __gfx1201__ || host pass
 
@@ -697,9 +718,10 @@ void rdna4_ml84_radiance_prep_host(const uint8_t* lut, const float* b_scale_g,
 // verbatim shape (K%128 check, tn4_min_m env, grid/block math), B/scale
 // arguments swapped for T/colscale/B_nib per the format change.
 // ─────────────────────────────────────────────────────────────────────────
-bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
-                               const uint8_t* lut, const float* b_scale_g, const float* colscale, float* C_f32,
-                               int N, int K, hipStream_t stream) {
+template <typename OutT>
+static bool radp_launch_ml84_atiled(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
+                                    const uint8_t* lut, const float* b_scale_g, const float* colscale, OutT* C,
+                                    int N, int K, hipStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0) return false;
     if (K % 128) return false;          // radiance_mxfp4_fp8.hip:1663, "tiled A needs K % 128 == 0"
     if (K % QK_ML8) return false;       // group granularity
@@ -713,13 +735,26 @@ bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, co
     if (M >= tn4_min_m && N >= RADP_BNF_OF(4)) {
         constexpr int B_ = RADP_BNF_OF(4);
         const dim3 grid((N + B_ - 1) / B_, (M + RADP_BMF - 1) / RADP_BMF);
-        hipLaunchKernelGGL((radp_gemm_ml84_atiled<4, 64>), grid, block, 0, stream,
-                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
+        hipLaunchKernelGGL((radp_gemm_ml84_atiled<4, 64, OutT>), grid, block, 0, stream,
+                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C, M, N, K, 1 << 30, 1 << 30, 0L);
     } else {
         constexpr int B_ = RADP_BNF_OF(2);
         const dim3 grid((N + B_ - 1) / B_, (M + RADP_BMF - 1) / RADP_BMF);
-        hipLaunchKernelGGL((radp_gemm_ml84_atiled<2, 128>), grid, block, 0, stream,
-                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C_f32, M, N, K, 1 << 30, 1 << 30, 0L);
+        hipLaunchKernelGGL((radp_gemm_ml84_atiled<2, 128, OutT>), grid, block, 0, stream,
+                            AT, B_nib, lut, b_scale_g, colscale, a_scale, C, M, N, K, 1 << 30, 1 << 30, 0L);
     }
     return hipGetLastError() == hipSuccess;
+}
+
+bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
+                               const uint8_t* lut, const float* b_scale_g, const float* colscale, float* C_f32,
+                               int N, int K, hipStream_t stream) {
+    return radp_launch_ml84_atiled<float>(M, A_fp8, a_scale, B_nib, lut, b_scale_g, colscale, C_f32, N, K, stream);
+}
+
+// Same kernel, bf16 epilogue: C_bf16[m][n] = rne_bf16(fp32 value the f32 entry point stores).
+bool rdna4_gemm_ml84_radiance_bf16(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
+                                    const uint8_t* lut, const float* b_scale_g, const float* colscale, uint16_t* C_bf16,
+                                    int N, int K, hipStream_t stream) {
+    return radp_launch_ml84_atiled<uint16_t>(M, A_fp8, a_scale, B_nib, lut, b_scale_g, colscale, C_bf16, N, K, stream);
 }

@@ -151,6 +151,14 @@ bool rdna4_gemm_ml84_radiance(int M, const void* A_fp8, const float* a_scale, co
                                const uint8_t* lut, const float* b_scale_g, const float* colscale, float* C_f32,
                                int N, int K, hipStream_t stream);
 
+// bf16-output variant of rdna4_gemm_ml84_radiance (same kernel, same
+// accumulation). C_bf16[m*N+n] = round-to-nearest-even bf16 of the exact fp32
+// value rdna4_gemm_ml84_radiance would store there (bitwise). Same decline
+// rules and return convention as rdna4_gemm_ml84_radiance.
+bool rdna4_gemm_ml84_radiance_bf16(int M, const void* A_fp8, const float* a_scale, const uint8_t* B_nib,
+                                    const uint8_t* lut, const float* b_scale_g, const float* colscale, uint16_t* C_bf16,
+                                    int N, int K, hipStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

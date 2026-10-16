@@ -12625,7 +12625,11 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     GGML_ASSERT(w->type   == GGML_TYPE_ML8_4);
     GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_I8);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // LLAMA_ACT_BF16 safety net: dst may be bf16 (f32 accumulate, one RNE
+    // round on store). The CUDA/HIP backend only claims bf16 dst for the
+    // RDNA4 prefill tile; any other placement lands here and must stay correct
+    // (slow, not fatal).
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(ggml_is_contiguous(x));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
@@ -12657,7 +12661,9 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
     const uint8_t     * lut_fp8  = (const uint8_t     *) lut->data + (size_t) lut_group_off * 16;
     const float       * x_data   = x_prequant ? NULL : (const float *) x->data;
-    float             * y_data   = (float             *) dst->data;
+    const bool          y_bf16   = dst->type == GGML_TYPE_BF16;
+    float             * y_data   = y_bf16 ? NULL : (float *) dst->data;
+    ggml_bf16_t       * y_bf16_p = y_bf16 ? (ggml_bf16_t *) dst->data : NULL;
 
     // Pre-quantized per-row layout base pointers (see doc comment above);
     // unused when !x_prequant.
@@ -12713,7 +12719,11 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
             for (int64_t k = 0; k < K; k++) {
                 sum += w_row_fp32[k] * x_col[k];
             }
-            y_data[m * N + n] = sum;
+            if (y_bf16) {
+                y_bf16_p[m * N + n] = GGML_FP32_TO_BF16(sum);
+            } else {
+                y_data[m * N + n] = sum;
+            }
         }
     }
 

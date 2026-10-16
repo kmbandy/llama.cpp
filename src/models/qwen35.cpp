@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include "ggml-ml8.h"
 
@@ -782,7 +783,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     const auto & layer = model.layers[il];
 
     // LLAMA_ACT_BF16 (2026-09-18 phase 2, read once): when set AND this is a
-    // prefill ubatch (n_tokens > 32 -- the same threshold
+    // prefill ubatch (FFN rows > 32 -- the same threshold
     // ggml_cuda_ml8_4_mul_mat_supports_bf16_out in ml8.cu gates the
     // RDNA4_TRFEED bf16-dst GEMM path on, since the M_pad==32 decode kernel
     // has no bf16 epilogue), run the ffn_up/ffn_gate GEMM outputs and the
@@ -798,14 +799,31 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // between ffn_up/ffn_gate and ffn_down run in bf16. Extending bf16
     // through the rest of the graph (build_norm's RMS_NORM+MUL, Qcur/Kcur/
     // Vcur, the residual adds) was not completed in this pass; see the report.
+    // Default ON since 2026-10-16 (R9700, Qwen3.8-27B ml8-4: 16k prefill
+    // 2700 -> 2765 t/s, NLL 2.5276 -> 2.5287 over 32 x 119 tokens);
+    // LLAMA_ACT_BF16=0 keeps the FFN intermediates f32.
     static const bool act_bf16_env = [] {
         const char * e = std::getenv("LLAMA_ACT_BF16");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
+        return e == nullptr || (e[0] != '\0' && e[0] != '0');
     }();
-    const bool use_bf16_ffn = act_bf16_env && n_tokens > 32 &&
+    // The gate must mirror ggml_cuda_ml8_4_mul_mat_supports_bf16_out (ml8.cu) and
+    // the CUDA supports_op for ML8_MUL_MAT with bf16 dst, or the node lands on CPU:
+    //  - M is the ROW COUNT OF THIS FFN INPUT, not n_tokens. On the last layer
+    //    cur is cropped to the output rows (ggml_get_rows(inp_out_ids) before
+    //    build_layer_ffn), so M can be <= 32 while n_tokens > 32.
+    //  - bf16 dst needs the RDNA4_TRFEED layout, i.e. N % 128 == 0 and
+    //    MT_ML8_4_LAYOUT != "triton" (the backend treats only that exact value as triton).
+    const int64_t n_ffn_rows = cur->ne[1] * cur->ne[2] * cur->ne[3];
+    static const bool ml8_layout_triton = [] {
+        const char * e = std::getenv("MT_ML8_4_LAYOUT");
+        return e != nullptr && std::strcmp(e, "triton") == 0;
+    }();
+    const bool use_bf16_ffn = act_bf16_env && n_ffn_rows > 32 && !ml8_layout_triton &&
         layer.ffn_up->type   == GGML_TYPE_ML8_4 &&
         layer.ffn_gate->type == GGML_TYPE_ML8_4 &&
         layer.ffn_down->type == GGML_TYPE_ML8_4 &&
+        layer.ffn_up->ne[1]   % 128 == 0 &&
+        layer.ffn_gate->ne[1] % 128 == 0 &&
         !layer.ffn_up_s && !layer.ffn_gate_s && !layer.ffn_down_s;
 
     if (use_bf16_ffn) {
