@@ -384,7 +384,7 @@ void ggml_vk_host_free(void * ptr) {
     for (auto & view : entry.views) {
         ggml_vk_destroy_buffer(view);
     }
-    if (vk_instance.multi_device) {
+    if (vk_instance.multi_device && !entry.external) {
         portable_aligned_free(entry.base);
     }
 }

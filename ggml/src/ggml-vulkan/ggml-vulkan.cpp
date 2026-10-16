@@ -6430,9 +6430,20 @@ void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t s
     if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
         return nullptr;
     }
-    // Registered against the POOL's device, not vk_instance.devices[0], so
-    // ggml_vk_host_get finds it when staging into this pool.
-    return ggml_vk_host_malloc(buffer_ctx->dev_buffer->device, size);
+    // pinned host memory is shared across devices now; make sure the POOL's device can
+    // see it (ggml_vk_host_get imports it on demand) so staging into this pool is direct
+    void * ptr = ggml_vk_host_malloc(size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    vk_buffer view;
+    size_t    view_offset = 0;
+    ggml_vk_host_get(buffer_ctx->dev_buffer->device, ptr, view, view_offset);
+    if (view == nullptr) {
+        ggml_vk_host_free(ptr);
+        return nullptr;
+    }
+    return ptr;
 }
 
 bool ggml_backend_vk_wp_host_register(
@@ -6483,15 +6494,20 @@ bool ggml_backend_vk_wp_host_register(
         return false;
     }
 
-    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
-    for (const auto & entry : device->pinned_memory) {
-        const uintptr_t registered_begin = (uintptr_t) std::get<0>(entry);
-        const uintptr_t registered_end = registered_begin + std::get<1>(entry);
+    std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+    for (const auto & entry : vk_instance.host_allocations) {
+        const uintptr_t registered_begin = (uintptr_t) entry.base;
+        const uintptr_t registered_end = registered_begin + entry.size;
         if (begin < registered_end && registered_begin < end) {
             return false;
         }
     }
-    device->pinned_memory.push_back(std::make_tuple(ptr, size, std::move(imported)));
+    vk_host_allocation entry;
+    entry.base               = ptr;
+    entry.size               = size;
+    entry.external           = true;
+    entry.views[device->idx] = std::move(imported);
+    vk_instance.host_allocations.push_back(std::move(entry));
     return true;
 }
 
@@ -6504,7 +6520,7 @@ void ggml_backend_vk_wp_host_unregister(
     if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
         return;
     }
-    ggml_vk_host_free(buffer_ctx->dev_buffer->device, ptr);
+    ggml_vk_host_free(ptr);
 }
 
 bool ggml_backend_vk_wp_read(ggml_backend_buffer_t pool_buffer,
@@ -6533,7 +6549,7 @@ void ggml_backend_vk_wp_host_free(ggml_backend_buffer_t pool_buffer, void * ptr)
     if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
         return;
     }
-    ggml_vk_host_free(buffer_ctx->dev_buffer->device, ptr);
+    ggml_vk_host_free(ptr);
 }
 
 // Weight-paging consumption bridge. Mirrors the CUDA backend's

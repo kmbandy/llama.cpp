@@ -1450,6 +1450,7 @@ struct vk_host_allocation {
     void *    base = nullptr;
     size_t    size = 0;
     vk_buffer views[GGML_VK_MAX_DEVICES];  // indexed by device->idx; null = not (yet) mapped here
+    bool      external = false;            // fork (weight paging): caller-owned memory registered for import, never freed here
 };
 
 struct vk_instance_t {
