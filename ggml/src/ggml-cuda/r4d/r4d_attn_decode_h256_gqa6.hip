@@ -297,20 +297,32 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
         }
     };
 
+    // A tile's NB entries are read whole, and when a tile spans several blocks the last one can run
+    // past the sequence's last block -- past the end of its row, and on the last row past the end
+    // of the table. Every key is clamped to ctx - 1 before it picks an entry, so no entry past
+    // `lastb` is ever used and clamping the index there changes no value that is. Only a window
+    // that reaches past `lastb` takes the clamped form, so every other tile keeps its one wide
+    // scalar load; at one block a tile no window can reach past it and the test folds away.
+    // (block-table clamp ported verbatim from libr4d 0.5.0, radiance b068190)
+    const int lastb = (ctx - 1) / BS;
+    auto load_bt = [&](int t0, int* out) {
+        if (NB > 1 && t0 + NB - 1 > lastb) {
+            #pragma unroll
+            for (int i = 0; i < NB; ++i) out[i] = bt[min(t0 + i, lastb)];
+        } else {
+            #pragma unroll
+            for (int i = 0; i < NB; ++i) out[i] = bt[t0 + i];
+        }
+    };
     int blk[NB];
-    if (BTS) {
-        #pragma unroll
-        for (int i = 0; i < NB; ++i) blk[i] = bt[t_lo * NB + i];
-    }
+    if (BTS) load_bt(t_lo * NB, blk);
     if (GPREV) fetchV(t_lo * TILE, blk);
 
     for (int ti = t_lo; ti < t_hi; ++ti) {
         const int k0 = ti * TILE;
         int blkn[NB];
         if (BTS && ti + 1 < t_hi) {
-            const int tb = (ti + 1) * NB;
-            #pragma unroll
-            for (int i = 0; i < NB; ++i) blkn[i] = bt[tb + i];
+            load_bt((ti + 1) * NB, blkn);
         }
         if (LDSB) lds_barrier(); else __syncthreads();
 
