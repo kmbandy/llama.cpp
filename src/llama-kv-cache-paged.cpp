@@ -2387,6 +2387,19 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 for (uint32_t il = 0; il < layers_.size(); ++il) {
                     const auto & layer = layers_[il];
                     if (!layer.k) continue;
+                    if (!ggml_backend_buffer_is_meta(layer.k->buffer)) {
+                        // Plain arena: block `physical` is the contiguous range
+                        // [physical * bytes_per_block, +bytes_per_block), the same bytes
+                        // ggml_backend_meta_tensor_get_block() copies for a non-meta tensor.
+                        // Issuing it through write_tensor() instead (a) lets the WP_CKPT_ASYNC
+                        // capture queue it as an async D2H into pinned staging rather than a
+                        // blocking per-block copy, and (b) makes the size-only pass of
+                        // llama_state_seq_get_size() (dummy io) copy nothing. Meta-split arenas
+                        // keep the block-io path: their per-device slices are not contiguous.
+                        io.write_tensor(layer.k, (size_t) physical * k_bytes_per_block_, k_bytes_per_block_);
+                        io.write_tensor(layer.v, (size_t) physical * v_bytes_per_block_, v_bytes_per_block_);
+                        continue;
+                    }
                     ggml_backend_meta_tensor_get_block(layer.k, kbuf.data(), physical, n_blocks_total_);
                     ggml_backend_meta_tensor_get_block(layer.v, vbuf.data(), physical, n_blocks_total_);
                     io.write(kbuf.data(), k_bytes_per_block_);
