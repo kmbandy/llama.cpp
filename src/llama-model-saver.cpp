@@ -543,6 +543,11 @@ void llama_model_saver::add_tensors_from_model() {
             if (tensor == nullptr || !seen.insert(tensor).second) {
                 continue;
             }
+            // fork: tensors derived at load time (ssm_a_log, ssm_alpha/beta F16) are not part of the GGUF
+            if (tensor->buffer != nullptr &&
+                    (tensor->buffer == model->ssm_a_log_buf || tensor->buffer == model->ssm_ab_f16_buf)) {
+                continue;
+            }
             add_tensor(tensor);
         }
     }
