@@ -3684,14 +3684,16 @@ static void ml8_mul_mat_core(
             a_scale_ptr = scale_base;
         } else {
 #if ML8_4_DECODE_V2_AVAILABLE
-            // MT_ML8_4_DECODE_V2_NOPAD=1 (with MT_ML8_4_DECODE_V2=1): decode-v2
-            // zero-fills A rows >= M itself, so hand it the unpadded pre-quantized
-            // activation and skip the 2 memsets + 2 copies of the padding below.
-            // Same split count as the padded v2 call further down.
+            // With MT_ML8_4_DECODE_V2=1, decode-v2 zero-fills A rows >= M itself,
+            // so hand it the unpadded pre-quantized activation and skip the 2
+            // memsets + 2 copies of the padding below. Same split count as the
+            // padded v2 call further down. Default ON since 2026-10-16 (R9700,
+            // Qwen3.8-27B ml8-4: 16k decode 110 -> 119 t/s, prefill unchanged);
+            // MT_ML8_4_DECODE_V2_NOPAD=0 restores the padded path.
             static const bool v2_nopad = [] {
                 const char * e  = std::getenv("MT_ML8_4_DECODE_V2_NOPAD");
                 const char * e2 = std::getenv("MT_ML8_4_DECODE_V2");
-                return e != nullptr && e[0] == '1' && e2 != nullptr && std::atoi(e2) != 0;
+                return (e == nullptr || e[0] != '0') && e2 != nullptr && std::atoi(e2) != 0;
             }();
             if (v2_nopad && !x_tiled && M_pad == 32 && dst->type == GGML_TYPE_F32 &&
                     repack->layout == ML8_4_LAYOUT_RDNA4_TRFEED) {
