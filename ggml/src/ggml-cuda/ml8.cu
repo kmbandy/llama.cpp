@@ -3712,27 +3712,22 @@ static void ml8_mul_mat_core(
                 }
             }
 #endif
-            a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
-            a_scale_scratch.alloc((size_t) M_pad);
-            // MT_ML8_4_PAD_NO_ZERO=1: leave padding rows unzeroed. GEMM rows are
-            // independent and rows >= M are never stored (decode-v2 writes m < M;
-            // split-K copies out M rows), so the two memsets are dead work: two
-            // of the ~6 runtime launches each decode projection paid (DS4.1 spine
-            // trace: ~450 projections, ~10k launches per verify step).
-            static const bool pad_no_zero = [] {
-                const char * e = std::getenv("MT_ML8_4_PAD_NO_ZERO");
-                return e != nullptr && e[0] == '1';
-            }();
-            if (!pad_no_zero) {
-                CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
-                CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
-            }
+            // One scratch holds [M_pad*K fp8 | M_pad fp32 scale]. Pad rows (>= M) are not
+            // zeroed: GEMM rows are independent (a row's output depends only on
+            // its own A row and scale) and rows >= M are never stored (decode-v2
+            // writes m < M; split-K copies out M rows), so the two pad memsets
+            // were dead work (~2 of the ~6 runtime launches per decode projection).
+            // This replaces the old MT_ML8_4_PAD_NO_ZERO opt-in, which is gone.
+            const size_t fp8_bytes = (size_t) M_pad * (size_t) K;   // K%4==0 keeps the scale 4B-aligned
+            a_fp8_scratch.alloc(fp8_bytes + (size_t) M_pad * sizeof(float));
+            // Two copies: the source scales sit at qs_base + M*K but the scratch
+            // scales start at M_pad*K, so the regions are not one contiguous copy.
             CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get(), qs_base, (size_t) M * (size_t) K,
                                        cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(a_scale_scratch.get(), scale_base, (size_t) M * sizeof(float),
+            CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get() + fp8_bytes, scale_base, (size_t) M * sizeof(float),
                                        cudaMemcpyDeviceToDevice, stream));
             a_fp8_ptr   = a_fp8_scratch.get();
-            a_scale_ptr = a_scale_scratch.get();
+            a_scale_ptr = reinterpret_cast<const float *>(a_fp8_scratch.get() + fp8_bytes);
         }
     } else {
         a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
@@ -4453,6 +4448,14 @@ bool ggml_cuda_ml8_can_fuse_ffn_swiglu(
     if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_I8) {
         return false;
     }
+    // A radiance-TILED qrot output (ML8_QROT_FLAG_TILED) can only be consumed by the
+    // radiance prefill GEMM (ml8_mul_mat_core's tiled branch). This fusion's trfeed
+    // kernel reads row-major fp8, so decline here (fall back to the two radiance GEMMs
+    // + GLU) instead of hitting the assert in ggml_cuda_op_ml8_ffn_gate_up_swiglu.
+    if (x->type == GGML_TYPE_I8 &&
+        (ggml_get_op_params_i32(x, ML8_QROT_OP_PARAM_FLAGS) & ML8_QROT_FLAG_TILED)) {
+        return false;
+    }
     if (!ggml_is_contiguous(x)) {
         return false;
     }
@@ -4589,16 +4592,18 @@ void ggml_cuda_op_ml8_ffn_gate_up_swiglu(
             a_fp8_ptr   = qs_base;
             a_scale_ptr = scale_base;
         } else {
-            a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);
-            a_scale_scratch.alloc((size_t) M_pad);
-            CUDA_CHECK(cudaMemsetAsync(a_fp8_scratch.get(), 0, (size_t) M_pad * (size_t) K, stream));
-            CUDA_CHECK(cudaMemsetAsync(a_scale_scratch.get(), 0, (size_t) M_pad * sizeof(float), stream));
+            // Same scratch layout as ml8_mul_mat_core's x_prequant pad path:
+            // [M_pad*K fp8 | M_pad fp32 scale]; pad rows are not zeroed (dead work).
+            const size_t fp8_bytes = (size_t) M_pad * (size_t) K;
+            a_fp8_scratch.alloc(fp8_bytes + (size_t) M_pad * sizeof(float));
+            // Two copies: the source scales sit at qs_base + M*K but the scratch
+            // scales start at M_pad*K, so the regions are not one contiguous copy.
             CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get(), qs_base, (size_t) M * (size_t) K,
                                        cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(a_scale_scratch.get(), scale_base, (size_t) M * sizeof(float),
+            CUDA_CHECK(cudaMemcpyAsync(a_fp8_scratch.get() + fp8_bytes, scale_base, (size_t) M * sizeof(float),
                                        cudaMemcpyDeviceToDevice, stream));
             a_fp8_ptr   = a_fp8_scratch.get();
-            a_scale_ptr = a_scale_scratch.get();
+            a_scale_ptr = reinterpret_cast<const float *>(a_fp8_scratch.get() + fp8_bytes);
         }
     } else {
         a_fp8_scratch.alloc((size_t) M_pad * (size_t) K);

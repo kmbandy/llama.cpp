@@ -437,9 +437,12 @@ __global__ void radp_ml8_qrot_kernel(
         }
         if constexpr (MODE == QMODE_ADD) {
           if (rout) {
-            float* ob = rout + (size_t)a * B + lane * E;
+            // float4 store: lane*E and a*B are multiples of 4 floats and
+            // rout is row*K with K%16==0, so every destination is 16B-aligned.
+            float4* ob = reinterpret_cast<float4*>(rout + (size_t)a * B + lane * E);
 #pragma unroll
-            for (int e = 0; e < E; e++) ob[e] = v[j][e];
+            for (int e = 0; e < E; e += 4)
+              ob[e / 4] = make_float4(v[j][e], v[j][e + 1], v[j][e + 2], v[j][e + 3]);
           }
         }
       }
@@ -467,16 +470,23 @@ __global__ void radp_ml8_qrot_kernel(
         tot = 0.0f;
 #pragma unroll
         for (int w = 0; w < NW; w++) tot += s_ss[w];
-        __syncthreads();
+        // No trailing __syncthreads: s_ss is written once per launch and never
+        // reused, so there is no WAR hazard to guard.
       }
       const float rms = rsqrtf(tot / (float)K + norm_eps);
 #pragma unroll
       for (int j = 0; j < MAXAW; j++) {
         const int a = wave + j * NW;
         if (a < a_dim) {
-          const float* wb = norm_w + (size_t)a * B + lane * E;
+          const float4* wb = reinterpret_cast<const float4*>(norm_w + (size_t)a * B + lane * E);
 #pragma unroll
-          for (int e = 0; e < E; e++) v[j][e] = v[j][e] * rms * wb[e];
+          for (int e = 0; e < E; e += 4) {
+            const float4 w4 = wb[e / 4];
+            v[j][e]     = v[j][e]     * rms * w4.x;
+            v[j][e + 1] = v[j][e + 1] * rms * w4.y;
+            v[j][e + 2] = v[j][e + 2] * rms * w4.z;
+            v[j][e + 3] = v[j][e + 3] * rms * w4.w;
+          }
         }
       }
     }
@@ -485,9 +495,10 @@ __global__ void radp_ml8_qrot_kernel(
       for (int j = 0; j < MAXAW; j++) {
         const int a = wave + j * NW;
         if (a < a_dim) {
-          float* ob = yout_row + (size_t)a * B + lane * E;
+          float4* ob = reinterpret_cast<float4*>(yout_row + (size_t)a * B + lane * E);
 #pragma unroll
-          for (int e = 0; e < E; e++) ob[e] = v[j][e];
+          for (int e = 0; e < E; e += 4)
+            ob[e / 4] = make_float4(v[j][e], v[j][e + 1], v[j][e + 2], v[j][e + 3]);
         }
       }
     }
@@ -562,7 +573,6 @@ __global__ void radp_ml8_qrot_kernel(
     __shared__ float s_row[ROWBUF];
     __shared__ float s_ha[HABUF];
     for (int idx = threadIdx.x; idx < a_dim * a_dim; idx += blockDim.x) s_ha[idx] = h_a[idx];
-    __syncthreads();
 #pragma unroll
     for (int c = 0; c < NCHUNK; c++) {
       const int e0 = c * ESTRIP;
@@ -603,7 +613,11 @@ __global__ void radp_ml8_qrot_kernel(
           }
         }
       }
-      __syncthreads();   // s_row is reused by the next strip -- guard the WAR hazard
+      // s_row is reused by the next strip -- guard the WAR hazard. The last
+      // strip has no successor, and s_max (below) is a separate array, so it
+      // needs no trailing barrier. (Also covers the one-time s_ha fill above:
+      // it is ordered by chunk 0's write-side barrier.)
+      if (c + 1 < NCHUNK) __syncthreads();
     }
   }
 
@@ -628,11 +642,26 @@ __global__ void radp_ml8_qrot_kernel(
     const int a = wave + j * NW;
     if (a < a_dim) {
       const int k0 = a * B + lane * E;
+      if constexpr (E >= 8) {
+        // 8-byte stores: k0 and e are multiples of 8, so (e, e+4) are the two
+        // halves of one tile group (k&7 == 0 and 4, offsets +0 and +4). A
+        // little-endian uint2 writes .x at the lower address, exactly as the
+        // two uint32 stores did, so the bytes are identical.
 #pragma unroll
-      for (int e = 0; e < E; e += 4) {
-        const uint32_t packed = fp8_quant_rot_pack4_hw(v[j][e] * inv_scale, v[j][e + 1] * inv_scale,
-                                                        v[j][e + 2] * inv_scale, v[j][e + 3] * inv_scale);
-        *reinterpret_cast<uint32_t*>(a_tiled + radp_tiled_off(row, k0 + e, K)) = packed;
+        for (int e = 0; e < E; e += 8) {
+          const uint32_t p0 = fp8_quant_rot_pack4_hw(v[j][e] * inv_scale, v[j][e + 1] * inv_scale,
+                                                      v[j][e + 2] * inv_scale, v[j][e + 3] * inv_scale);
+          const uint32_t p1 = fp8_quant_rot_pack4_hw(v[j][e + 4] * inv_scale, v[j][e + 5] * inv_scale,
+                                                      v[j][e + 6] * inv_scale, v[j][e + 7] * inv_scale);
+          *reinterpret_cast<uint2*>(a_tiled + radp_tiled_off(row, k0 + e, K)) = make_uint2(p0, p1);
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < E; e += 4) {
+          const uint32_t packed = fp8_quant_rot_pack4_hw(v[j][e] * inv_scale, v[j][e + 1] * inv_scale,
+                                                          v[j][e + 2] * inv_scale, v[j][e + 3] * inv_scale);
+          *reinterpret_cast<uint32_t*>(a_tiled + radp_tiled_off(row, k0 + e, K)) = packed;
+        }
       }
     }
   }
@@ -1652,7 +1681,9 @@ bool rdna4_ml8_qrot_tiled(const float* x, const void* h_a, int rot_kind, int a_d
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
 
   RADP_DISPATCH(ml8qrot::QMODE_PLAIN, x, /*in1=*/nullptr, /*residual_out=*/nullptr, h_a_f, norm_w,
@@ -1670,7 +1701,9 @@ bool rdna4_ml8_qrot_add_tiled(const float* x, const float* residual, float* resi
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
 
   RADP_DISPATCH(ml8qrot::QMODE_ADD, x, residual, residual_out, h_a_f, norm_w, norm_eps, A_tiled,
@@ -1686,7 +1719,9 @@ bool rdna4_ml8_qrot_silu_mul_tiled(const float* gate_up, int gate_first, const v
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)N;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
 
   RADP_DISPATCH(ml8qrot::QMODE_SILU_FUSED, gate_up, /*in1=*/nullptr, /*residual_out=*/nullptr,
@@ -1703,7 +1738,9 @@ bool rdna4_ml8_qrot_silu_mul_split_tiled(const float* gate, const float* up, con
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)N;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
 
   RADP_DISPATCH(ml8qrot::QMODE_SILU_SPLIT, gate, up, /*residual_out=*/nullptr, h_a_f,
@@ -1728,7 +1765,9 @@ bool rdna4_ml8_qrot_silu_mul_split_tiled_bf16(const void* gate_bf16, const void*
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)N;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
   const uint16_t* g16 = (const uint16_t*)gate_bf16;
   const uint16_t* u16 = (const uint16_t*)up_bf16;
@@ -1782,7 +1821,9 @@ bool rdna4_ml8_qrot_add_tiled_bf16(const void* x_bf16, const void* residual_bf16
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
   const uint16_t* x16 = (const uint16_t*)x_bf16;
   const uint16_t* r16 = (const uint16_t*)residual_bf16;
@@ -1855,7 +1896,9 @@ bool rdna4_ml8_qrot_gated_norm_tiled(const float* o, const float* z, size_t z_nb
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
   const char* z_bytes = (const char*)z;
   int lph = 0;
@@ -1916,7 +1959,9 @@ bool rdna4_ml8_qrot_gate_sigmoid_tiled(const float* o, const float* z, size_t z_
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
   const char* z_bytes = (const char*)z;
   int lph = 0;
@@ -1982,7 +2027,9 @@ bool rdna4_ml8_qrot_gated_norm_tiled_r4d(const void* o_bf16, size_t o_nb_head, s
 
   const int Mt = (M + 15) >> 4;
   const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
+  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
+  // of the tile buffer (all rows, all K columns), so the memset is dead work.
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
   const float* h_a_f = (const float*)h_a;
   const uint16_t* o16 = (const uint16_t*)o_bf16;
   const char* z_bytes = (const char*)z;
