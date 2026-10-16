@@ -463,6 +463,21 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    // qkv_mixed->ne[1] >= K-1 + n_rs_seq: the new conv state (and every rollback slot) lies entirely
+    // in qkv_mixed, so it is read from there and conv_input is only consumed by ssm_conv
+    const bool direct = qkv_mixed->ne[1] >= conv_kernel_size - 1 + (int64_t) cparams.n_rs_seq;
+
+    ggml_tensor * qkv_mixed_src = qkv_mixed;
+
+    // [K-1] columns of qkv_mixed starting at combined column s_idx (requires direct), as [K-1, C, S]
+    auto qkv_tail = [&](int64_t s_idx) {
+        ggml_tensor * win = ggml_view_3d(ctx0, qkv_mixed_src,
+                conv_channels, conv_kernel_size - 1, n_seqs,
+                qkv_mixed_src->nb[1], qkv_mixed_src->nb[2],
+                (s_idx - (conv_kernel_size - 1)) * qkv_mixed_src->nb[1]);
+        return ggml_transpose(ctx0, win);
+    };
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -477,7 +492,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
-        ggml_tensor * conv_state_last =
+        ggml_tensor * conv_state_last = direct ? qkv_tail(s_idx) :
             ggml_view_3d(ctx0, conv_input,
                     conv_kernel_size - 1, conv_channels, n_seqs,
                     conv_input->nb[1], conv_input->nb[2],
@@ -490,7 +505,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     (s_slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        // deferred: the write must run after SSM_CONV has read the old state (see flush_*)
+        pending_conv_state_writes.push_back(ggml_cpy(ctx0, conv_state_last, conv_state_update));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
@@ -540,7 +556,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
-            ggml_tensor * conv_state_last =
+            ggml_tensor * conv_state_last = direct ? qkv_tail(s_idx) :
                 ggml_view_3d(ctx0, conv_input,
                         conv_kernel_size - 1, conv_channels, n_seqs,
                         conv_input->nb[1], conv_input->nb[2],
@@ -552,11 +568,24 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                         conv_states_all->nb[1],
                         (s_slot * mem_size + kv_head) * row_size);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+            // deferred: the write must run after SSM_CONV has read the old state (see flush_*)
+            pending_conv_state_writes.push_back(ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }
     }
 
     return conv_input;
+}
+
+// The conv-state cache write must come after the SSM_CONV that reads the same cache slot. ggml only
+// orders nodes by data dependency and does not see that the read and write alias the cache, so the
+// writes are appended to gf here, after build_conv_state() returned, the layer's SSM_CONV is already
+// in gf (it is an ancestor of the attention output expanded below), and the writes therefore run
+// after it. Without this order, a direct-branch write (cpy from qkv_mixed) can run before the read.
+void llm_build_delta_net_base::flush_pending_conv_state_writes() {
+    for (ggml_tensor * w : pending_conv_state_writes) {
+        ggml_build_forward_expand(gf, w);
+    }
+    pending_conv_state_writes.clear();
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
@@ -592,6 +621,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
+        flush_pending_conv_state_writes();
         return output;
     }
 
@@ -637,5 +667,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
+    flush_pending_conv_state_writes();
     return output;
 }

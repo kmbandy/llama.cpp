@@ -3,6 +3,8 @@
 #include "unary.cuh"
 #include "mt_gdn_r4d.cuh"  // GGML_HIP_R4D-gated R4D conv-side hook (no-op stub otherwise; MAD-406)
 
+#include <unordered_set>
+
 // BF16 activation coverage (2026-09-18): src0 (conv_x), the conv weight (src1) and dst
 // are each independently templated (f32 or bf16); bias stays f32. Internal math is fp32.
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, typename T = float, typename Tout = T, typename W = float>
@@ -160,6 +162,135 @@ static void ssm_conv_f32_cuda(const T * src0, const W * src1, const float * bias
     }
 }
 
+// Concat-elided form: SSM_CONV reads the conv state (src[0]) and the transposed qkv (src[1]) of the
+// CONCAT that feeds it, instead of the materialized [K-1+T] tensor. Taps are summed in the same order
+// as ssm_conv_f32, so the output is bit-identical to the CONCAT path.
+static constexpr int64_t ssm_conv_state_tokens = 32; // output tokens per block
+
+template <bool apply_silu, size_t d_conv>
+static __global__ void ssm_conv_state_f32(const float * __restrict__ state, const float * __restrict__ qkv,
+                                          const float * __restrict__ weight, const float * __restrict__ bias,
+                                          float * __restrict__ dst, const int64_t n_t,
+                                          const int64_t state_nb1, const int64_t state_nb2,
+                                          const int64_t qkv_nb0, const int64_t qkv_nb1, const int64_t qkv_nb2,
+                                          const int64_t w_nb1, const int64_t dst_nb0, const int64_t dst_nb1,
+                                          const int64_t dst_nb2) {
+    const int64_t c  = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    const int64_t s  = blockIdx.x;
+    const int64_t t0 = (int64_t) blockIdx.z * ssm_conv_state_tokens;
+
+    const float * st = (const float *) ((const char *) state + s * state_nb2 + c * state_nb1);
+    const char  * qk = (const char *) qkv + s * qkv_nb2 + c * qkv_nb1;
+    const float * wc = (const float *) ((const char *) weight + c * w_nb1);
+    const float   b  = bias != nullptr ? bias[c] : 0.0f;
+
+    float w[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = wc[j];
+    }
+
+    const int64_t t_end = min(t0 + ssm_conv_state_tokens, n_t);
+    for (int64_t t = t0; t < t_end; t++) {
+        float x[d_conv];
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            // combined column t + j: the first d_conv-1 come from the state, the rest from qkv
+            const int64_t col = t + j;
+            x[j] = col < (int64_t) (d_conv - 1) ? st[col] : *(const float *) (qk + (col - (d_conv - 1)) * qkv_nb0);
+        }
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[j] * w[j];
+        }
+        sumf += b;
+        *(float *) ((char *) dst + s * dst_nb2 + t * dst_nb1 + c * dst_nb0) =
+            apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_state_f32_cuda(const ggml_tensor * st, const ggml_tensor * qk, const ggml_tensor * w,
+                                    const float * bias, const ggml_tensor * out, cudaStream_t stream) {
+    const dim3 blocks(out->ne[2], out->ne[0] / 128, (out->ne[1] + ssm_conv_state_tokens - 1) / ssm_conv_state_tokens);
+
+    auto launch = [&](auto d_conv) {
+        constexpr size_t kNC = decltype(d_conv)::value;
+        ssm_conv_state_f32<apply_silu, kNC><<<blocks, 128, 0, stream>>>(
+            (const float *) st->data, (const float *) qk->data, (const float *) w->data, bias, (float *) out->data,
+            out->ne[1], st->nb[1], st->nb[2], qk->nb[0], qk->nb[1], qk->nb[2], w->nb[1],
+            out->nb[0], out->nb[1], out->nb[2]);
+    };
+
+    switch (w->ne[0]) {
+        case 3:  launch(std::integral_constant<size_t, 3 >{}); break;
+        case 4:  launch(std::integral_constant<size_t, 4 >{}); break;
+        case 5:  launch(std::integral_constant<size_t, 5 >{}); break;
+        case 9:  launch(std::integral_constant<size_t, 9 >{}); break;
+        case 15: launch(std::integral_constant<size_t, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
+// CONCAT nodes whose SSM_CONV consumer reads them directly (see ggml_cuda_ssm_conv_try_elide_concat)
+static thread_local std::unordered_set<const ggml_tensor *> g_ssm_conv_elided_concat;
+
+void ggml_cuda_ssm_conv_clear_elided() {
+    g_ssm_conv_elided_concat.clear();
+}
+
+bool ggml_cuda_ssm_conv_try_elide_concat(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    // r4d owns the GDN conv-prep fusion for this shape (it reads the CONCAT node itself)
+    if (r4d_gdn_conv_enabled() || !ctx.stream_context().concurrent_events.empty()) {
+        return false;
+    }
+
+    const ggml_tensor * cat = cgraph->nodes[i];
+    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * st = cat->src[0]; // conv state [K-1, C, S]
+    const ggml_tensor * qk = cat->src[1]; // qkv_mixed transposed [T, C, S]
+    if (cat->type != GGML_TYPE_F32 || st->type != GGML_TYPE_F32 || qk->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(st) || cat->ne[0] != st->ne[0] + qk->ne[0] ||
+        st->ne[1] != cat->ne[1] || qk->ne[1] != cat->ne[1] || cat->ne[1] % 128 != 0 ||
+        st->ne[2] != cat->ne[2] || qk->ne[2] != cat->ne[2] || cat->ne[2] > 65535) {
+        return false;
+    }
+
+    // the CONCAT must have exactly one consumer, and it must be the SSM_CONV that reads it as src[0]
+    int                  n_users = 0;
+    const ggml_tensor * user    = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n    = cgraph->nodes[j];
+        bool                uses = n->view_src == cat;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            uses = uses || n->src[s] == cat;
+        }
+        if (uses) {
+            n_users++;
+            user = n;
+        }
+    }
+    if (n_users != 1 || user->op != GGML_OP_SSM_CONV || user->src[0] != cat) {
+        return false;
+    }
+
+    const ggml_tensor * w = user->src[1];
+    const int64_t       nc = w->ne[0];
+    if (w->type != GGML_TYPE_F32 || user->type != GGML_TYPE_F32 || st->ne[0] != nc - 1 ||
+        (nc != 3 && nc != 4 && nc != 5 && nc != 9 && nc != 15) || user->ne[2] > 65535 ||
+        (user->ne[1] + ssm_conv_state_tokens - 1) / ssm_conv_state_tokens > 65535 || user->ne[0] != cat->ne[1]) {
+        return false;
+    }
+
+    g_ssm_conv_elided_concat.insert(cat);
+    return true;
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     // MAD-406: R4D conv-prep hook (mt_gdn_r4d.cu), gated by MAD_USE_R4D_GDN_CONV=1 -- mirrors the
     // mt_pagedattn.cu r4d gate pattern. Always declines today (op-boundary miss: a/b/A_log/dt_bias
@@ -213,6 +344,15 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    if (g_ssm_conv_elided_concat.count(src0) != 0) {
+        if (fuse_silu) {
+            ssm_conv_state_f32_cuda<true>(src0->src[0], src0->src[1], src1, bias_d, out, stream);
+        } else {
+            ssm_conv_state_f32_cuda<false>(src0->src[0], src0->src[1], src1, bias_d, out, stream);
+        }
+        return;
     }
 
 #define SSM_CONV_DISPATCH(T_IN, T_W, T_OUT)                                                                          \

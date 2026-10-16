@@ -9323,6 +9323,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // GDN conv input: a CONCAT read only by its SSM_CONV is skipped here and read by that SSM_CONV
+    if (node->op == GGML_OP_CONCAT && ggml_cuda_ssm_conv_try_elide_concat(*cuda_ctx, cgraph, i)) {
+        g_fused_qrot_skip.insert(node);
+        return 0;
+    }
+
     // MAD-406 follow-up: GDN conv-prep fusion, gated internally by
     // MAD_USE_R4D_GDN_CONV=1. Matched producers are skipped by identity
     // (g_fused_qrot_skip), not a contiguous index range. Placed before the
@@ -10506,6 +10512,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
             g_fused_qrot_skip.clear();
+            ggml_cuda_ssm_conv_clear_elided();
             // Chain-227: deferred ml8-4 radiance plans (pattern A/C/B_SPLIT)
             // are registered at a chain's head and consumed at its qrot's
             // own turn WITHIN one graph compute -- nothing should ever

@@ -5140,6 +5140,45 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV fed the way build_conv_state() feeds it: CONCAT(conv state, transposed qkv) along dim 0,
+// then SILU. On CUDA this is the concat-elided SSM_CONV path.
+struct test_ssm_conv_state_concat : public test_case {
+    const ggml_type type;
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_STATE_CONCAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, d_conv, d_inner, n_t, n_s);
+    }
+
+    test_ssm_conv_state_concat(ggml_type type, int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s)
+        : type(type), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, type, d_conv - 1, d_inner, n_s);
+        ggml_tensor * qkv   = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_set_name(state, "conv_state");
+        ggml_set_name(qkv, "qkv_mixed");
+        ggml_set_name(w, "conv_w");
+
+        ggml_tensor * conv_input = ggml_concat(ctx, state, ggml_transpose(ctx, qkv), 0);
+        ggml_tensor * out        = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11246,6 +11285,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
         }
+    }
+
+    // build_conv_state() style CONCAT + SSM_CONV + SILU (concat-elided path on CUDA); n_t not a multiple of 32 in one case
+    for (int64_t d_conv : {3, 4, 9}) {
+        test_cases.emplace_back(new test_ssm_conv_state_concat(GGML_TYPE_F32, d_conv, 1024, 1, 1));
+        test_cases.emplace_back(new test_ssm_conv_state_concat(GGML_TYPE_F32, d_conv, 1024, 33, 1));
+        test_cases.emplace_back(new test_ssm_conv_state_concat(GGML_TYPE_F32, d_conv, 2048, 300, 2));
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1

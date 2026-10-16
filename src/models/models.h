@@ -86,6 +86,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     virtual ~llm_build_delta_net_base() = default;
 
+    // conv-state cache writes produced by build_conv_state(); they are expanded into gf by
+    // flush_pending_conv_state_writes() at the end of build_recurrent_attn(), i.e. after the layer's
+    // SSM_CONV has been added to gf (see the comment in build_conv_state)
+    std::vector<ggml_tensor *> pending_conv_state_writes;
+
+    void flush_pending_conv_state_writes();
+
     // returns pair of output and new state
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_chunking(
                 ggml_tensor * q,
