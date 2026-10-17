@@ -4,19 +4,18 @@
 The 510 GB checkpoint does not fit. Engram lives alone in two shards
 (~94.6 GiB each) and is the only content in those files:
 
-  layers.1.engram.*  -> model-00047-of-00048.safetensors
-  layers.14.engram.* -> model-00048-of-00048.safetensors
+  layers.{1,14}.engram.* -> resolved from model.safetensors.index.json (V4.1: shards 47, 48)
 
 Prefers a complete local shard under cache-dir/shards/ (or cache-dir/).
 Otherwise Range-gets 1M-row chunks of F8_E4M3 weight + F8_E8M0 scale.
 Dequant is cheap; MXFP4 is the cost — gguf.quantize walks 16-row groups
 in Python (~14s/chunk on one core). A 12-process fork pool shares the
 chunk via RawArray so the 3900X's cores all run those cache-sized
-groups (~1.7s/chunk). Peak extra disk is the two MXFP4 staging files
-(~49 GiB each) plus the output GGUF.
+groups (~1.7s/chunk). The MXFP4 rows are written straight into the final
+GGUF through a memmap (no staging copy): peak extra disk is the output itself.
 
-Resume: if a staging file and sidecar progress JSON exist, conversion
-continues from the last completed row.
+Resume: the output and outfile.progress.json hold the layer's rows_done, the
+extras flag and a done marker; a rerun continues from the last flushed chunk.
 """
 from __future__ import annotations
 
@@ -27,9 +26,11 @@ import os
 import shutil
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import requests
@@ -40,7 +41,7 @@ from urllib3.util.retry import Retry
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gguf-py"))
 import gguf  # noqa: E402
 from gguf.quants import MXFP4  # noqa: E402
-from gguf.utility import SafetensorRemote  # noqa: E402
+from gguf.utility import RemoteTensor, SafetensorRemote  # noqa: E402
 
 logger = logging.getLogger("dsv41-engram")
 
@@ -56,7 +57,6 @@ ELEM_BYTES = {
     "F16": 2,
     "F32": 4,
 }
-MIN_FREE_BYTES = 200 * 1024 ** 3
 
 # Filled in the MXFP4 worker processes by _mxfp4_worker_init.
 _MXFP4_RAW: tuple | None = None
@@ -256,49 +256,12 @@ def write_progress(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def convert_table(
-    session: requests.Session,
-    hf_url: str,
-    tensors: dict[str, gguf.utility.RemoteTensor],
-    bid: int,
-    staging_dir: Path,
-    chunk_rows: int,
-    local_path: Path | None = None,
-    workers: int = DEFAULT_WORKERS,
-) -> tuple[Path, dict[str, np.ndarray]]:
-    weight_name = f"layers.{bid}.engram.embed.weight"
-    scale_name = f"layers.{bid}.engram.embed.scale"
-    wt = tensors[weight_name]
-    st = tensors[scale_name]
-    n_rows, n_cols = (int(x) for x in wt.shape)
-    scale_groups = int(st.shape[1])
-    w_elem = ELEM_BYTES[wt.dtype]
-    s_elem = ELEM_BYTES[st.dtype]
-    if n_cols % 32:
-        raise ValueError(f"engram row width {n_cols} not multiple of MXFP4 block 32")
-    if n_cols % scale_groups:
-        raise ValueError(f"engram row width {n_cols} not divisible by {scale_groups} scale groups")
-    per_group = n_cols // scale_groups
-    row_w = n_cols * w_elem
-    row_s = scale_groups * s_elem
-
-    qtype = gguf.GGMLQuantizationType.MXFP4
-    row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
-    staging = staging_dir / f"engram_{bid}_MXFP4.bin"
-    progress_path = staging_dir / f"engram_{bid}_MXFP4.progress.json"
-    extras_path = staging_dir / f"engram_{bid}_extras.npz"
-
-    logger.info(
-        "engram layer %d: %s %s + %s %s -> MXFP4 %d x %d (%.1f GB) at %s",
-        bid, wt.dtype, tuple(wt.shape), st.dtype, tuple(st.shape),
-        n_rows, n_cols, n_rows * row_bytes / 1e9, staging,
-    )
-
-    extras: dict[str, np.ndarray] = {}
+def make_ranged(session: requests.Session | None, hf_url: str, local_path: Path | None) -> Callable[[int, int], bytes]:
+    """Byte-range reader over one shard: the local file when present, else HF Range (CDN URL resolved once)."""
     use_local = local_path is not None and local_path.is_file()
-    cdn = hf_url if use_local else resolve_url(session, hf_url)
     if use_local:
-        logger.info("layer %d: reading local shard %s (%.1f GiB)", bid, local_path, local_path.stat().st_size / 1024 ** 3)
+        logger.info("reading local shard %s (%.1f GiB)", local_path, local_path.stat().st_size / 1024 ** 3)
+    cdn = hf_url if use_local else resolve_url(session, hf_url)
 
     def ranged(start: int, size: int) -> bytes:
         nonlocal cdn
@@ -317,83 +280,163 @@ def convert_table(
             cdn = resolve_url(session, hf_url)
             return http_range(session, cdn, start, size)
 
-    # Small extras first (k/q BF16, wkv FP8+[32,32] e8m0).
-    if extras_path.is_file():
-        loaded = np.load(extras_path)
-        extras = {k: loaded[k] for k in loaded.files}
-        logger.info("reusing extras %s", extras_path)
-    else:
-        def pull(name: str):
-            meta = tensors[name]
-            return meta, ranged(meta.offset_start, meta.size)
+    return ranged
 
-        k_name = f"layers.{bid}.engram.k_weight"
-        q_name = f"layers.{bid}.engram.q_weight"
-        w_name = f"layers.{bid}.engram.wkv.weight"
-        s_name = f"layers.{bid}.engram.wkv.scale"
-        if k_name in tensors:
-            meta, raw = pull(k_name)
-            extras["k"] = bf16_to_f32(raw, tuple(int(x) for x in meta.shape))
-        if q_name in tensors:
-            meta, raw = pull(q_name)
-            extras["q"] = bf16_to_f32(raw, tuple(int(x) for x in meta.shape))
-        if w_name in tensors and s_name in tensors:
-            wmeta, wraw = pull(w_name)
-            smeta, sraw = pull(s_name)
-            wr, wc = (int(x) for x in wmeta.shape)
+
+def local_shard_tensors(path: Path) -> dict[str, RemoteTensor]:
+    """Tensor metadata read from a local safetensors header (same fields as SafetensorRemote.get_list_tensors)."""
+    with open(path, "rb") as fh:
+        n = int.from_bytes(fh.read(8), "little")
+        header = json.loads(fh.read(n).decode("utf-8"))
+    data_start = 8 + n
+    out: dict[str, RemoteTensor] = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = meta["data_offsets"]
+        out[name] = RemoteTensor(
+            dtype=meta["dtype"], shape=tuple(int(x) for x in meta["shape"]),
+            offset_start=data_start + start, size=end - start, url=str(path),
+        )
+    return out
+
+
+def progress_path_for(outfile: Path) -> Path:
+    return outfile.with_name(outfile.name + ".progress.json")
+
+
+def progress_done(outfile: Path) -> bool:
+    p = progress_path_for(outfile)
+    return p.is_file() and bool(json.loads(p.read_text(encoding="utf-8")).get("done"))
+
+
+def engram_names(bid: int) -> dict[str, str]:
+    """GGUF tensor names for one layer: embd (MXFP4), k/q/wkv (f32)."""
+    return {
+        "embd": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_EMBD].format(bid=bid) + ".weight",
+        "k": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_K].format(bid=bid) + ".weight",
+        "q": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_Q].format(bid=bid) + ".weight",
+        "wkv": gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_WKV].format(bid=bid) + ".weight",
+    }
+
+
+def _extra_keys(bid: int, tensors: dict[str, RemoteTensor]) -> list[tuple[str, str]]:
+    """(key, source tensor) for each f32 extra present in this layer, in write order."""
+    keys = [(k, f"layers.{bid}.engram.{k}_weight") for k in ("k", "q")]
+    keys = [(k, s) for k, s in keys if s in tensors]
+    w = f"layers.{bid}.engram.wkv.weight"
+    if w in tensors and f"layers.{bid}.engram.wkv.scale" in tensors:
+        keys.append(("wkv", w))
+    return keys
+
+
+def engram_extras(ranged: Callable[[int, int], bytes], tensors: dict[str, RemoteTensor], bid: int) -> dict[str, np.ndarray]:
+    """k/q (BF16) and wkv (FP8 + 32x32 E8M0 block scales), all dequantized to f32."""
+    extras: dict[str, np.ndarray] = {}
+    for key, src in _extra_keys(bid, tensors):
+        meta = tensors[src]
+        raw = ranged(meta.offset_start, meta.size)
+        shape = tuple(int(x) for x in meta.shape)
+        if key == "wkv":
+            smeta = tensors[f"layers.{bid}.engram.wkv.scale"]
+            sraw = ranged(smeta.offset_start, smeta.size)
+            wr, wc = shape
             sr, sc = (int(x) for x in smeta.shape)
-            extras["wkv"] = dequant_fp8_block32(
-                f8e4m3_to_f32(wraw, wr, wc),
-                e8m0_to_f32(sraw, sr, sc),
-            )
-            logger.info("wkv dequant layer %d: %s -> %s", bid, tuple(wmeta.shape), extras["wkv"].shape)
-        np.savez(extras_path, **extras)
-        logger.info("wrote extras %s", extras_path)
+            extras[key] = dequant_fp8_block32(f8e4m3_to_f32(raw, wr, wc), e8m0_to_f32(sraw, sr, sc))
+            logger.info("wkv dequant layer %d: %s -> %s", bid, shape, extras[key].shape)
+        else:
+            extras[key] = bf16_to_f32(raw, shape)
+    return extras
 
-    start_row = 0
-    if staging.is_file() and progress_path.is_file():
-        prog = json.loads(progress_path.read_text(encoding="utf-8"))
-        if int(prog.get("n_rows", -1)) == n_rows and int(prog.get("row_bytes", -1)) == row_bytes:
-            start_row = int(prog.get("rows_done", 0))
-            if start_row > n_rows:
-                start_row = 0
-            if start_row:
-                logger.info("resuming layer %d at row %d / %d", bid, start_row, n_rows)
-    if start_row == 0:
-        require_free(staging_dir, n_rows * row_bytes + 8 * 1024 ** 3)
-        out = np.memmap(staging, dtype=np.uint8, mode="w+", shape=(n_rows, row_bytes))
-        out.flush()
-    else:
-        if staging.stat().st_size != n_rows * row_bytes:
-            raise RuntimeError(
-                f"staging {staging} size {staging.stat().st_size} != expected {n_rows * row_bytes}"
-            )
-        out = np.memmap(staging, dtype=np.uint8, mode="r+", shape=(n_rows, row_bytes))
+
+LOOKAHEAD = 2  # chunks in flight ahead of the one being quantized
+
+
+def convert_table(
+    ranged: Callable[[int, int], bytes],
+    tensors: dict[str, RemoteTensor],
+    bid: int,
+    target: Path,
+    offset: int,
+    *,
+    start_row: int = 0,
+    chunk_rows: int = CHUNK_ROWS,
+    workers: int = DEFAULT_WORKERS,
+    checkpoint: Callable[[int], None] | None = None,
+) -> None:
+    """Stream the layer's FP8 rows (from row start_row) into target at byte offset as MXFP4 rows.
+
+    checkpoint(rows_done) runs after each chunk is flushed, so a restart resumes there.
+    """
+    weight_name = f"layers.{bid}.engram.embed.weight"
+    scale_name = f"layers.{bid}.engram.embed.scale"
+    wt = tensors[weight_name]
+    st = tensors[scale_name]
+    n_rows, n_cols = (int(x) for x in wt.shape)
+    scale_groups = int(st.shape[1])
+    w_elem = ELEM_BYTES[wt.dtype]
+    s_elem = ELEM_BYTES[st.dtype]
+    if n_cols % 32:
+        raise ValueError(f"engram row width {n_cols} not multiple of MXFP4 block 32")
+    if n_cols % scale_groups:
+        raise ValueError(f"engram row width {n_cols} not divisible by {scale_groups} scale groups")
+    per_group = n_cols // scale_groups
+    row_w = n_cols * w_elem
+    row_s = scale_groups * s_elem
+
+    qtype = gguf.GGMLQuantizationType.MXFP4
+    row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
+
+    logger.info(
+        "engram layer %d: %s %s + %s %s -> MXFP4 %d x %d (%.1f GB) at %s+%d",
+        bid, wt.dtype, tuple(wt.shape), st.dtype, tuple(st.shape),
+        n_rows, n_cols, n_rows * row_bytes / 1e9, target, offset,
+    )
+    out = np.memmap(target, dtype=np.uint8, mode="r+", offset=offset, shape=(n_rows, row_bytes))
 
     t_all = time.time()
     n_chunks = (n_rows + chunk_rows - 1) // chunk_rows
     n_workers = max(1, int(workers))
     pool: ProcessPoolExecutor | None = None
     raw_in = raw_out = None
-    if n_workers > 1:
+    if n_workers > 1 and n_rows >= 8192:  # the pool is only used for chunks of >= 8192 rows
         ctx = get_context("fork")
-        raw_in = ctx.RawArray("f", chunk_rows * n_cols)
-        raw_out = ctx.RawArray("B", chunk_rows * row_bytes)
+        cap = min(chunk_rows, n_rows)
+        raw_in = ctx.RawArray("f", cap * n_cols)
+        raw_out = ctx.RawArray("B", cap * row_bytes)
         pool = ProcessPoolExecutor(
             max_workers=n_workers,
             mp_context=ctx,
             initializer=_mxfp4_worker_init,
-            initargs=(raw_in, raw_out, chunk_rows, n_cols, row_bytes),
+            initargs=(raw_in, raw_out, cap, n_cols, row_bytes),
         )
         logger.info("layer %d: MXFP4 process pool workers=%d", bid, n_workers)
 
+    # Download overlaps quantization: chunks are fetched LOOKAHEAD ahead, each
+    # weight range split over `conns` parallel Range requests (one serial
+    # stream left the link idle during every quantize step).
+    conns = max(1, int(os.environ.get("WP_FORGE_DOWNLOADS", "8")))
+    conn_pool = ThreadPoolExecutor(max_workers=conns, thread_name_prefix="engram-range")
+    ahead_pool = ThreadPoolExecutor(max_workers=LOOKAHEAD, thread_name_prefix="engram-chunk")
+
+    def fetch(start: int) -> tuple[bytes, bytes]:
+        nrows = min(start + chunk_rows, n_rows) - start
+        w0, wn = wt.offset_start + start * row_w, nrows * row_w
+        step = -(-wn // conns)
+        parts = [conn_pool.submit(ranged, w0 + o, min(step, wn - o)) for o in range(0, wn, step)]
+        sbuf = ranged(st.offset_start + start * row_s, nrows * row_s)
+        return b"".join(f.result() for f in parts), sbuf
+
+    starts = list(range(start_row, n_rows, chunk_rows))
+    pending = deque(ahead_pool.submit(fetch, s) for s in starts[:LOOKAHEAD])
     try:
-        for start in range(start_row, n_rows, chunk_rows):
+        for i, start in enumerate(starts):
             stop = min(start + chunk_rows, n_rows)
             nrows = stop - start
             t0 = time.time()
-            wbuf = ranged(wt.offset_start + start * row_w, nrows * row_w)
-            sbuf = ranged(st.offset_start + start * row_s, nrows * row_s)
+            wbuf, sbuf = pending.popleft().result()
+            if i + LOOKAHEAD < len(starts):
+                pending.append(ahead_pool.submit(fetch, starts[i + LOOKAHEAD]))
             t_dl = time.time()
             chunk = f8e4m3_to_f32(wbuf, nrows, n_cols)
             scale = e8m0_to_f32(sbuf, nrows, scale_groups)
@@ -407,19 +450,12 @@ def convert_table(
                 packed = gguf.quantize(f32, qtype).reshape(nrows, row_bytes)
             out[start:stop] = packed.reshape(nrows, row_bytes)
             del f32, packed
-            if start == start_row or stop == n_rows or ((start // chunk_rows) % 10 == 0):
-                out.flush()
-                write_progress(progress_path, {
-                    "bid": bid,
-                    "rows_done": stop,
-                    "n_rows": n_rows,
-                    "row_bytes": row_bytes,
-                    "elapsed_s": time.time() - t_all,
-                })
+            out.flush()
+            if checkpoint is not None:
+                checkpoint(stop)
             dt = time.time() - t0
             done_chunks = (stop + chunk_rows - 1) // chunk_rows
-            remain = n_chunks - done_chunks
-            eta = remain * dt
+            eta = (n_chunks - done_chunks) * dt
             if start == start_row or stop == n_rows or (start // chunk_rows) % 5 == 0:
                 logger.info(
                     "  layer %d: %d / %d rows (%.1f%%)  dl %.1fs dq %.1fs q %.1fs tot %.1fs  ETA %.1fh",
@@ -427,29 +463,16 @@ def convert_table(
                     t_dl - t0, t_dq - t_dl, time.time() - t_dq, dt, eta / 3600.0,
                 )
     finally:
+        ahead_pool.shutdown(wait=True, cancel_futures=True)
+        conn_pool.shutdown(wait=True, cancel_futures=True)
         if pool is not None:
             pool.shutdown(wait=True)
 
     out.flush()
-    write_progress(progress_path, {
-        "bid": bid,
-        "rows_done": n_rows,
-        "n_rows": n_rows,
-        "row_bytes": row_bytes,
-        "elapsed_s": time.time() - t_all,
-        "done": True,
-    })
-    logger.info("engram layer %d: staging complete in %.1f min", bid, (time.time() - t_all) / 60.0)
-    return staging, extras
+    logger.info("engram layer %d: MXFP4 rows complete in %.1f min", bid, (time.time() - t_all) / 60.0)
 
 
-def write_gguf(
-    outfile: Path,
-    hparams: dict,
-    tables: dict[int, Path],
-    extras: dict[int, dict[str, np.ndarray]],
-) -> None:
-    writer = gguf.GGUFWriter(str(outfile), arch="deepseek41", use_temp_file=False)
+def _engram_kv(writer: gguf.GGUFWriter, hparams: dict) -> None:
     writer.add_engram_head_count(int(hparams["engram_n_heads"]))
     writer.add_engram_key_length(int(hparams["engram_head_dim"]))
     writer.add_engram_max_ngram_size(int(hparams["engram_max_ngram_size"]))
@@ -461,6 +484,145 @@ def write_gguf(
     if "engram_compressed_vocab_size" in hparams:
         writer.add_engram_compressed_vocab_size(int(hparams["engram_compressed_vocab_size"]))
 
+
+def plan_engram_gguf(
+    hparams: dict, remote_tensors: dict[str, RemoteTensor],
+) -> list[tuple[str, tuple[int, ...], gguf.GGMLQuantizationType | None, int]]:
+    """Tensor infos write_gguf emits, in its order: per layer embd, then k/q/wkv when present.
+
+    Each entry is (gguf name, shape, raw_dtype, nbytes). embd is (rows, row_bytes) MXFP4 bytes;
+    raw_dtype None means F32 with the numpy shape given.
+    """
+    qtype = gguf.GGMLQuantizationType.MXFP4
+    plan: list[tuple[str, tuple[int, ...], gguf.GGMLQuantizationType | None, int]] = []
+    for bid in (int(x) for x in hparams["engram_layer_ids"]):
+        names = engram_names(bid)
+        n_rows, n_cols = (int(x) for x in remote_tensors[f"layers.{bid}.engram.embed.weight"].shape)
+        row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
+        plan.append((names["embd"], (n_rows, row_bytes), qtype, n_rows * row_bytes))
+        for key, src in _extra_keys(bid, remote_tensors):
+            shape = tuple(int(x) for x in remote_tensors[src].shape)
+            plan.append((names[key], shape, None, int(np.prod(shape)) * 4))
+    return plan
+
+
+def write_skeleton(
+    path: Path, hparams: dict, layout: list, preallocate: bool,
+) -> tuple[dict[str, int], int]:
+    """GGUF header, KV and tensor infos through GGUFWriter. Returns each tensor's absolute data
+    offset and the final file size. preallocate sizes the file to that size (sparse); otherwise
+    only the header is written, which is enough to get the offsets."""
+    writer = gguf.GGUFWriter(str(path), arch="deepseek41", use_temp_file=False)
+    _engram_kv(writer, hparams)
+    for name, shape, raw, nbytes in layout:
+        if raw is None:
+            writer.add_tensor_info(name, shape, np.dtype(np.float32), nbytes)
+        else:
+            writer.add_tensor_info(name, shape, np.dtype(np.uint8), nbytes, raw_dtype=raw)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_ti_data_to_file()
+    fout = writer.fout[0]
+    writer.write_padding(fout, fout.tell())
+    offsets: dict[str, int] = {}
+    pos = fout.tell()
+    for name, _, _, nbytes in layout:
+        offsets[name] = pos
+        pos += gguf.GGUFWriter.ggml_pad(nbytes, writer.data_alignment)
+    fout.flush()
+    if preallocate:
+        fout.truncate(pos)
+    writer.close()
+    return offsets, pos
+
+
+def _write_bytes(path: Path, offset: int, buf: np.ndarray) -> None:
+    mm = np.memmap(path, dtype=np.uint8, mode="r+", offset=offset, shape=(buf.size,))
+    mm[:] = buf
+    mm.flush()
+
+
+def build_engram_gguf(
+    outfile: Path,
+    hparams: dict,
+    remote: dict[str, RemoteTensor],
+    ranges: dict[int, Callable[[int, int], bytes]],
+    *,
+    chunk_rows: int = CHUNK_ROWS,
+    workers: int = DEFAULT_WORKERS,
+    only: set[int] | None = None,
+    on_layer: Callable[[int, float], None] | None = None,
+) -> bool:
+    """Write the final engram GGUF in place: skeleton first, then MXFP4 rows and f32 extras straight
+    into it through memmap. Resumable through outfile + '.progress.json'. Returns True when complete."""
+    layout = plan_engram_gguf(hparams, remote)
+    names = [name for name, *_ in layout]
+    scratch = outfile.with_name(outfile.name + ".layout")
+    offsets, size = write_skeleton(scratch, hparams, layout, preallocate=False)
+    scratch.unlink()
+
+    prog_path = progress_path_for(outfile)
+    if prog_path.is_file():
+        prog = json.loads(prog_path.read_text(encoding="utf-8"))
+        if prog.get("size") != size or prog.get("names") != names or outfile.stat().st_size != size:
+            raise RuntimeError(f"{prog_path} does not match the plan; delete {outfile} and {prog_path} to restart")
+        if prog.get("done"):
+            logger.info("engram GGUF already complete: %s", outfile)
+            return True
+        logger.info("resuming engram GGUF %s", outfile)
+    else:
+        if outfile.exists():
+            raise FileExistsError(f"{outfile} exists without {prog_path}; refusing to overwrite")
+        require_free(outfile.parent, size + 8 * 1024 ** 3)
+        write_skeleton(outfile, hparams, layout, preallocate=True)
+        prog = {"size": size, "names": names, "layers": {}, "done": False}
+        write_progress(prog_path, prog)
+
+    layer_ids = [int(x) for x in hparams["engram_layer_ids"]]
+    for bid in layer_ids:
+        if only is not None and bid not in only:
+            continue
+        lp = prog["layers"].setdefault(str(bid), {"rows_done": 0, "extras": False, "done": False})
+        if lp["done"]:
+            continue
+        t0 = time.time()
+        ranged = ranges[bid]
+        keys = engram_names(bid)
+        if not lp["extras"]:
+            for key, arr in engram_extras(ranged, remote, bid).items():
+                buf = np.ascontiguousarray(arr).view(np.uint8).reshape(-1)
+                _write_bytes(outfile, offsets[keys[key]], buf)
+            lp["extras"] = True
+            write_progress(prog_path, prog)
+
+        def checkpoint(rows_done: int, lp: dict = lp) -> None:
+            lp["rows_done"] = rows_done
+            write_progress(prog_path, prog)
+
+        convert_table(
+            ranged, remote, bid, outfile, offsets[keys["embd"]],
+            start_row=lp["rows_done"], chunk_rows=chunk_rows, workers=workers, checkpoint=checkpoint,
+        )
+        lp["done"] = True
+        write_progress(prog_path, prog)
+        if on_layer is not None:
+            on_layer(bid, time.time() - t0)
+
+    prog["done"] = all(prog["layers"].get(str(b), {}).get("done") for b in layer_ids)
+    write_progress(prog_path, prog)
+    return bool(prog["done"])
+
+
+def write_gguf(
+    outfile: Path,
+    hparams: dict,
+    tables: dict[int, Path],
+    extras: dict[int, dict[str, np.ndarray]],
+) -> None:
+    """Reference writer: MXFP4 tables already staged as bins, then copied into a new GGUF."""
+    writer = gguf.GGUFWriter(str(outfile), arch="deepseek41", use_temp_file=False)
+    _engram_kv(writer, hparams)
+
     qtype = gguf.GGMLQuantizationType.MXFP4
     n_cols = int(hparams["engram_head_dim"])
     row_bytes = int(gguf.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes)
@@ -469,18 +631,12 @@ def write_gguf(
         mm = np.memmap(path, dtype=np.uint8, mode="r")
         n_rows = mm.size // row_bytes
         mm = mm.reshape(n_rows, row_bytes)
-        name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_EMBD].format(bid=bid) + ".weight"
-        writer.add_tensor(name, mm, raw_dtype=qtype)
+        names = engram_names(bid)
+        writer.add_tensor(names["embd"], mm, raw_dtype=qtype)
         extra = extras.get(bid, {})
-        if "k" in extra:
-            tname = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_K].format(bid=bid) + ".weight"
-            writer.add_tensor(tname, np.ascontiguousarray(extra["k"]))
-        if "q" in extra:
-            tname = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_Q].format(bid=bid) + ".weight"
-            writer.add_tensor(tname, np.ascontiguousarray(extra["q"]))
-        if "wkv" in extra:
-            tname = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ENGRAM_WKV].format(bid=bid) + ".weight"
-            writer.add_tensor(tname, np.ascontiguousarray(extra["wkv"]))
+        for key in ("k", "q", "wkv"):
+            if key in extra:
+                writer.add_tensor(names[key], np.ascontiguousarray(extra[key]))
 
     logger.info("writing GGUF %s", outfile)
     writer.write_header_to_file()
@@ -490,8 +646,8 @@ def write_gguf(
     logger.info("wrote %s (%.1f GB)", outfile, outfile.stat().st_size / 1e9)
 
 
-def probe(session: requests.Session, repo: str) -> tuple[dict, dict[int, str], dict[str, gguf.utility.RemoteTensor]]:
-    base = f"{SafetensorRemote.BASE_DOMAIN}/{repo}/resolve/main"
+def probe(session: requests.Session, repo: str, revision: str = "main") -> tuple[dict, dict[int, str], dict[str, gguf.utility.RemoteTensor]]:
+    base = f"{SafetensorRemote.BASE_DOMAIN}/{repo}/resolve/{revision}"
     logger.info("fetching config + weight map from %s", repo)
     hparams = flatten_hparams(load_json_url(session, f"{base}/config.json"))
     index = load_json_url(session, f"{base}/model.safetensors.index.json")
@@ -528,6 +684,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--revision", default="main", help="HF commit sha/tag/branch to pin every fetch to")
     ap.add_argument("--cache-dir", default=str(Path.home() / "models" / "dsv41-hf-engram"))
     ap.add_argument("--outfile", default=str(Path.home() / "models" / "dsv41-engram-mxfp4.gguf"))
     ap.add_argument("--chunk-rows", type=int, default=CHUNK_ROWS)
@@ -536,22 +693,21 @@ def main() -> int:
         help="MXFP4 process-pool size (default 12 = 3900X physical cores; leave SMT for llama-server)",
     )
     ap.add_argument("--probe", action="store_true", help="print shard map and exit")
-    ap.add_argument("--keep-staging", action="store_true")
+    ap.add_argument(
+        "--keep-staging", action="store_true",
+        help="accepted for compatibility; the in-place path writes no staging files",
+    )
     ap.add_argument(
         "--only-layers", type=int, nargs="+", default=None,
-        help="convert only these Engram layer ids (skip GGUF write). Resume later without this flag.",
+        help="convert only these Engram layer ids into the output. Rerun without this flag to finish.",
     )
     args = ap.parse_args()
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir = cache_dir / "staging"
-    staging_dir.mkdir(exist_ok=True)
-
-    require_free(cache_dir, MIN_FREE_BYTES)
 
     session = make_session()
-    hparams, shards, remote = probe(session, args.repo)
+    hparams, shards, remote = probe(session, args.repo, args.revision)
     (cache_dir / "config.flat.json").write_text(json.dumps({
         k: hparams[k] for k in hparams if k.startswith("engram_") or k in (
             "hidden_size", "num_hidden_layers", "num_nextn_predict_layers",
@@ -564,12 +720,11 @@ def main() -> int:
     outfile = Path(args.outfile)
     outfile.parent.mkdir(parents=True, exist_ok=True)
 
-    tables: dict[int, Path] = {}
-    extras: dict[int, dict[str, np.ndarray]] = {}
-    base = f"{SafetensorRemote.BASE_DOMAIN}/{args.repo}/resolve/main"
+    base = f"{SafetensorRemote.BASE_DOMAIN}/{args.repo}/resolve/{args.revision}"
     workers = max(1, int(args.workers))
     only = set(args.only_layers) if args.only_layers else None
     logger.info("MXFP4 workers=%d only_layers=%s", workers, sorted(only) if only else "all")
+    ranges: dict[int, Callable[[int, int], bytes]] = {}
     for bid, filename in shards.items():
         if only is not None and bid not in only:
             logger.info("skipping layer %d (--only-layers)", bid)
@@ -577,23 +732,16 @@ def main() -> int:
         local = find_local_shard(cache_dir, filename)
         if local is None:
             logger.info("layer %d: no complete local shard for %s, streaming via HTTP Range", bid, filename)
-        staging, extra = convert_table(
-            session, f"{base}/{filename}", remote, bid, staging_dir, args.chunk_rows,
-            local_path=local, workers=workers,
-        )
-        tables[bid] = staging
-        extras[bid] = extra
+        ranges[bid] = make_ranged(session, f"{base}/{filename}", local)
 
-    if only is not None:
-        logger.info("only-layers done; not writing GGUF")
+    done = build_engram_gguf(
+        outfile, hparams, remote, ranges, chunk_rows=args.chunk_rows, workers=workers, only=only,
+        on_layer=lambda bid, secs: logger.info("layer %d written in %.1f min", bid, secs / 60.0),
+    )
+    if not done:
+        logger.info("only-layers done; output is incomplete, rerun without --only-layers to finish")
         return 0
-
-    write_gguf(outfile, hparams, tables, extras)
-    if not args.keep_staging:
-        for path in tables.values():
-            logger.info("deleting staging %s", path)
-            path.unlink(missing_ok=True)
-            path.with_name(path.name.replace(".bin", ".progress.json")).unlink(missing_ok=True)
+    logger.info("wrote %s (%.1f GB)", outfile, outfile.stat().st_size / 1e9)
     logger.info("done")
     return 0
 

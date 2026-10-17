@@ -122,7 +122,7 @@ def test_write_bundle_shape(rplan, tmp_path):
     sets = {s["id"]: s for s in b["expert_sets"]}
     assert list(sets) == ["L0-1-w0", "L0-1-w1", "L2-3"]
     for s in b["expert_sets"]:
-        assert set(s) == {"id", "role", "layers", "width", "n_ff_exp", "machine", "path",
+        assert set(s) == {"id", "role", "layers", "width", "experts", "n_ff_exp", "machine", "path",
                           "manifest", "descriptor", "bytes", "blobs"}
         for blob in s["blobs"]:
             assert set(blob) == {"file", "bytes", "sha256"}
@@ -250,3 +250,26 @@ def test_verify_bundle(rplan):
     rep_deep = B.verify_bundle(b3, rplan.machines, deep=True, hparams=HPARAMS, arch=ARCH)
     by = {(c.target, c.name): c for c in rep_deep.checks}
     assert by[("spine", "spine_sha256")].ok
+
+
+def _range_bundle(ranges):
+    return {"expert_sets": [
+        {"id": f"L0-1-e{i}", "role": "experts", "layers": [0, 1], "width": None,
+         "experts": list(r), "n_ff_exp": 64}
+        for i, r in enumerate(ranges)
+    ]}
+
+
+def test_coverage_expert_ranges():
+    hp = {"n_routed_experts": 8}
+    arch = ARCHS["deepseek41"]
+    ok = B._coverage_check(_range_bundle([(0, 5), (6, 7)]), None, None)
+    assert ok.ok, ok.detail
+    full = B._coverage_check(_range_bundle([(0, 5), (6, 7)]), {**hp, arch.n_layer_key: 2}, arch)
+    assert full.ok, full.detail
+    gap = B._coverage_check(_range_bundle([(0, 4), (6, 7)]), None, None)
+    assert not gap.ok and "gap at 6" in gap.detail
+    overlap = B._coverage_check(_range_bundle([(0, 5), (5, 7)]), None, None)
+    assert not overlap.ok and "overlap at 5" in overlap.detail
+    short = B._coverage_check(_range_bundle([(0, 5)]), {**hp, arch.n_layer_key: 2}, arch)
+    assert not short.ok and "end at 5, want 7" in short.detail

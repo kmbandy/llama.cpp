@@ -35,6 +35,7 @@ No retries: any exception emits one error event and re-raises.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -58,6 +59,7 @@ from .stages import (
     SidecarStage,
     SpineStage,
     StageResult,
+    write_descriptor,
 )
 from .tools import Tools
 
@@ -156,9 +158,15 @@ class Job:
             name: machines_mod.free_bytes(m, m.models_dir)
             for name, m in self.rplan.machines.items()
         }
+        # on resume, sets whose stage already finished are on disk -- they count
+        # against free space already, not as a further need
+        done = self._completed(log)
         planned: dict[str, int] = {}
-        for s in self.rplan.sets:
-            planned[s.machine] = planned.get(s.machine, 0) + s.est_bytes
+        for g in self._expert_groups():
+            if g[0].id.rsplit("-w", 1)[0] in done:
+                continue
+            for s in g:
+                planned[s.machine] = planned.get(s.machine, 0) + s.est_bytes
         problems: list[str] = []
         for name, need in planned.items():
             have = free.get(name, 0)
@@ -180,6 +188,35 @@ class Job:
             ],
             "free_bytes": free,
             "est_local_peak_bytes": peak,
+        })
+
+    def _write_deferred_descriptors(self, set_results: dict) -> None:
+        spine_local = Path(self.rplan.spine_path).expanduser()
+        if not spine_local.exists():
+            raise AssertionError(f"spine not local: {spine_local}")
+        for s in self.rplan.sets:
+            res = set_results.get(s.id)
+            if res is None or res.descriptor_rel is not None:
+                continue
+            sink = sink_mod.sink_for(self.rplan.machines[s.machine], s.dir)
+            manifest_text = sink.get_text(res.manifest_rel)
+            if manifest_text is None:
+                raise AssertionError(f"{s.id}: manifest {res.manifest_rel} missing")
+            index_texts = {}
+            for sh in json.loads(manifest_text)["shards"]:
+                text = sink.get_text(sh["index_file"])
+                if text is None:
+                    raise AssertionError(f"{s.id}: index {sh['index_file']} missing")
+                index_texts[sh["index_file"]] = text
+            rel = write_descriptor(self.tools, self.workdir, sink, s, spine_local,
+                                   manifest_text, index_texts, self._events(s.id))
+            set_results[s.id] = dataclasses.replace(res, descriptor_rel=rel)
+
+    def _emit_spine(self, spine: tuple[int, str]) -> None:
+        self._emit({
+            "kind": "blob_written", "stage": "spine",
+            "file": self.rplan.spine_path.rsplit("/", 1)[-1],
+            "bytes": int(spine[0]), "sha256": str(spine[1]),
         })
 
     # -- stage grouping ----------------------------------------------------------------
@@ -288,6 +325,7 @@ class Job:
         log = self._log_events() if self.resume else []
         done = self._completed(log)
         groups = self._expert_groups()
+        spine_stage: SpineStage | None = None
         try:
             self._preflight(log)
 
@@ -303,15 +341,20 @@ class Job:
                 self._emit({"kind": "stage_done", "stage": "spine", "resumed": True})
             else:
                 builder = self.builder or ConverterSpineBuilder(self.tools, self.rplan.arch, self.rplan.plan.name)
-                spine = SpineStage(
+                spine_stage = SpineStage(
                     self.rplan, self.source, self.tools, self._spine_sink(),
                     self._events("spine"), self.workdir, builder,
-                ).run()
-            self._emit({
-                "kind": "blob_written", "stage": "spine",
-                "file": self.rplan.spine_path.rsplit("/", 1)[-1],
-                "bytes": int(spine[0]), "sha256": str(spine[1]),
-            })
+                )
+                if self.source.is_gguf:
+                    spine = spine_stage.run()
+                else:
+                    # single pass: dense-only shards now; shards that also hold
+                    # experts are peeled by the expert stages before release;
+                    # the spine is built after them (step 3b)
+                    spine_stage.peel_dense_only()
+                    spine = None
+            if spine is not None:
+                self._emit_spine(spine)
 
             # 2. sidecars (HF sources only; only classes the plan quantizes)
             sidecars: dict[str, tuple[int, str]] = {}
@@ -337,6 +380,7 @@ class Job:
 
             # 3. expert stages in plan order, releasing shards as we go
             set_results: dict[str, StageResult] = {}
+            on_release = spine_stage.peel_shard if spine is None and spine_stage is not None else None
             for i, g in enumerate(groups):
                 stage_id = g[0].id.rsplit("-w", 1)[0]
                 sinks = {
@@ -350,6 +394,7 @@ class Job:
                         res = ExpertStage(
                             g, self.rplan, self.source, self.tools, sinks,
                             self._events(stage_id), self.workdir, workers=self.workers,
+                            on_release=on_release,
                         ).run()
                     else:
                         self._emit({"kind": "stage_done", "stage": stage_id, "resumed": True})
@@ -357,6 +402,7 @@ class Job:
                     res = ExpertStage(
                         g, self.rplan, self.source, self.tools, sinks,
                         self._events(stage_id), self.workdir, workers=self.workers,
+                        on_release=on_release,
                     ).run()
                 set_results.update(res)
                 for s in g:
@@ -371,7 +417,17 @@ class Job:
                         for s in later_group:
                             later |= self._shards_needed(s)
                     for shard in self._shards_needed(g[0]) - later:
+                        if on_release is not None:
+                            on_release(shard)
                         self.source.release_shard(shard)
+
+            # 3b. spine from the peel the expert stages filled (re-peels only
+            # what a resumed run never saw)
+            if spine is None:
+                assert spine_stage is not None
+                spine = spine_stage.finish()
+                self._emit_spine(spine)
+                self._write_deferred_descriptors(set_results)
 
             # 4. bundle, place, verify
             bundle = bundle_mod.write_bundle(

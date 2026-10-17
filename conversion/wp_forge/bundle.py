@@ -78,6 +78,7 @@ def write_bundle(rplan: ResolvedPlan, *, spine: tuple[int, str],
             "role": s.role,
             "layers": [s.layers.first, s.layers.last],
             "width": width,
+            "experts": None if s.expert_first is None else [s.expert_first, s.expert_last],
             "n_ff_exp": int(rplan.hparams[arch.n_ff_exp_key]),
             "machine": s.machine,
             "path": s.dir,
@@ -145,14 +146,34 @@ def _coverage_check(b: dict, hparams: dict | None, arch) -> Check:
         # per layer: the experts a set actually holds (its slice width when
         # sliced, the full expert count when unsliced) must sum to n_ff_exp;
         # a layer is covered when the total is > 0.
+        # Expert-range sets (whole experts first..last) instead must tile the
+        # expert ids 0..n_expert-1 per layer; a fully tiled layer counts as
+        # holding the full width.
         full = int(expert[0]["n_ff_exp"]) if expert else 0
         total: dict[int, int] = {}
+        ranges: dict[int, list[tuple[int, int]]] = {}
         for s in expert:
-            held = (s["width"][1] - s["width"][0]) if s["width"] else full
             for l in range(s["layers"][0], s["layers"][1] + 1):
+                if s.get("experts"):
+                    ranges.setdefault(l, []).append(tuple(s["experts"]))
+                    continue
+                held = (s["width"][1] - s["width"][0]) if s["width"] else full
                 total[l] = total.get(l, 0) + held
         exp_max = max((s["layers"][1] for s in expert), default=-1)
         problems = []
+        n_expert = (int(hparams[arch.n_expert_key])
+                    if ranges and hparams is not None and arch is not None
+                    and arch.n_expert_key in hparams else None)
+        for l, rs in sorted(ranges.items()):
+            rs.sort()
+            nxt = 0
+            for first, last in rs:
+                if first != nxt:
+                    problems.append(f"layer {l} expert ranges {'overlap' if first < nxt else 'gap'} at {first}")
+                nxt = max(nxt, last + 1)
+            if n_expert is not None and nxt != n_expert:
+                problems.append(f"layer {l} expert ranges end at {nxt - 1}, want {n_expert - 1}")
+            total[l] = total.get(l, 0) + full
         for l in range(exp_max + 1):
             n = total.get(l, 0)
             if n == 0:

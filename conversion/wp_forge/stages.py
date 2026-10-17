@@ -49,14 +49,20 @@ from typing import Callable, Dict, Protocol
 
 import gguf
 import numpy as np
+from gguf.utility import SafetensorRemote
 
 from .arch import ArchSpec, classify, expert_tensor_names, expert_tensor_names_stage
 from .plan import ResolvedPlan, SetSpec
 from .quant import QuantError, lossless_repack, quantize_expert
-from .sink import Sink
+from .sink import LocalSink, Sink
 from .source import Source
 from .stitch import LayerOutput, layer_outputs_from_repack, stitch
 from .tools import Tools, ToolError
+# quant.py put the repo root on sys.path before this import
+from conversion.dsv41_engram_from_hf import (  # noqa: E402
+    build_engram_gguf, find_local_shard, local_shard_tensors, make_ranged, make_session,
+    progress_done, progress_path_for,
+)
 
 
 @dataclass
@@ -64,6 +70,32 @@ class StageResult:
     manifest_rel: str
     descriptor_rel: str | None
     blobs: list[tuple[str, int, str]]  # (dst_name, bytes, sha256)
+
+
+def write_descriptor(
+    tools: Tools, workdir: Path, sink: Sink, s: SetSpec, spine_local: Path,
+    manifest_text: str, index_texts: dict[str, str], events: Callable[[dict], None],
+) -> str | None:
+    """Run llama-wp-expert-descriptor on LOCAL copies of a set's manifest and
+    shard indexes and upload the result. None when the tool rejects the
+    manifest (sliced+layer-partial is a known C++ gap)."""
+    manifest_rel = f"{s.output_base}-experts-manifest.json"
+    descriptor_rel = f"{s.output_base}-experts-manifest.expert-descriptor.json"
+    try:
+        desc_dir = workdir / f"desc-{s.id}"
+        desc_dir.mkdir(parents=True, exist_ok=True)
+        (desc_dir / manifest_rel).write_text(manifest_text)
+        for rel, text in index_texts.items():
+            (desc_dir / rel).write_text(text)
+        desc_local = tools.descriptor(spine_local, desc_dir / manifest_rel)
+        if not sink.exists(descriptor_rel):
+            sink.put_text(desc_local.read_text(), descriptor_rel)
+        shutil.rmtree(desc_dir, ignore_errors=True)
+        return descriptor_rel
+    except ToolError:
+        events({"kind": "verify", "set": s.id,
+                "descriptor": "skipped: tool rejected sliced+layer-partial manifest"})
+        return None
 
 
 class ExpertStage:
@@ -78,9 +110,13 @@ class ExpertStage:
         workdir: Path,
         *,
         workers: int = 1,
+        on_release: Callable[[str], None] | None = None,
     ) -> None:
         if not stage_sets:
             raise ValueError("ExpertStage needs at least one set")
+        # called with a shard id just before the stage drops it from the cache
+        # (SpineStage.peel_shard: one download feeds the spine and the experts)
+        self.on_release = on_release
         # One stage owns all width sets of one plan stage: they share layers and
         # widths (the same split applied to every width set); only slice_index
         # differs. Assert that.
@@ -222,6 +258,8 @@ class ExpertStage:
             by_shard[shard] = max(by_shard.get(shard, -1), layer)
         for shard in shards:
             if by_shard.get(shard, -1) <= L:
+                if self.on_release is not None:
+                    self.on_release(shard)
                 self.source.release_shard(shard)
 
     # -- ml8 (rotated ML8_FP8/ML8_4) helpers -------------------------------
@@ -522,29 +560,18 @@ class ExpertStage:
             if not sink.exists(idx_rel):
                 sink.put_text(plan.index_text, idx_rel)
 
-        descriptor_rel: str | None = f"{s.output_base}-experts-manifest.expert-descriptor.json"
         spine_local = Path(self.rplan.spine_path).expanduser()
-        if not spine_local.exists():
-            raise AssertionError(f"spine not local: {spine_local}")
-        try:
-            desc_dir = self.workdir / f"desc-{s.id}"
-            desc_dir.mkdir(parents=True, exist_ok=True)
-            (desc_dir / manifest_rel).write_text(manifest_text)
-            for plan in stitched.blobs:
-                (desc_dir / (plan.dst_name[: -len(".wpb")] + ".wpi.json")).write_text(plan.index_text)
-            desc_local = self.tools.descriptor(spine_local, desc_dir / manifest_rel)
-            if not sink.exists(descriptor_rel):
-                sink.put_text(desc_local.read_text(), descriptor_rel)
-            shutil.rmtree(desc_dir, ignore_errors=True)
-        except ToolError:
-            descriptor_rel = None
-            self.events(
-                {
-                    "kind": "verify",
-                    "set": s.id,
-                    "descriptor": "skipped: tool rejected sliced+layer-partial manifest",
-                }
+        if spine_local.exists():
+            descriptor_rel = write_descriptor(
+                self.tools, self.workdir, sink, s, spine_local, manifest_text,
+                {p.dst_name[: -len(".wpb")] + ".wpi.json": p.index_text for p in stitched.blobs},
+                self.events,
             )
+        else:
+            # single-pass run: the spine is built after the expert stages;
+            # Job.run writes the descriptor once it exists
+            descriptor_rel = None
+            self.events({"kind": "verify", "set": s.id, "descriptor": "deferred: spine not built yet"})
 
         blobs = [(entries[L][1], entries[L][2], entries[L][3]) for L in self.layers]
         return StageResult(manifest_rel=manifest_rel, descriptor_rel=descriptor_rel, blobs=blobs)
@@ -705,12 +732,19 @@ class ConverterSpineBuilder:
                 "zero-stub peel trick is a follow-up"
             )
         tmp_bf16 = out_gguf.parent / (out_gguf.name + ".bf16.gguf")
+        dense_type = quant.get("dense", "q8_0")
         try:
             self.tools.convert_hf(peel_dir, tmp_bf16)
-            result = self.tools.quantize(
-                tmp_bf16, out_gguf,
-                default_type=quant.get("dense", "q8_0"), tensor_types={},
-            )
+            if dense_type == "bf16":
+                # the converter output IS the bf16 spine; llama-quantize would
+                # refuse it anyway when the converter already emitted q8_0
+                # (deepseek41 FP8 weights convert straight to q8_0)
+                os.replace(tmp_bf16, out_gguf)
+                result = out_gguf
+            else:
+                result = self.tools.quantize(
+                    tmp_bf16, out_gguf, default_type=dense_type, tensor_types={},
+                )
         finally:
             tmp_bf16.unlink(missing_ok=True)
         # the loader only skips the routed experts when the spine says they are
@@ -772,9 +806,52 @@ class SpineStage:
             )
             return size, sha
 
-        self.workdir.mkdir(parents=True, exist_ok=True)
-        peel_dir = self.workdir / "peel"
-        peel_bytes = self._peel(peel_dir)
+        self.peel_dense_only(also_expert_shards=True)
+        return self.finish()
+
+    # -- single pass: the expert stages hand each shard to peel_shard before
+    # releasing it, so a shard holding both dense and expert tensors is
+    # downloaded once. peel_dense_only() covers shards no expert stage reads;
+    # finish() peels anything still missing (resume) and builds the spine.
+
+    @property
+    def peel_dir(self) -> Path:
+        return self.workdir / "peel"
+
+    def _dense_names(self) -> set[str]:
+        if not hasattr(self, "_dense"):
+            index = self.source.tensor_index()
+            self._dense = {
+                n for n in index if classify(self.rplan.arch, n) in ("dense", "spec_head.dense")
+            }
+        return self._dense
+
+    def _dense_shards(self) -> list[str]:
+        index = self.source.tensor_index()
+        return sorted({index[n] for n in self._dense_names()})
+
+    def peel_dense_only(self, also_expert_shards: bool = False) -> None:
+        """Peel (then release) dense-bearing shards that hold no routed expert
+        tensor; with also_expert_shards, every dense-bearing shard."""
+        index = self.source.tensor_index()
+        has_expert = {
+            index[n] for n in index
+            if classify(self.rplan.arch, n) in ("experts", "spec_head.experts")
+        }
+        for shard in self._dense_shards():
+            if also_expert_shards or shard not in has_expert:
+                self.peel_shard(shard)
+                self.source.release_shard(shard)
+
+    def finish(self) -> tuple[int, str]:
+        spine_rel = self.rplan.spine_path.rsplit("/", 1)[-1]
+        t0 = time.time()
+        for shard in self._dense_shards():
+            if not (self.peel_dir / shard).is_file():
+                self.peel_shard(shard)
+                self.source.release_shard(shard)
+        peel_dir = self.peel_dir
+        peel_bytes = self._write_peel_index(peel_dir)
         self.events(
             {"kind": "stage_start", "stage": "spine",
              "est_local_peak_bytes": 2 * peel_bytes}
@@ -791,52 +868,52 @@ class SpineStage:
         )
         return size, sha
 
-    def _peel(self, peel_dir: Path) -> int:
+    def peel_shard(self, shard: str) -> None:
+        """Copy one shard's dense tensors into peel_dir/<shard> (idempotent).
+        Does not release the shard: the caller owns the cache."""
         import torch
-        from safetensors.torch import save_file  # noqa: F401 (API per contract)
+        from safetensors.torch import save_file
 
-        peel_dir.mkdir(parents=True, exist_ok=True)
-        arch = self.rplan.arch
-        index = self.source.tensor_index()
-        # only the shards the index says hold dense tensors are fetched: on a
-        # real repo (Qwen3.8: 131 files, 360 GB) most files hold only experts
-        # or a sidecar table, and opening them here would download all of it
-        dense_names = {
-            n for n in index if classify(arch, n) in ("dense", "spec_head.dense")
-        }
-        shards = sorted({index[n] for n in dense_names})
-        weight_map: dict[str, str] = {}
-        for shard in shards:
-            # resume: a shard already peeled keeps its file; rebuild its map entries
-            if (peel_dir / shard).is_file():
-                from safetensors import safe_open
-                with safe_open(str(peel_dir / shard), framework="pt", device="cpu") as f:
-                    for name in f.keys():
-                        weight_map[name] = shard
-                continue
+        dense_names = self._dense_names()
+        if not hasattr(self, "_peel_lock"):
+            self._peel_lock = threading.Lock()
+        with self._peel_lock:
+            self.peel_dir.mkdir(parents=True, exist_ok=True)
+            dst = self.peel_dir / shard
+            if dst.is_file() or shard not in set(self._dense_shards()):
+                return
             tensors: dict[str, "torch.Tensor"] = {}
             with self.source.open_shard(shard) as reader:
                 for name in reader.keys():
                     if name not in dense_names:
                         continue
-                    # reader.get_tensor f32-casts; back to bf16 for the peel
-                    # (dsv41_experts_from_hf peels raw, the synthetic repo is
-                    # bf16 so the round trip is lossless there). Integer
-                    # tensors must NOT go through that cast: Qwen3.8's PLE hash
-                    # constants are exact int64 (45-bit multipliers, prime
-                    # vocab sizes) and bf16 rounding silently corrupts them.
                     arr = reader.get_tensor(name)
-                    t = torch.from_numpy(arr)
-                    if np.issubdtype(arr.dtype, np.floating):
-                        t = t.to(torch.bfloat16)
+                    if isinstance(arr, torch.Tensor):
+                        # raw FP8 weights / E8M0 scales / packed ints: peel
+                        # bit-exact; the converter pairs and dequantizes them
+                        t = arr
+                    else:
+                        # f32-cast floats back to bf16 for the peel; integer
+                        # tensors (Qwen3.8 PLE hash constants, exact int64)
+                        # must NOT be rounded through bf16
+                        t = torch.from_numpy(arr)
+                        if np.issubdtype(arr.dtype, np.floating):
+                            t = t.to(torch.bfloat16)
                     tensors[name] = t
-                    weight_map[name] = shard
             if tensors:
-                save_file(tensors, str(peel_dir / shard))
-            # release: keeping every dense-bearing shard would pin ~100 GB of
-            # cache on Qwen3.8 (49 of the 52 also hold experts). The expert
-            # stages re-fetch what they need; network is cheaper than disk here.
-            self.source.release_shard(shard)
+                tmp = dst.with_name(dst.name + ".part")
+                save_file(tensors, str(tmp))
+                os.replace(tmp, dst)
+            self.events({"kind": "peeled", "stage": "spine", "shard": shard, "tensors": len(tensors)})
+
+    def _write_peel_index(self, peel_dir: Path) -> int:
+        from safetensors import safe_open
+
+        weight_map: dict[str, str] = {}
+        for f in sorted(peel_dir.glob("*.safetensors")):
+            with safe_open(str(f), framework="pt", device="cpu") as h:
+                for name in h.keys():
+                    weight_map[name] = f.name
         (peel_dir / "config.json").write_text(
             (self.source.cache_dir / "config.json").read_text()
         )
@@ -864,6 +941,9 @@ class SidecarStage:
     class keeps its HF name unchanged. f16/bf16 plan quants store the raw
     values; quant types are packed per-tensor through quantize_expert.
 
+    deepseek41 engram is built in place (_run_engram): FP8 -> MXFP4 rows straight into the
+    final GGUF through the streaming converter, no staging copy, quant must be "mxfp4".
+
     GGUF sources have no sidecars: run() is a no-op returning (0, "").
     """
 
@@ -888,6 +968,8 @@ class SidecarStage:
     def run(self) -> tuple[int, str]:
         if self.source.is_gguf:
             return 0, ""
+        if self.cls == "engram" and self.rplan.arch.name == "deepseek41":
+            return self._run_engram()
         sidecar_rel = self.rplan.sidecar_paths[self.cls].rsplit("/", 1)[-1]
         if self.sink.exists(sidecar_rel) and (self.sink.size(sidecar_rel) or 0) > 0:
             self.events({"kind": "stage_done", "stage": self.cls, "resumed": True})
@@ -925,6 +1007,63 @@ class SidecarStage:
              "sha": sha, "secs": round(time.time() - t0, 3)}
         )
         return size, sha
+
+    def _run_engram(self) -> tuple[int, str]:
+        qtype = self.rplan.plan.quant[self.cls]
+        if qtype != "mxfp4":
+            raise QuantError(
+                f"sidecar engram: {self.rplan.arch.name} engram is streamed FP8 -> MXFP4 in place; "
+                f"quant must be 'mxfp4', got '{qtype}'"
+            )
+        rel = self.rplan.sidecar_paths[self.cls].rsplit("/", 1)[-1]
+        local = isinstance(self.sink, LocalSink)
+        # LocalSink: build at the final path (resumed via its progress json). Other sinks: build in
+        # the workdir, then put and delete.
+        target = Path(self.sink.root) / rel if local else self.workdir / rel
+        if self.sink.exists(rel) and (self.sink.size(rel) or 0) > 0 and (not local or progress_done(target)):
+            self.events({"kind": "stage_done", "stage": self.cls, "resumed": True})
+            return self.sink.size(rel), self.sink.sha256(rel)
+
+        t0 = time.time()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        remote, ranges = self._engram_inputs()
+        self.events({"kind": "stage_start", "stage": self.cls})
+        done = build_engram_gguf(
+            target, self.rplan.hparams, remote, ranges,
+            on_layer=lambda L, secs: self.events(
+                {"kind": "layer_done", "stage": self.cls, "layer": L, "secs": round(secs, 3)}),
+        )
+        if not done:
+            raise RuntimeError(f"sidecar engram: {target} is incomplete after build")
+        if local:
+            size, sha = self.sink.size(rel), self.sink.sha256(rel)
+        else:
+            size, sha = self.sink.put_file(target, rel)
+            target.unlink()
+            progress_path_for(target).unlink(missing_ok=True)
+        self.events(
+            {"kind": "stage_done", "stage": self.cls, "bytes": size,
+             "sha": sha, "secs": round(time.time() - t0, 3)}
+        )
+        return size, sha
+
+    def _engram_inputs(self):
+        """Remote tensor metadata and byte-range readers for the engram layers. Shard names come
+        from the source index; the URL pins the source's repo and revision (main when unpinned)."""
+        index = self.source.tensor_index()
+        base = f"{SafetensorRemote.BASE_DOMAIN}/{self.source.repo}/resolve/{self.source.revision or 'main'}"
+        shards = {int(L): index[f"layers.{L}.engram.embed.weight"] for L in self.rplan.hparams["engram_layer_ids"]}
+        session = make_session()
+        remote: dict = {}
+        local_of: dict[str, Path | None] = {}
+        for shard in sorted(set(shards.values())):
+            local_of[shard] = find_local_shard(self.source.cache_dir, shard)
+            if local_of[shard] is not None:
+                remote.update(local_shard_tensors(local_of[shard]))
+            else:
+                remote.update(SafetensorRemote.get_list_tensors(f"{base}/{shard}"))
+        ranges = {L: make_ranged(session, f"{base}/{shard}", local_of[shard]) for L, shard in shards.items()}
+        return remote, ranges
 
     @staticmethod
     def _gguf_name(hf_name: str) -> str:

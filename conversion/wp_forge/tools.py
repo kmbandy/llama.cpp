@@ -99,7 +99,7 @@ class Tools:
     # ------------------------------------------------------------------ run
 
     def _run(self, tool: str, argv: list[str]) -> None:
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        proc = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         if proc.returncode != 0:
             raise ToolError(
                 tool, argv, proc.returncode, proc.stderr[-STDERR_TAIL_CHARS:]

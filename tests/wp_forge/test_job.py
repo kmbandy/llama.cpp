@@ -31,7 +31,7 @@ source: hf:fake/repo
 quant:
   experts: q8_0
   dense: q8_0
-  engram: q8_0
+  engram: mxfp4
 spine: a
 experts:
   - layers: 0-1
@@ -78,6 +78,16 @@ def _rplan(env, source):
     return plan_mod.resolve(plan, source.hparams(), machines, source_is_gguf=source.is_gguf)
 
 
+def _stage_engram_shard(env) -> None:
+    """The in-place engram build reads a complete local shard (no HF Range in tests)."""
+    cache = env["wd"] / "hf-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    weight_map = json.loads((env["hub"] / "model.safetensors.index.json").read_text())["weight_map"]
+    shard = weight_map["layers.0.engram.embed.weight"]
+    shutil.copy(env["hub"] / shard, cache / shard)
+    (cache / (shard + ".complete")).write_text("")
+
+
 def _events(wd: Path) -> list[dict]:
     log = wd / "forge.jsonl"
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
@@ -100,6 +110,7 @@ def test_cli_dry_run(env, monkeypatch, capsys):
 
 def test_full_run(env):
     wd = env["wd"]
+    _stage_engram_shard(env)
     source = env["source"]()
     rplan = _rplan(env, source)
     b = Job(rplan, source, env["tools"], workdir=wd,
@@ -127,13 +138,14 @@ def test_full_run(env):
     assert kinds[0] == "plan_resolved"
     assert all("ts" in e and "job_id" in e for e in events)
     assert sum(1 for e in events if e["kind"] == "stage_done") >= 3
-    assert sum(1 for e in events if e["kind"] == "layer_done") == 3
+    assert sum(1 for e in events if e["kind"] == "layer_done" and e["stage"] != "engram") == 3
     assert any(e["kind"] == "verify" and e.get("ok") is True for e in events)
     assert (env["a"] / "m" / "forge.jsonl").is_file()
 
 
 def test_resume_after_crash(env, monkeypatch):
     wd = env["wd"]
+    _stage_engram_shard(env)
     source = env["source"]()
     rplan = _rplan(env, source)
 
@@ -161,7 +173,12 @@ def test_resume_after_crash(env, monkeypatch):
     pr = next(e for e in events2 if e["kind"] == "plan_resolved")
     assert pr["resumed"] is True
     starts = [e["stage"] for e in events2 if e["kind"] == "stage_start"]
-    assert "spine" not in starts
+    # single pass: the spine is built after the expert stages, so a crash in
+    # L2-2 leaves it unbuilt -- but the first run's peels are reused
+    assert starts.index("spine") > starts.index("L2-2")
+    peeled1 = {e["shard"] for e in events1 if e["kind"] == "peeled"}
+    peeled2 = {e["shard"] for e in events2 if e["kind"] == "peeled"}
+    assert peeled1 and not (peeled1 & peeled2)
     assert "engram" not in starts
     assert "L0-1" not in starts
     assert "L2-2" in starts
@@ -191,3 +208,21 @@ def test_preflight_names_machine(env, monkeypatch):
     # preflight fails before any stage: log has at most plan_resolved absent
     events = _events(env["wd"])
     assert not any(e["kind"] == "plan_resolved" for e in events)
+
+
+def test_single_pass_fetches_each_shard_once(env):
+    # the spine peel rides the expert pass: no weight shard is downloaded twice
+    wd = env["wd"]
+    _stage_engram_shard(env)
+    counts: dict[str, int] = {}
+    inner = env["fetch"]
+
+    def counting(repo: str, filename: str, dest_dir: Path) -> Path:
+        if filename.endswith(".safetensors"):
+            counts[filename] = counts.get(filename, 0) + 1
+        return inner(repo, filename, dest_dir)
+
+    source = HFSource("fake/repo", wd / "hf-cache", fetch=counting)
+    rplan = _rplan(env, source)
+    Job(rplan, source, env["tools"], workdir=wd, builder=SyntheticSpineBuilder()).run()
+    assert counts and all(n == 1 for n in counts.values()), counts

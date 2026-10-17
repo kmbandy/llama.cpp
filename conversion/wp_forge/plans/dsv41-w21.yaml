@@ -1,18 +1,31 @@
-# Experts only. Every layer, whole experts: 256 on main, 128 on 2026.
-# Spine and engram stay the files already on disk. Spec head is not rebuilt.
-# Repack writes gate/up/down as one group, then llama-wp-expert-shard keeps
-# each expert whole and sends its id range to one machine.
+# Full rebuild of the DS4.1 bundle from DeepSeek-V4.1-Flash-1017 (2026-10-17:
+# weights-only update; config/tokenizer/index.json byte-identical to V4.1-Flash).
+# Whole experts: 256 on main, 128 on 2026. Name kept so expert dirs match the
+# router worker presets (~/models/dsv41-w21/L0-39-e0, /mnt/nvme/dsv41-w21/L0-39-e1).
+#
+# Engram is streamed FP8 -> MXFP4 in place by the sidecar stage (no staging copy).
+#
+# Spine is forged as BF16 (dsv41-w21-spine.gguf), then converted to ML8_4 with
+# scripts/calibration/convert_fp8_rotated.py --format ml8_4 and swapped in at the
+# same path (manifests name it in model_files; the descriptor reads shapes only).
+# Spec head (MTP 40-42 routed experts) lands as set L40-42 on main, then
+# `wp-forge merge-sets bundle.json --into L0-39-e0 --from L40-42` folds it into
+# e0 -- MTP experts live in the existing expert set, served by the same worker.
 name: dsv41-w21
-source: hf:deepseek-ai/DeepSeek-V4.1-Flash
-experts_only: true
-spine_file: /home/kmbandy/models/dsv41-spine-ml84.gguf
+source: hf:deepseek-ai/DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170
 quant:
   experts: mxfp4
+  spec_head.experts: mxfp4
+  dense: bf16
+  spec_head.dense: bf16
+  engram: mxfp4
 spine: mad-lab-main
 sidecars: mad-lab-main
-spec_head: none
 experts:
   - layers: "0-39"
     machine: mad-lab-main
     expert_ranges: ["0-255", "256-383"]
     slice_machines: [mad-lab-main, mad-lab-2026]
+spec_head:
+  layers: "40-42"
+  machine: mad-lab-main

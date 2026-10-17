@@ -519,7 +519,13 @@ def _hf_model(source: str, cache_dir: Path | None, opts: dict[str, Any] | None =
 
     if source.startswith("hf:"):
         from huggingface_hub import snapshot_download
-        repo = source[3:]
+        from .source import parse_hf_spec
+        repo, revision = parse_hf_spec(source)
+        if revision is not None:
+            # the stock converter streams weights from gguf.utility.SafetensorRemote,
+            # which hardcodes resolve/main; a pin here would silently mix revisions
+            raise ConvertError(f"source {source!r}: revision pins are not supported on the convert path "
+                               "(stock converter streams from resolve/main); use the expert pipeline")
         local = snapshot_download(repo_id=repo, cache_dir=str(cache_dir) if cache_dir else None,
                                   allow_patterns=["LICENSE", "*.json", "*.md", "*.txt", "*.jinja",
                                                   "tokenizer.model"])

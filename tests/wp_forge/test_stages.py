@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from conversion.wp_forge.arch import ARCHS
+from conversion.wp_forge.quant import QuantError
 from conversion.wp_forge.plan import LayerRange, SetSpec
 from conversion.wp_forge.sink import LocalSink
 from conversion.wp_forge.source import HFSource
@@ -269,28 +270,17 @@ def test_spine_stage_synthetic(env):
     assert done[0]["stage"] == "spine"
 
 
-def test_sidecar_stage_engram(env):
+def test_sidecar_stage_engram_rejects_q8_0(env):
+    # deepseek41 engram is FP8 -> MXFP4 in place; the positive path is in test_engram_inplace.py
     sink = LocalSink(str(env.tmp_path / "engram-out"))
     sink.mkdir()
     stage = SidecarStage(
         "engram", env.rplan, env.source, env.tools, sink,
         lambda e: None, env.tmp_path / "work-engram",
     )
-    size, sha = stage.run()
-
-    sidecar_rel = env.rplan.sidecar_paths["engram"].rsplit("/", 1)[-1]
-    assert sink.exists(sidecar_rel) and sink.size(sidecar_rel) == size
-    assert sink.sha256(sidecar_rel) == sha
-    assert not (env.tmp_path / "work-engram" / "engram.gguf").exists()
-
-    n_layer = env.rplan.arch.n_layer(env.rplan.hparams)
-    r = gguf.GGUFReader(str(env.tmp_path / "engram-out" / sidecar_rel))
-    assert r.tensors is not None and len(r.tensors) == n_layer
-    for L, t in enumerate(r.tensors):
-        assert t.name == f"blk.{L}.engram_embd.weight", t.name
-        assert t.tensor_type is gguf.GGMLQuantizationType.Q8_0
-        assert tuple(int(x) for x in t.shape[::-1]) == (16, 32)  # GGUFReader shape is ggml ne-order (reversed)
-    assert r.get_field("general.name").contents() == "synthetic"
+    with pytest.raises(QuantError, match="quant must be 'mxfp4', got 'q8_0'"):
+        stage.run()
+    assert not (env.tmp_path / "engram-out" / "synthetic-engram.gguf").exists()
 
 
 def test_converter_builder_env_gated(env):

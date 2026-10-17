@@ -113,6 +113,8 @@ _DSV41 = ArchSpec(
                                    proj={"gate": "w1", "down": "w2", "up": "w3"}, scale_suffix=".scale"),
     sidecars={"engram": r"^layers\.\d+\.engram\."},
     spec_head_n_expert_key="dspark_n_routed_experts",
+    # deepseek.py generate_extra_tensors skips absent routed experts (spine-only convert)
+    converter_tolerates_missing_experts=True,
 )
 
 _DSV4 = ArchSpec(

@@ -6,6 +6,7 @@ tests use a local directory as the hub.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -50,11 +51,25 @@ def flatten_hparams(cfg: dict) -> dict:
     return out
 
 
-def _hf_fetch(repo: str, filename: str, dest_dir: Path) -> Path:
+def parse_hf_spec(spec: str) -> tuple[str, str | None]:
+    """'hf:<repo>[@<revision>]' -> (repo, revision). Splits on the LAST '@'
+    so the repo part may not contain one; revision None means the default branch."""
+    if not spec.startswith("hf:"):
+        raise PlanError(f"source: {spec!r} is not an hf: spec")
+    body = spec[3:]
+    if "@" not in body:
+        return body, None
+    repo, rev = body.rsplit("@", 1)
+    if not repo or not rev:
+        raise PlanError(f"source: {spec!r} needs a repo and a non-empty revision after '@'")
+    return repo, rev
+
+
+def _hf_fetch(repo: str, filename: str, dest_dir: Path, revision: str | None = None) -> Path:
     from huggingface_hub import hf_hub_download
     dest_dir.mkdir(parents=True, exist_ok=True)
     return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=str(dest_dir),
-                                token=os.environ.get("HF_TOKEN")))
+                                token=os.environ.get("HF_TOKEN"), revision=revision))
 
 
 class _SafetensorsReader:
@@ -79,16 +94,24 @@ class _SafetensorsReader:
         # can view the same bytes as uint8; numpy would be the wrong type.
         if t.dtype in (torch.uint8, torch.int8):
             return t
+        # FP8 block-scaled weights (DS4.1 attention, shared experts, engram):
+        # numpy has no float8. Keep them raw so the converter still sees an FP8
+        # weight beside its .scale partner and dequantizes the pair.
+        if t.dtype in tuple(getattr(torch, n) for n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, n)):
+            return t
         return t.numpy()
 
 
 class HFSource:
     is_gguf = False
 
-    def __init__(self, repo: str, cache_dir: Path, fetch: Fetch | None = None):
+    def __init__(self, repo: str, cache_dir: Path, fetch: Fetch | None = None,
+                 revision: str | None = None):
         self.repo = repo
+        self.revision = revision
         self.cache_dir = Path(cache_dir)
-        self.fetch = fetch or _hf_fetch
+        # an injected fetch must take the revision itself (closure), see cli.make_source
+        self.fetch = fetch or functools.partial(_hf_fetch, revision=revision)
         self._hparams: dict | None = None
         self._index: dict[str, str] | None = None
         # Several shard files at once. One file per layer, so this is what

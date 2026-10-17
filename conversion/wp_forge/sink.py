@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Protocol
@@ -35,6 +36,9 @@ class Sink(Protocol):
     def put_text(self, text: str, relpath: str) -> None: ...
     def get_text(self, relpath: str) -> str | None: ...
     def mkdir(self) -> None: ...
+    def rename(self, src: str, dst: str) -> None: ...
+    def remove(self, relpath: str) -> None: ...
+    def rmdir(self, relpath: str) -> bool: ...
 
 
 class _Base:
@@ -173,6 +177,23 @@ class LocalSink:
         except OSError:
             return None
 
+    def rename(self, src: str, dst: str) -> None:
+        # never overwrites: a finished blob is never silently replaced
+        d = self._p(dst)
+        if d.exists():
+            raise FileExistsError(str(d))
+        shutil.move(str(self._p(src)), str(d))  # shutil: works across mounts too
+
+    def remove(self, relpath: str) -> None:
+        self._p(relpath).unlink(missing_ok=True)
+
+    def rmdir(self, relpath: str) -> bool:
+        try:
+            self._p(relpath).rmdir()
+        except OSError:  # not empty, or gone
+            return False
+        return True
+
 
 class SSHSink:
     def __init__(self, host: str, root: str):
@@ -219,6 +240,17 @@ class SSHSink:
         if not self.exists(relpath):
             return None
         return _ssh(self.host, f"cat {shlex.quote(self._p(relpath))}")
+
+    def rename(self, src: str, dst: str) -> None:
+        s, d = shlex.quote(self._p(src)), shlex.quote(self._p(dst))
+        _ssh(self.host, f"test ! -e {d} && mv {s} {d}")
+
+    def remove(self, relpath: str) -> None:
+        _ssh(self.host, f"rm -f {shlex.quote(self._p(relpath))}")
+
+    def rmdir(self, relpath: str) -> bool:
+        out = _ssh(self.host, f"rmdir {shlex.quote(self._p(relpath))} 2>/dev/null && echo y || echo n")
+        return out.strip() == "y"
 
 
 def sink_for(m: Machine, root: str) -> Sink:

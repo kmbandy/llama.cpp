@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_PATH = Path("~/.config/mad-lab-agents/machines.json").expanduser()
-_ALLOWED = {"local", "ssh", "models_dir"}
+# router_node: the llama-router reads the same file (server-router-machines.h)
+_ALLOWED = {"local", "ssh", "models_dir", "router_node"}
 SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 

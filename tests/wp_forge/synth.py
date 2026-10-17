@@ -4,7 +4,9 @@ Tiny, deterministic, bf16 everywhere. Expert tensors are plain bf16 with NO
 `.scale` partners, so the lossless MXFP4 repack path does not apply here (the
 stage falls through to dequant->quantize). One safetensors shard per layer,
 one per MTP stage, one for embed/head/norm -- the DS4.1 layout minus the
-+3 shard offset the real repo has.
++3 shard offset the real repo has. Engram (when enabled) is its own shard,
+FP8 E4M3 weight + per-row scale stored as uint8 E8M0 bytes, like the real
+checkpoint's engram shards (no dense tensors, so the spine peel never frees it).
 """
 from __future__ import annotations
 
@@ -33,7 +35,7 @@ def make_synthetic_hf_repo(
     dir = Path(dir)
     dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
-    n_shards = n_layer + nextn + 1
+    n_shards = n_layer + nextn + 1 + (1 if engram else 0)
     weight_map: dict[str, str] = {}
     total = 0
 
@@ -61,8 +63,6 @@ def make_synthetic_hf_repo(
         t[f"layers.{layer}.attn.wq.weight"] = _t(rng, n_embd, n_embd)
         t[f"layers.{layer}.ffn.shared_experts.w1.weight"] = _t(rng, n_ff, n_embd)
         t[f"layers.{layer}.attn_norm.weight"] = _t(rng, n_embd)
-        if engram:
-            t[f"layers.{layer}.engram.embed.weight"] = _t(rng, 16, n_embd)
         write(layer, t)
     for stage in range(nextn):
         t = experts(f"mtp.{stage}.ffn.experts")
@@ -73,6 +73,14 @@ def make_synthetic_hf_repo(
         "head.weight": _t(rng, 64, n_embd),
         "norm.weight": _t(rng, n_embd),
     })
+    if engram:
+        erng = np.random.default_rng(1)  # own stream: the layer tensors above stay unchanged
+        e: dict[str, torch.Tensor] = {}
+        for layer in range(n_layer):
+            e[f"layers.{layer}.engram.embed.weight"] = torch.from_numpy(
+                erng.standard_normal((16, n_embd), dtype=np.float32)).to(torch.float8_e4m3fn)
+            e[f"layers.{layer}.engram.embed.scale"] = torch.full((16, n_embd // 32), 127, dtype=torch.uint8)
+        write(n_layer + nextn + 1, e)
 
     (dir / "config.json").write_text(json.dumps({
         "architectures": ["DeepseekV41ForCausalLM"],
@@ -83,6 +91,8 @@ def make_synthetic_hf_repo(
         "moe_intermediate_size": n_ff,
         "hidden_size": n_embd,
         "num_experts_per_tok": 2,
+        **({"engram_n_heads": 2, "engram_head_dim": n_embd, "engram_max_ngram_size": 3,
+            "engram_layer_ids": list(range(n_layer))} if engram else {}),
     }, indent=1))
     (dir / "model.safetensors.index.json").write_text(json.dumps({
         "metadata": {"total_size": total},

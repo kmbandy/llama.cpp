@@ -1,4 +1,5 @@
-"""wp-forge CLI: wp-forge run PLAN.yaml [--dry-run ...] | wp-forge verify BUNDLE.json.
+"""wp-forge CLI: wp-forge run PLAN.yaml [--dry-run ...] | wp-forge verify BUNDLE.json
+| wp-forge merge-sets BUNDLE.json --into SET --from SET [--dry-run].
 
 Stdout is JSON only (the resolved-plan JSON for --dry-run, JSON event lines
 for a real run, the verify summary line for verify). All logging goes to
@@ -35,14 +36,19 @@ def _log(msg: str) -> None:
 def make_source(spec: str, cache_dir: Path | None = None, fetch=None):
     """Build the Source for a plan's source: field. spec: 'hf:<repo>' or 'gguf:<path>'."""
     if spec.startswith("hf:"):
+        repo, revision = source_mod.parse_hf_spec(spec)
         hub = os.environ.get("WP_FORGE_HF_LOCAL_HUB")
         if fetch is None and hub:
+            if revision is not None:
+                # a plain directory has no revisions; refuse rather than serve the wrong one
+                raise plan_mod.PlanError(f"source: {spec!r} cannot pin a revision with WP_FORGE_HF_LOCAL_HUB set")
+
             def fetch(repo: str, filename: str, dest_dir: Path) -> Path:
                 dest_dir = Path(dest_dir)
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 return Path(shutil.copy(Path(hub) / filename, dest_dir / filename))
-        return source_mod.HFSource(spec[3:], Path(cache_dir) if cache_dir else Path("hf-cache"),
-                                   fetch=fetch)
+        return source_mod.HFSource(repo, Path(cache_dir) if cache_dir else Path("hf-cache"),
+                                   fetch=fetch, revision=revision)
     if spec.startswith("gguf:"):
         return source_mod.GGUFSource(spec[5:])
     raise plan_mod.PlanError(f"source: {spec!r} (want 'hf:<repo>' or 'gguf:<path>')")
@@ -135,6 +141,17 @@ def _verify(args) -> int:
     return 0 if report.ok else 1
 
 
+def _merge_sets(args) -> int:
+    from . import merge_sets as merge_mod
+    machines = machines_mod.load_machines(args.machines)
+    emit = lambda e: print(json.dumps(e), flush=True)  # noqa: E731
+    summary = merge_mod.merge_sets(Path(args.bundle), machines, args.into, args.src,
+                                   dry_run=args.dry_run, emit=emit)
+    if args.dry_run:
+        print(json.dumps(summary, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wp-forge", add_help=True)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -154,10 +171,19 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("--deep", action="store_true")
     p_ver.add_argument("--machines", default=None)
 
+    p_ms = sub.add_parser("merge-sets", help="fold one expert set into the adjacent set on the same machine")
+    p_ms.add_argument("bundle")
+    p_ms.add_argument("--into", required=True, help="set id that keeps its manifest (the earlier layers)")
+    p_ms.add_argument("--from", dest="src", required=True, help="set id folded in (the later layers)")
+    p_ms.add_argument("--machines", default=None)
+    p_ms.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args(argv)
     try:
         if args.cmd == "run":
             return _run(args)
+        if args.cmd == "merge-sets":
+            return _merge_sets(args)
         return _verify(args)
     except (plan_mod.PlanError, job_mod.PreflightError) as e:
         _log(f"wp-forge: {e}")
