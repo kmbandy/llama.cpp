@@ -261,7 +261,10 @@ def tensor_role(name: str) -> tuple[str | None, bool]:
 # (N_SPLIT_KRONECKER_ROLES) rotating/quantizing IS the wanted, existing,
 # byte-identical-must-stay-that-way behavior (the qwen38-27b-ml8-4 recipe
 # explicitly rotates the lm_head). Keyed by GGUF `general.architecture`.
-_PROTECT_EMBED_OUTPUT_ARCHES = {"deepseek41"}
+# Empty by default since 2026-10-17: the DS4.1 spine ships Q8_0 token_embd +
+# rotated ML8_4 output (NLL within run-to-run noise of the BF16 pair, -1.6 GB);
+# --protect-embed-output restores the verbatim copy for deepseek41.
+_PROTECT_EMBED_OUTPUT_ARCHES: set[str] = set()
 
 
 def classify_tensor(name: str, shape: tuple, first_nextn_layer: int | None = None,
@@ -1297,7 +1300,12 @@ def main() -> None:
                         "in --src are left alone. Unset (default): no "
                         "change from prior behavior -- Qwen conversions are "
                         "unaffected.")
+    p.add_argument("--protect-embed-output", action="store_true",
+                   help="Copy token_embd/output verbatim on deepseek41 instead of "
+                        "token_embd -> Q8_0 and output -> rotated (the default).")
     args = p.parse_args()
+    if args.protect_embed_output:
+        _PROTECT_EMBED_OUTPUT_ARCHES.add("deepseek41")
 
     reader = gguf.GGUFReader(args.src)
     plan = build_plan(reader, args.rotation_seed, args.local_b, args.max_b, format=args.format)

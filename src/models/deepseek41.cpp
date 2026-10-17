@@ -408,6 +408,11 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         ml8_reg.register_weight(weight, sc);
     };
 
+    // lm head (model-scope, no il): an ml8-4 head ships output.centroids +
+    // rotation sidecars (convert_fp8_rotated --quantize-embed-output); a BF16
+    // head is not an ml8 weight and this is a no-op.
+    register_ml8_weight(output, LLM_TENSOR_OUTPUT, -1, n_embd);
+
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
         const int flags = i < n_layer ? trunk_flags : mtp_flags;
@@ -810,6 +815,7 @@ void llama_model_deepseek41::graph::build_dspark_stages(const llama_model & mode
 
     auto * output = model.output;
     auto * output_s = model.output_s;
+    const llama_model * head_owner = nullptr;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -817,10 +823,21 @@ void llama_model_deepseek41::graph::build_dspark_stages(const llama_model & mode
                 "DSpark decoder requires the target model's output projection");
         output = model_other->output;
         output_s = model_other->output_s;
+        head_owner = model_other;
     }
 
     cur = cap_lm_head_rows(cur);
-    cur = build_lora_mm(output, cur, output_s);
+    if (head_owner != nullptr) {
+        // the borrowed head's ml8 sidecars live in the target model's registry,
+        // not this graph's -- a lookup here would miss and run a plain mul_mat
+        // over rotated ml8 weights
+        cur = build_ml8_or_mul_mat(ctx0, head_owner->ml8_reg, output, cur, &ml8_fp8b128_qrot_memo);
+        if (output_s) {
+            cur = ggml_mul(ctx0, cur, output_s);
+        }
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
@@ -3925,7 +3942,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     res->t_embd = cur;
 
     cur = cap_lm_head_rows(cur);
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    // registry miss (BF16/Q8_0 head) is a plain ggml_mul_mat, byte-identical
+    cur = ml8_reg ? build_ml8_or_mul_mat(ctx0, *ml8_reg, model.output, cur, &ml8_fp8b128_qrot_memo)
+                  : ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
