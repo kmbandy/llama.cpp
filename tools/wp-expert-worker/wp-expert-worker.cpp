@@ -641,6 +641,17 @@ bool ggml_backend_cuda_wp_d2h(ggml_backend_t, const ggml_tensor *, void *, size_
 bool ggml_backend_cuda_wp_reader_copy(ggml_backend_t, ggml_tensor *,
                                       const void *, size_t, size_t)
     __attribute__((weak));
+// MXFP4 radiance (ggml-cuda.h): weak, so Vulkan/CPU-only builds link and see null.
+bool ggml_backend_cuda_mxfp4_radiance_available(ggml_backend_t)
+    __attribute__((weak));
+size_t ggml_backend_cuda_mxfp4_radiance_packed_bytes(int64_t, int64_t)
+    __attribute__((weak));
+bool ggml_backend_cuda_wp_mxfp4_radiance_stage(ggml_backend_t, void *, void *, size_t, int64_t, int64_t, bool)
+    __attribute__((weak));
+bool ggml_backend_cuda_wp_mxfp4_radiance_unstage(ggml_backend_t, const void *, void *, size_t, int64_t, int64_t, bool)
+    __attribute__((weak));
+bool ggml_backend_cuda_wp_mxfp4_radiance_stage_reader(ggml_backend_t, void *, size_t, int64_t, int64_t)
+    __attribute__((weak));
 bool ggml_backend_cuda_wp_graph_counts(ggml_backend_t, uint64_t *, uint64_t *,
                                        uint64_t *, uint64_t *, uint64_t *)
     __attribute__((weak));
@@ -3791,6 +3802,9 @@ FuseGateUpDiag classify_fuse_gate_up(const FuseGateUpCheck & check) {
         diag.reason = FuseGateUpReason::Shape;
         return diag;
     }
+    if (check.gate_device_span != 0) {
+        diag.gate_bytes = check.gate_device_span;
+    }
     if (check.up_device_offset != check.gate_device_offset + diag.gate_bytes) {
         diag.reason = FuseGateUpReason::Adjacency;
         return diag;
@@ -3923,6 +3937,11 @@ struct MemberSpan {
     uint64_t size   = 0;
     uint64_t device_offset = 0;
     uint64_t device_bytes = 0;
+    // MXFP4 radiance (WP_EXPERT_MXFP4_RADIANCE): device bytes are the packed layout, size stays the stock
+    // block_mxfp4 byte count. rad_n/rad_k are the [N rows, K] shape the repack needs.
+    bool    radiance = false;
+    int64_t rad_n = 0;
+    int64_t rad_k = 0;
 };
 
 struct ExpertPage {
@@ -3939,6 +3958,8 @@ struct ExpertPage {
     void *                            resident_base = nullptr;
     uint64_t                          upload_hash = 0;
     bool                              upload_hash_valid = false;
+    // Resident only: device bytes are radiance-packed (set after the repack is enqueued).
+    bool                              radiance_packed = false;
 };
 
 struct Catalog {
@@ -3947,6 +3968,131 @@ struct Catalog {
     std::vector<int>                                layers;
     uint64_t                                        max_page_size = 0;
 };
+
+// WP_EXPERT_MXFP4_RADIANCE=1 (opt-in): MXFP4 expert roles are stored on the device in radiance's packed layout
+// (ggml.h GGML_TENSOR_FLAG_MXFP4_RADIANCE). The blob, the host arena and the CPU tier stay stock block_mxfp4;
+// only device slot/resident bytes are repacked, and only after their H2D (radiance_repack_page).
+static uint64_t env_u64_or(const char * name, uint64_t def) {
+    const char * e = std::getenv(name);
+    return e != nullptr && e[0] != '\0' ? (uint64_t) std::strtoull(e, nullptr, 10) : def;
+}
+
+bool mxfp4_radiance_env_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("WP_EXPERT_MXFP4_RADIANCE");
+        return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+// Packed bytes of one MXFP4 role (N*row_size(K) + N Wref tail), or 0 if not an MXFP4 role / unsupported shape.
+size_t radiance_role_packed_bytes(const RoleSpec & spec) {
+    if (spec.type != GGML_TYPE_MXFP4 || ggml_backend_cuda_mxfp4_radiance_packed_bytes == nullptr) {
+        return 0;
+    }
+    return ggml_backend_cuda_mxfp4_radiance_packed_bytes((int64_t) spec.ne1, (int64_t) spec.ne0);
+}
+
+// Decides once per device layout whether radiance packing is on, and logs why.
+bool mxfp4_radiance_layout_enabled(ggml_backend_t backend, const Catalog & catalog, const std::string & device_name) {
+    if (!mxfp4_radiance_env_on()) {
+        return false;
+    }
+    std::string why;
+    size_t n_roles = 0;
+    if (backend == nullptr || backend_is_cpu(backend)) {
+        why = "backend is CPU";
+    } else if (ggml_backend_cuda_mxfp4_radiance_available == nullptr ||
+               !ggml_backend_cuda_mxfp4_radiance_available(backend)) {
+        why = "device is not gfx1201 or radiance kernels are not built";
+    } else {
+        for (const auto & layer : catalog.descriptor.layers) {
+            for (const auto & role : layer.second) {
+                if (role.second.type != GGML_TYPE_MXFP4) {
+                    continue;
+                }
+                ++n_roles;
+                if (radiance_role_packed_bytes(role.second) == 0) {
+                    why = "unsupported MXFP4 shape N=" + std::to_string(role.second.ne1) +
+                          " K=" + std::to_string(role.second.ne0);
+                    break;
+                }
+            }
+            if (!why.empty()) {
+                break;
+            }
+        }
+        if (why.empty() && n_roles == 0) {
+            why = "descriptor has no MXFP4 roles";
+        }
+    }
+    std::cerr << "wp expert worker: mxfp4 radiance layout " << (why.empty() ? "enabled" : "disabled")
+              << " device=" << device_name;
+    if (why.empty()) {
+        std::cerr << " mxfp4_roles=" << n_roles;
+    } else {
+        std::cerr << " reason=\"" << why << "\"";
+    }
+    std::cerr << "\n";
+    return why.empty();
+}
+
+// Largest stock role size of a page's radiance roles (scratch size for the repack).
+uint64_t radiance_max_role_bytes(const ExpertPage & page) {
+    uint64_t best = 0;
+    for (const auto & role : page.roles) {
+        if (role.second.radiance) {
+            best = std::max<uint64_t>(best, role.second.size);
+        }
+    }
+    return best;
+}
+
+bool page_has_radiance(const ExpertPage & page) {
+    for (const auto & role : page.roles) {
+        if (role.second.radiance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Repacks every radiance role of `page` in place. base is the page's device base (slot raw data or resident
+// base); scratch holds >= radiance_max_role_bytes(page). Stock bytes are D2D-copied to scratch and repacked back
+// into the role region on the same stream as the H2D (WP copy stream when enabled). host_wait blocks until done.
+bool radiance_repack_page(ggml_backend_t backend, uint8_t * base, const ExpertPage & page, uint8_t * scratch,
+                          bool host_wait) {
+    for (const auto & role : page.roles) {
+        const MemberSpan & m = role.second;
+        if (!m.radiance) {
+            continue;
+        }
+        if (ggml_backend_cuda_wp_mxfp4_radiance_stage == nullptr ||
+            !ggml_backend_cuda_wp_mxfp4_radiance_stage(backend, base + m.device_offset, scratch,
+                                                       (size_t) m.size, m.rad_n, m.rad_k, host_wait)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reader-thread flavour of radiance_repack_page: the reader's H2D is host-synchronized, so the stock bytes are on the
+// device when this runs; it repacks each radiance role in place on a per-thread stream with a per-thread scratch and
+// returns only once the packed bytes are there (safe to call from several reader threads at once).
+bool radiance_repack_page_reader(ggml_backend_t backend, uint8_t * base, const ExpertPage & page) {
+    for (const auto & role : page.roles) {
+        const MemberSpan & m = role.second;
+        if (!m.radiance) {
+            continue;
+        }
+        if (ggml_backend_cuda_wp_mxfp4_radiance_stage_reader == nullptr ||
+            !ggml_backend_cuda_wp_mxfp4_radiance_stage_reader(backend, base + m.device_offset, (size_t) m.size,
+                                                              m.rad_n, m.rad_k)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct backend_deleter {
     void operator()(ggml_backend * backend) const {
@@ -5357,7 +5503,7 @@ std::vector<ResourcePage> resource_pages(
 
 Catalog & layout_sliced_pages(
         Catalog & catalog, ggml_backend_buffer_type_t buft,
-        const std::string & device_name = {}) {
+        const std::string & device_name = {}, bool radiance = false) {
     // Whole-expert pages used to skip this and keep device_size == blob size.
     // CUDA MMQ over-reads the last quantized row (qwen4exp down Q5_1 ne0=640)
     // into MATRIX_ROW_PADDING; without slack that is the next slot and dim
@@ -5437,6 +5583,8 @@ Catalog & layout_sliced_pages(
         }
         std::vector<uint64_t> allocation_sizes;
         allocation_sizes.reserve(members.size());
+        std::vector<bool> is_radiance;
+        is_radiance.reserve(members.size());
         for (const auto & member : members) {
             const RoleSpec & spec = specs.at(member.first);
             ggml_tensor * tensor =
@@ -5475,6 +5623,12 @@ Catalog & layout_sliced_pages(
             if (ggml_is_quantized(spec.type) && spec.ne0 % 512 != 0) {
                 alloc_size += ggml_row_size(spec.type, 512 - (spec.ne0 % 512));
             }
+            // MXFP4 radiance: the device role is exactly the packed layout, rounded to 256 bytes.
+            const size_t rad_packed = radiance ? radiance_role_packed_bytes(spec) : 0;
+            if (rad_packed != 0) {
+                alloc_size = (size_t) GGML_PAD(rad_packed, 256);
+            }
+            is_radiance.push_back(rad_packed != 0);
             allocation_sizes.push_back((uint64_t) alloc_size);
         }
         const std::vector<DeviceMemberLayout> layout =
@@ -5483,6 +5637,12 @@ Catalog & layout_sliced_pages(
         for (size_t i = 0; i < members.size(); ++i) {
             members[i].second->device_offset = layout[i].offset;
             members[i].second->device_bytes  = layout[i].size;
+            members[i].second->radiance = is_radiance[i];
+            if (is_radiance[i]) {
+                const RoleSpec & rspec = specs.at(members[i].first);
+                members[i].second->rad_n = rspec.ne1;
+                members[i].second->rad_k = rspec.ne0;
+            }
             if (layout[i].offset > UINT64_MAX - layout[i].size) {
                 throw std::overflow_error("expert slice device layout overflows");
             }
@@ -5749,6 +5909,17 @@ public:
                 read_once(page, host);
                 tensor_set_page_range(
                     allocation.raw, page, host, 0, (size_t) page.size);
+                // MXFP4 radiance: the H2D above is synchronous, so repack in place and host-wait.
+                if (page_has_radiance(page)) {
+                    buffer_ptr scratch(ggml_backend_alloc_buffer(
+                        backend_, (size_t) radiance_max_role_bytes(page)));
+                    if (!scratch || !radiance_repack_page(
+                            backend_, (uint8_t *) allocation.raw->data, page,
+                            (uint8_t *) ggml_backend_buffer_get_base(scratch.get()), true)) {
+                        throw std::runtime_error("failed to repack resident expert page to mxfp4 radiance");
+                    }
+                    page.radiance_packed = true;
+                }
                 if (wp_worker_cuda_async_hash_trace_enabled(backend_)) {
                     page.upload_hash = hash_page_upload(page, host);
                     page.upload_hash_valid = true;
@@ -6712,6 +6883,8 @@ public:
     struct Loaded {
         ggml_backend_buffer_t buffer = nullptr;
         void *                base   = nullptr;
+        // MXFP4 radiance: this entry's device bytes are packed (flag the MXFP4 role tensors from it).
+        bool                  radiance_packed = false;
     };
 
     struct ArenaLayout {
@@ -6786,6 +6959,31 @@ public:
                 throw std::logic_error("expert batch entry is not ready");
             }
             return entry.loaded;
+        }
+
+        // Any published entry of this batch holds radiance-packed bytes. The non-radiance alternative
+        // batch paths (arena / grouped / batched copies) are refused for such batches.
+        bool any_radiance_loaded() const {
+            for (const Entry & entry : entries_) {
+                if (entry.ready && entry.loaded.radiance_packed) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // True when the batch's slot-backed entries are either all radiance-packed or all stock. The grouped views
+        // (arena / d3 / mmid) flag a whole 3D weight, so a mix cannot be computed by them.
+        bool radiance_uniform() const {
+            bool any = false;
+            bool all = true;
+            for (const Entry & entry : entries_) {
+                if (!entry.ready || entry.cpu_tier || entry.loaded.base == nullptr) {
+                    continue;
+                }
+                any = any || entry.loaded.radiance_packed;
+                all = all && entry.loaded.radiance_packed;
+            }
+            return !any || all;
         }
 
         uint64_t upload_hash(size_t index) const {
@@ -6951,6 +7149,7 @@ public:
             std::chrono::steady_clock::time_point issued{};
             uint64_t upload_hash = 0;
             bool upload_hash_valid = false;
+            bool radiance_packed = false;
             uint32_t span_seq = 0;      // WP_WORKER_SPAN_TRACE: the copy's own request tag
             int      span_layer = -1;   // ... and request layer (completion may run elsewhere)
             int      span_page_layer = -1;
@@ -7343,6 +7542,7 @@ public:
                         };
                         batch.entries_[i].upload_hash = page.upload_hash;
                         batch.entries_[i].upload_hash_valid = page.upload_hash_valid;
+                        batch.entries_[i].loaded.radiance_packed = page.radiance_packed;
                         ++batch.n_resident_;
                         if (batch.demand_rec_) { batch.demand_rec_->src[i] = 'V'; }
                         continue;
@@ -7400,6 +7600,9 @@ public:
                 };
                 batch.entries_[i].upload_hash = slot.upload_hash;
                 batch.entries_[i].upload_hash_valid = slot.upload_hash_valid;
+                // MXFP4 radiance: a slot hit must carry the slot's packed tag, else the compute path
+                // treats the repacked bytes as stock block_mxfp4 (garbage / non-finite output).
+                batch.entries_[i].loaded.radiance_packed = slot.radiance_packed;
                 ++batch.n_resident_;
             }
 
@@ -7620,6 +7823,7 @@ public:
                         }
                     }
                     slot.valid = false;
+                    slot.radiance_packed = false;
 
                     pi.slot_index = slot_index;
                     pi.raw        = slot.raw;
@@ -8980,6 +9184,9 @@ private:
         uint64_t            size      = 0;
         uint64_t            upload_hash = 0;
         bool                upload_hash_valid = false;
+        // MXFP4 radiance: the slot's radiance role bytes are packed. Set only after the repack is enqueued
+        // for the page (drain_one_read); cleared whenever the slot is rewritten, evicted or parked.
+        bool                radiance_packed = false;
         uint64_t            tick      = 0;
         // How many times this page has been asked for. Ranking by USE COUNT is
         // the whole policy; tick is only the tie-break. Offline on the reference
@@ -9915,6 +10122,12 @@ private:
         }
         bool ok = true;
         try {
+          if (page_has_radiance(victim)) {
+            // MXFP4 radiance: the victim's radiance roles sit in the packed layout, but the host arena (and the CPU
+            // tier computing from it) is stock block_mxfp4. Unpack each such role into a device scratch and D2H from
+            // there, so the arena always holds stock bytes; other roles copy straight from the slot.
+            ok = demote_radiance_page(victim, raw, data);
+          } else {
             // Non-blocking per-thread stream where the backend has one: the
             // per-thread-stream tensor_get fallback measured ~12 ms per 18 MiB
             // page on gfx1201, queued behind the compute graph. It returns
@@ -9940,6 +10153,7 @@ private:
                 // reader-thread safe (per-thread stream, see tensor_verify_page_range)
                 tensor_get_page(raw, victim, data);
             }
+          }
         } catch (...) {
             ok = false;
         }
@@ -9951,6 +10165,78 @@ private:
         }
         ns_victim_demote_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    }
+
+    // MXFP4 radiance victim D2H. One scratch (largest radiance role) shared by the demote thread, the park path and
+    // the reader/drain threads that demote synchronously, so the whole unpack + D2H of a role runs under one lock.
+    std::mutex     demote_unpack_mu_;
+    buffer_ptr     demote_unpack_buf_;
+    context_ptr    demote_unpack_ctx_;
+    ggml_tensor *  demote_unpack_t_ = nullptr;
+    size_t         demote_unpack_bytes_ = 0;
+
+    bool demote_radiance_page(const ExpertPage & victim, ggml_tensor * raw, void * data) {
+        auto lock = wp_lock_timed(demote_unpack_mu_);
+        const size_t need = (size_t) radiance_max_role_bytes(victim);
+        if (demote_unpack_t_ == nullptr || demote_unpack_bytes_ < need) {
+            demote_unpack_t_ = nullptr;
+            demote_unpack_buf_.reset();
+            demote_unpack_ctx_.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead() * 2,
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!demote_unpack_ctx_) {
+                return false;
+            }
+            demote_unpack_t_ = ggml_new_tensor_1d(demote_unpack_ctx_.get(), GGML_TYPE_I8, (int64_t) need);
+            demote_unpack_buf_.reset(ggml_backend_alloc_buffer(backend_, need));
+            if (!demote_unpack_buf_) {
+                demote_unpack_t_ = nullptr;
+                return false;
+            }
+            ggml_backend_tensor_alloc(demote_unpack_buf_.get(), demote_unpack_t_,
+                                      ggml_backend_buffer_get_base(demote_unpack_buf_.get()));
+            demote_unpack_bytes_ = need;
+        }
+        const auto d2h = [&](ggml_tensor * t, size_t dev_off, size_t host_off, size_t n) {
+            if (ggml_backend_cuda_wp_d2h != nullptr) {
+                WpStateScope d2h_state(WP_S_GPU_SYNC, -1, 0);   // blocking D2H
+                if (ggml_backend_cuda_wp_d2h(backend_, t, (char *) data + host_off, dev_off, n)) {
+                    return true;
+                }
+            }
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0);
+              ggml_backend_tensor_get(t, (char *) data + host_off, dev_off, n); }
+            return true;
+        };
+        for (const auto & role : victim.roles) {
+            const MemberSpan & m = role.second;
+            if (!m.radiance) {
+                if (!d2h(raw, (size_t) m.device_offset, (size_t) m.offset, (size_t) m.size)) {
+                    return false;
+                }
+                continue;
+            }
+            if (ggml_backend_cuda_wp_mxfp4_radiance_unstage == nullptr ||
+                !ggml_backend_cuda_wp_mxfp4_radiance_unstage(
+                    backend_, (const char *) raw->data + m.device_offset, demote_unpack_t_->data,
+                    (size_t) m.size, m.rad_n, m.rad_k, true)) {
+                return false;
+            }
+            if (!d2h(demote_unpack_t_, 0, (size_t) m.offset, (size_t) m.size)) {
+                return false;
+            }
+        }
+        static const bool s_path_log = [] {
+            const char * e = std::getenv("WP_EXPERT_PATH_LOG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (s_path_log) {
+            std::fprintf(stderr, "wp expert worker: radiance demote (unpacked D2H) layer=%d expert=%d\n",
+                         victim.layer, victim.expert);
+        }
+        return true;
     }
 
     std::atomic<uint64_t> n_victim_demoted_{0};
@@ -10151,6 +10437,18 @@ private:
             if (mismatches > 0) {
                 g_worker_n_reader_h2d_verify_fail.fetch_add(
                     mismatches, std::memory_order_relaxed);
+            }
+        }
+        // MXFP4 radiance: repack the page's radiance roles in place (after the verify above, which compares stock
+        // bytes). Host-synchronized, so the page is published as packed as soon as drain_one_read sees `uploaded`.
+        if (page_has_radiance(*pagein.page)) {
+            if (!radiance_repack_page_reader(backend_, (uint8_t *) pagein.raw->data, *pagein.page)) {
+                result.uploaded = false;
+                try {
+                    throw std::runtime_error("failed to repack expert page to mxfp4 radiance (reader thread)");
+                } catch (...) {
+                    result.error = std::current_exception();
+                }
             }
         }
     }
@@ -10538,9 +10836,22 @@ private:
         }
     }
 
+    uint8_t * radiance_scratch(size_t bytes) {
+        if (bytes > radiance_scratch_bytes_) {
+            { WpStateScope wss(WP_S_GPU_SYNC, -1, 0); ggml_backend_synchronize(backend_); }
+            radiance_scratch_.reset(ggml_backend_alloc_buffer(backend_, bytes));
+            if (!radiance_scratch_) {
+                throw std::runtime_error("failed to allocate mxfp4 radiance repack scratch");
+            }
+            radiance_scratch_bytes_ = bytes;
+        }
+        return (uint8_t *) ggml_backend_buffer_get_base(radiance_scratch_.get());
+    }
+
     void publish_pagein_slot(Batch & batch, size_t entry_index, size_t slot_index,
                              const ExpertPage & page,
-                             uint64_t upload_hash, bool upload_hash_valid) {
+                             uint64_t upload_hash, bool upload_hash_valid,
+                             bool radiance_packed) {
         Slot & slot = slots_[slot_index];
         slot.valid = true;
         slot.key   = { page.layer, page.expert };
@@ -10553,7 +10864,8 @@ private:
         slot.uses     = lfu_history_enabled_ ? history_uses(page) : evict_age_ + 1;
         slot.upload_hash = upload_hash;
         slot.upload_hash_valid = upload_hash_valid;
-        entry.loaded = { slot.buffer, slot.raw->data };
+        slot.radiance_packed = radiance_packed;
+        entry.loaded = { slot.buffer, slot.raw->data, radiance_packed };
         entry.upload_hash = upload_hash;
         entry.upload_hash_valid = upload_hash_valid;
         entry.copy_pending = false;
@@ -10594,7 +10906,7 @@ private:
             if (it->page != nullptr) {
                 publish_pagein_slot(
                     batch, it->entry_index, it->slot_index, *it->page,
-                    it->upload_hash, it->upload_hash_valid);
+                    it->upload_hash, it->upload_hash_valid, it->radiance_packed);
             }
             it = batch.pending_copies_.erase(it);
         }
@@ -10662,6 +10974,9 @@ private:
                 }
             } else {
                 Slot & slot = slots_[pagein.slot_index];
+                // The slot's bytes are about to be rewritten: until the repack below
+                // is enqueued they are not in the radiance layout.
+                slot.radiance_packed = false;
                 if (pagein.demote_page != nullptr) {
                     // before this page-in's first stripe lands in the slot
                     demote_to_arena(pagein);
@@ -10690,6 +11005,12 @@ private:
                             batch.bytes_h2d_ += result->h2d_bytes;
                         }
                         ++batch.n_reader_h2d_;
+                    }
+                    // MXFP4 radiance: the reader thread repacked the page right after its upload (see
+                    // reader_h2d_upload), so the slot is packed once the page's last stripe has landed.
+                    if (page_done && !(pshared != nullptr && pshared->fin_error) &&
+                            page_has_radiance(*pagein.page)) {
+                        slot.radiance_packed = true;
                     }
                 } else if (result->cpu_direct) {
                     // WP_CPU_DIRECT_PAGEIN: bytes already in slot.raw. Skip the
@@ -10761,6 +11082,27 @@ private:
                 wp_span_end(WP_SPAN_H2D, pagein.span_layer, pagein.span_seq, h2d_issue_ns,
                             (int64_t) result->len, pagein.page->layer);
                 copy_stream_async = used_copy_stream && !used_fallback;
+                // MXFP4 radiance: once the page's last stripe is on the device, repack its radiance roles in
+                // place. Enqueued on the same stream as the H2D and BEFORE the copy event is recorded and the
+                // page is published, so the existing event/wait machinery orders compute after it. Host-waits
+                // unless the copy-event path will order it.
+                if (page_done && !(pshared != nullptr && pshared->fin_error) &&
+                        page_has_radiance(*pagein.page)) {
+                    // No host wait. The repack is enqueued on the same stream as the page's H2D (the WP copy stream) and
+                    // ggml_backend_cuda_wp_mxfp4_radiance_stage records the copy-stream "latest" event after it, which
+                    // every backend graph_compute makes the compute stream wait on (wp_copy_pending), exactly as for the
+                    // stock async H2D. When the copy stream is off, or the H2D fell back to the synchronous
+                    // ggml_backend_tensor_set, the stage call syncs by itself. The host wait used to serialize the
+                    // drain thread on every page-in (H2D + repack latency) and cost prefill throughput.
+                    const bool host_wait = false;
+                    uint8_t * const scratch = radiance_scratch(radiance_max_role_bytes(*pagein.page));
+                    if (!radiance_repack_page(backend_, (uint8_t *) slot.raw->data, *pagein.page,
+                                              scratch, host_wait)) {
+                        GGML_ABORT("wp expert worker: mxfp4 radiance repack failed (layer %d expert %d)",
+                                   pagein.page->layer, pagein.page->expert);
+                    }
+                    slot.radiance_packed = true;
+                }
                 if (page_done) {
                     if (copy_stream_async) {
                         ++batch.n_copy_stream_ok_;
@@ -10884,6 +11226,7 @@ private:
                             pending.issued = std::chrono::steady_clock::now();
                             pending.upload_hash = slot.upload_hash;
                             pending.upload_hash_valid = slot.upload_hash_valid;
+                            pending.radiance_packed = slot.radiance_packed;
                             pending.span_seq = pagein.span_seq;
                             pending.span_layer = pagein.span_layer;
                             pending.span_page_layer = pagein.page->layer;
@@ -10895,7 +11238,8 @@ private:
                             }
                             publish_pagein_slot(
                                 batch, pagein.entry_index, pagein.slot_index,
-                                *pagein.page, slot.upload_hash, slot.upload_hash_valid);
+                                *pagein.page, slot.upload_hash, slot.upload_hash_valid,
+                                slot.radiance_packed);
                             if (batch.copy_event_ != nullptr) {
                                 record_copy_event(batch.copy_event_);
                             }
@@ -10903,7 +11247,8 @@ private:
                     } else {
                         publish_pagein_slot(
                             batch, pagein.entry_index, pagein.slot_index,
-                            *pagein.page, slot.upload_hash, slot.upload_hash_valid);
+                            *pagein.page, slot.upload_hash, slot.upload_hash_valid,
+                            slot.radiance_packed);
                     }
                 }
             }
@@ -11778,6 +12123,9 @@ private:
     }
 
     ggml_backend_t             backend_ = nullptr;
+    // MXFP4 radiance repack scratch (one role's stock bytes), grown on demand. Only the drain thread uses it.
+    buffer_ptr                 radiance_scratch_;
+    size_t                     radiance_scratch_bytes_ = 0;
     ResourcePlan               resources_;
     size_t                     read_stripes_ = read_stripes_from_env();
     size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
@@ -13064,6 +13412,7 @@ uint64_t ExpertSlotPool::park_release_arenas() {
     park_arena_count_ = arenas_.size();
     for (Slot & slot : slots_) {
         slot.valid = false;
+        slot.radiance_packed = false;
         slot.page = nullptr;
         slot.key = {};
         slot.cache_id = -1;
@@ -13623,7 +13972,7 @@ public:
         resident_(backend_.get(),
                   layout_sliced_pages(
                       catalog_, ggml_backend_get_default_buffer_type(backend_.get()),
-                      device),
+                      device, mxfp4_radiance_layout_enabled(backend_.get(), catalog_, device)),
                   resident_expert_blocks, page_owner_),
         pool_(
             backend_.get(),
@@ -15574,6 +15923,10 @@ public:
         if (request.assignments.empty()) {
             return false;
         }
+        // MXFP4 radiance: the arena views flag the whole 3D weight, so every routed slot must be packed (or none).
+        if (!batch.radiance_uniform()) {
+            return false;
+        }
         static const char * k_roles[3] = {"gate", "up", "down"};
         const auto & specs = catalog_.descriptor.layers.at(request.layer);
         const auto stride_ok = [](uint64_t stride, ggml_type type) {
@@ -16667,6 +17020,51 @@ public:
         // in the protocol encoder.
         if (!request.assignments.empty() &&
                 request.assignments.size() > batch.n_cpu_tier()) {
+            // WP_EXPERT_PATH_LOG=1: which compute path produced this request (diagnostic; one line per request)
+            static const bool s_path_log = [] {
+                const char * e = std::getenv("WP_EXPERT_PATH_LOG");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (s_path_log) {
+                std::fprintf(stderr, "wp expert worker: path layer=%d n_tokens=%u n_assign=%zu path=%s radiance=%d\n",
+                             (int) request.layer, request.n_tokens, request.assignments.size(), last_compute_path_,
+                             (int) batch.any_radiance_loaded());
+            }
+            // WP_REQUEST_DUMP=<dir>: write the first WP_REQUEST_DUMP_MAX (default 400) requests as llama-wp-worker-verify
+            // request files, so real activations/routing can be replayed offline against radiance and stock workers.
+            // WP_REQUEST_DUMP_MIN_LAYER (default 0) restricts to layers >= it.
+            {
+                static const char * const dump_dir = std::getenv("WP_REQUEST_DUMP");
+                if (dump_dir != nullptr && dump_dir[0] != '\0' && request.layer >= (int) env_u64_or("WP_REQUEST_DUMP_MIN_LAYER", 0) &&
+                        request.n_tokens <= env_u64_or("WP_REQUEST_DUMP_MAX_TOKENS", 16)) {
+                    static std::atomic<uint64_t> dump_seq{0};
+                    static const uint64_t dump_max = env_u64_or("WP_REQUEST_DUMP_MAX", 400);
+                    const uint64_t seq = dump_seq.fetch_add(1);
+                    if (seq < dump_max && request.activation_size() == (size_t) request.n_tokens * (size_t) catalog_.descriptor.hparams.n_embd) {
+                        char name[512];
+                        std::snprintf(name, sizeof name, "%s/req_%05llu_L%d_T%u.txt", dump_dir,
+                                      (unsigned long long) seq, (int) request.layer, request.n_tokens);
+                        if (FILE * f = std::fopen(name, "w")) {
+                            std::fprintf(f, "%d %u %lld %.9g\n%zu\n", (int) request.layer, request.n_tokens,
+                                         (long long) catalog_.descriptor.hparams.n_embd, (double) request.swiglu_clamp,
+                                         request.assignments.size());
+                            for (const auto & a : request.assignments) {
+                                std::fprintf(f, "%d", (int) a.expert_id);
+                                for (float w : a.weights) std::fprintf(f, " %.9g", (double) w);
+                                std::fprintf(f, "\n");
+                            }
+                            const float * act = request.activation_data();
+                            const size_t n_embd = (size_t) catalog_.descriptor.hparams.n_embd;
+                            for (uint32_t t = 0; t < request.n_tokens; ++t) {
+                                for (size_t k = 0; k < n_embd; ++k) {
+                                    std::fprintf(f, "%.9g%c", (double) act[t * n_embd + k], k + 1 == n_embd ? '\n' : ' ');
+                                }
+                            }
+                            std::fclose(f);
+                        }
+                    }
+                }
+            }
             read_result(sum, request_stats, std::numeric_limits<size_t>::max(),
                         (int) request.layer, last_compute_path_,
                         /* capture_wire = */ cpu_job == nullptr);
@@ -19100,6 +19498,7 @@ private:
         }();
         const bool d3_grouped =
             !mmid_assoc.use_mmid &&
+            radiance_slots_strided(request, pages, batch, selected) &&
             !persistent_graphs &&
             !ml8_special_layer &&
             (grouped_gemv || (s_batch_moe && !use_gather) || (s_worker_collapse && !use_gather)) &&
@@ -19216,7 +19615,7 @@ private:
         // matmul across two differently-calibrated weights), so this
         // optimization is not attempted for such a layer -- the per-expert
         // loop below always takes its separate gate/up branch instead.
-        if (s_fuse_gate_up && !ml8_special_layer) {
+        if (s_fuse_gate_up && !ml8_special_layer && batch.radiance_uniform()) {
             FuseGateUpCheck chk;
             chk.swiglu_clamp = request.swiglu_clamp;
             chk.use_gather = use_gather;
@@ -19238,6 +19637,9 @@ private:
                 const ExpertPage & page = *pages[i];
                 chk.gate_device_offset = page.roles.at("gate").device_offset;
                 chk.up_device_offset = page.roles.at("up").device_offset;
+                // MXFP4 radiance: the gate role occupies its packed device bytes, not the stock row bytes.
+                chk.gate_device_span = batch.loaded(i).radiance_packed && page.roles.at("gate").radiance
+                    ? page.roles.at("gate").device_bytes : 0;
                 fuse_diag = classify_fuse_gate_up(chk);
                 any_selected = true;
                 if (fuse_diag.reason != FuseGateUpReason::Ok) {
@@ -19347,9 +19749,12 @@ private:
         const bool fuse_gate_up_vk_wide =
             vk_mmv_cap > 0 && max_expert_width > vk_mmv_cap;
         const bool fuse_gate_up =
-            s_fuse_gate_up && !ml8_special_layer &&
+            s_fuse_gate_up && !ml8_special_layer && batch.radiance_uniform() &&
             fuse_diag.reason == FuseGateUpReason::Ok &&
             !fuse_gate_up_vk_wide;
+        if (fuse_gate_up) {
+            last_compute_path_ = "gather-fused";
+        }
         if (s_fuse_gate_up) {
             if (fuse_gate_up_vk_wide && fuse_diag.reason == FuseGateUpReason::Ok) {
                 ++request_stats.n_fuse_gate_up_miss_vk_wide;
@@ -19387,6 +19792,7 @@ private:
             key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
             key.fused_gate_up = fuse_gate_up;
+            key.radiance = batch.any_radiance_loaded();
             std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
             // See the note on GraphKey: a cache hit rebinds pointers, never
             // types, so two layers whose expert tensors are quantized
@@ -19487,6 +19893,14 @@ private:
                     attach_weight(
                         w, loaded.buffer, loaded.base,
                         page.roles.at(kRoles[j]).device_offset);
+                    // MXFP4 radiance: the entry's slot tag decides the layout this request's bytes are in.
+                    if (w->type == GGML_TYPE_MXFP4) {
+                        if (loaded.radiance_packed) {
+                            w->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                        } else {
+                            w->flags &= ~(GGML_TENSOR_FLAG_MXFP4_RADIANCE | GGML_TENSOR_FLAG_MXFP4_RADIANCE_PAIR);
+                        }
+                    }
                 }
                 const auto & wv = request.assignments[i].weights;
                 if (use_gather) {
@@ -19689,6 +20103,11 @@ private:
                 if (ml8_prepacked && spec.type == GGML_TYPE_ML8_4) {
                     tensor->flags |= GGML_TENSOR_FLAG_ML8_PACKED;
                 }
+                // MXFP4 radiance: this entry's device bytes are the packed layout, so flag the tensor for
+                // ggml-cuda's radiance GEMM. Tag is set only after the repack was enqueued (drain_one_read).
+                if (loaded.radiance_packed && spec.type == GGML_TYPE_MXFP4) {
+                    tensor->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                }
                 // D2 miss: record for rebinding on later hits. Creation order is
                 // gate, up, down per expert -- the hit path indexes k*3+j on
                 // exactly that order.
@@ -19758,6 +20177,13 @@ private:
                 attach_weight(
                     gate_up, loaded.buffer, loaded.base,
                     page.roles.at("gate").device_offset);
+                if (loaded.radiance_packed && sg.type == GGML_TYPE_MXFP4 && page.roles.at("gate").radiance) {
+                    // two packed matrices back to back: ggml-cuda quantizes the activations once and runs one GEMM per
+                    // matrix (GGML_TENSOR_FLAG_MXFP4_RADIANCE_PAIR); the second matrix is `up` itself.
+                    gate_up->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE | GGML_TENSOR_FLAG_MXFP4_RADIANCE_PAIR;
+                    gate_up->op_params[0] = (int32_t) (page.roles.at("up").device_offset -
+                                                       page.roles.at("gate").device_offset);
+                }
                 if (gc != nullptr) {
                     gc->expert_w.push_back(gate_up);
                     gc->expert_w.push_back(nullptr);
@@ -21274,6 +21700,37 @@ private:
         if (n_as == 0 || n_as > (size_t) std::numeric_limits<int32_t>::max() || n_as < n) {
             return false;
         }
+        // MXFP4 radiance: the 3D MXFP4 weights are flagged iff EVERY selected expert is packed. A mix cannot be
+        // computed by one flagged-or-not 3D weight, so it falls back to the per-expert path (which tags per slot).
+        // The non-vk tensors address expert k at base + k*nb[2] from sel[0], so the packed slots must also be
+        // uniformly strided with the same role offsets; otherwise this batch falls back too.
+        size_t n_radiance = 0;
+        for (size_t k = 0; k < n; ++k) {
+            n_radiance += batch.loaded(sel[k]).radiance_packed ? 1 : 0;
+        }
+        if (n_radiance != 0 && n_radiance != n) {
+            return false;
+        }
+        const bool mmid_radiance = n > 0 && n_radiance == n;
+        int64_t mmid_stride = 0;
+        if (mmid_radiance) {
+            // MXFP4 radiance: expert matrices are located by the per-expert pointer table below (expert_ptrs), exactly
+            // like the stock mmq path, so slots need no uniform stride and the pad experts (n_as > n) work. The 3D
+            // placeholder still gets an nb[2] that holds one packed role, which ggml-cuda's supports_op validates.
+            if (is_vulkan_backend()) {
+                return false;
+            }
+            uint64_t role_extent = 0;
+            for (const auto & role : pages[sel[0]]->roles) {
+                if (role.second.radiance) {
+                    role_extent = std::max<uint64_t>(role_extent, role.second.device_bytes);
+                }
+            }
+            mmid_stride = (int64_t) role_extent;
+            if (mmid_stride <= 0) {
+                return false;
+            }
+        }
         const uint32_t n_tokens = request.n_tokens;
         const int64_t n_embd = catalog_.descriptor.hparams.n_embd;
         const int64_t k_width = (int64_t) plan.k_width;
@@ -21290,8 +21747,12 @@ private:
             gate_spec.type == up_spec.type && gate_spec.ne0 == up_spec.ne0 &&
             gate_spec.ne1 == up_spec.ne1;
         if (fuse_gate_up) {
-            const size_t gate_bytes =
+            size_t gate_bytes =
                 ggml_row_size(gate_spec.type, (int64_t) gate_spec.ne0) * (size_t) gate_spec.ne1;
+            if (mmid_radiance && pages[sel[0]]->roles.at("gate").radiance) {
+                // radiance roles occupy their packed device bytes
+                gate_bytes = (size_t) pages[sel[0]]->roles.at("gate").device_bytes;
+            }
             for (size_t k = 0; k < n; ++k) {
                 const ExpertPage & page = *pages[sel[k]];
                 if (page.roles.at("up").device_offset !=
@@ -21399,6 +21860,23 @@ private:
                 t->buffer = loaded.buffer;
                 t->data = (uint8_t *) loaded.base +
                     pages[sel[0]]->roles.at(role).device_offset;
+                if (mmid_radiance) {
+                    // Expert k lives at data + k*stride (checked above); the packed role is
+                    // flagged for ggml-cuda's radiance MUL_MAT_ID.
+                    // (placeholder stride: the real locations come from the expert pointer table; a fused pair spans
+                    // gate + up)
+                    t->nb[2] = (size_t) mmid_stride * ((fuse_gate_up && ri == 0) ? 2 : 1);
+                    t->nb[3] = t->nb[2] * (size_t) n_as;
+                    if (spec.type == GGML_TYPE_MXFP4) {
+                        t->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                        if (fuse_gate_up && ri == 0) {
+                            // [gate;up] pair: two packed matrices per expert, the second is `up` itself
+                            t->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE_PAIR;
+                            t->op_params[0] = (int32_t) (pages[sel[0]]->roles.at("up").device_offset -
+                                                         pages[sel[0]]->roles.at("gate").device_offset);
+                        }
+                    }
+                }
             }
             return t;
         };
@@ -21649,7 +22127,7 @@ private:
             }
         }
         last_compute_path_ = vk_arena ? "batch-mmid-arena"
-            : (cpu_mmid ? "batch-mmid-cpu" : "batch-mmid");
+            : (cpu_mmid ? "batch-mmid-cpu" : (fuse_gate_up ? "batch-mmid-fused" : "batch-mmid"));
         enum ggml_status status = GGML_STATUS_FAILED;
         {
             struct DiscardQueuedPtrs {
@@ -21688,6 +22166,73 @@ private:
             request_stats.n_weight_total += n_computed;
         }
         return true;
+    }
+
+    // MXFP4 radiance zero-copy 3D view of the selected slots: the packed roles can't be dense-packed through the copy
+    // machinery (the packed size differs from ggml_nbytes), so the grouped views address the slots in place, which is
+    // only possible when the selected slots sit at one constant stride in one buffer with identical role offsets.
+    // Returns true for a stock batch (nothing to check). On a radiance batch `stride` receives the expert stride
+    // (nb[2]) and `first` the first selected assignment.
+    bool radiance_slot_stride(const std::vector<const ExpertPage *> & pages,
+                              const ExpertSlotPool::Batch & batch, const std::vector<size_t> & sel,
+                              int64_t * stride = nullptr) const {
+        if (!batch.any_radiance_loaded()) {
+            return true;
+        }
+        if (!batch.radiance_uniform() || sel.empty() || is_vulkan_backend()) {
+            return false;
+        }
+        const ExpertPage & page0 = *pages[sel[0]];
+        uint64_t extent = 0;
+        for (const auto & role : page0.roles) {
+            if (role.second.radiance) {
+                extent = std::max<uint64_t>(extent, role.second.device_bytes);
+            }
+        }
+        const ExpertSlotPool::Loaded first = batch.loaded(sel[0]);
+        if (first.buffer == nullptr || first.base == nullptr) {
+            return false;
+        }
+        int64_t st = (int64_t) extent;
+        if (sel.size() > 1) {
+            const ExpertSlotPool::Loaded second = batch.loaded(sel[1]);
+            st = (const char *) second.base - (const char *) first.base;
+        }
+        if (st <= 0 || (uint64_t) st < extent) {
+            return false;
+        }
+        for (size_t k = 0; k < sel.size(); ++k) {
+            const ExpertSlotPool::Loaded lk = batch.loaded(sel[k]);
+            if (lk.buffer != first.buffer || (const char *) lk.base != (const char *) first.base + (int64_t) k * st) {
+                return false;
+            }
+            const ExpertPage & pk = *pages[sel[k]];
+            for (const char * role : { "gate", "up", "down" }) {
+                if (pk.roles.at(role).device_offset != page0.roles.at(role).device_offset) {
+                    return false;
+                }
+            }
+        }
+        if (stride != nullptr) {
+            *stride = st;
+        }
+        return true;
+    }
+
+    bool radiance_slots_strided(const pipe_expert_dispatch_req & request,
+                                const std::vector<const ExpertPage *> & pages,
+                                const ExpertSlotPool::Batch & batch,
+                                const std::function<bool(size_t)> & selected) const {
+        if (!batch.any_radiance_loaded()) {
+            return true;
+        }
+        std::vector<size_t> sel;
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (selected(i)) {
+                sel.push_back(i);
+            }
+        }
+        return radiance_slot_stride(pages, batch, sel);
     }
 
     void compute_batch_grouped(
@@ -21905,7 +22450,29 @@ private:
         ggml_tensor * as_gate = nullptr;
         ggml_tensor * as_up = nullptr;
         ggml_tensor * as_down = nullptr;
-        if (use_batched_copies) {
+        int64_t rad_stride = 0;
+        const bool rad_d3 = batch.any_radiance_loaded();
+        if (rad_d3) {
+            // MXFP4 radiance: no dense-pack copy. The packed slots are addressed in place as one 3D weight per role
+            // (expert k at base + k*stride), flagged for ggml-cuda's radiance MUL_MAT_ID.
+            if (!radiance_slot_stride(pages, batch, sel, &rad_stride)) {
+                GGML_ABORT("wp expert worker: grouped radiance batch lost its uniform slot stride");
+            }
+            const ExpertSlotPool::Loaded first = batch.loaded(sel[0]);
+            const auto rad_view = [&](const RoleSpec & spec, const char * role) {
+                ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
+                attach_weight(t, first.buffer, first.base, page0.roles.at(role).device_offset);
+                if (spec.type == GGML_TYPE_MXFP4 && page0.roles.at(role).radiance) {
+                    t->nb[2] = (size_t) rad_stride;
+                    t->nb[3] = t->nb[2] * (size_t) n;
+                    t->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                }
+                return t;
+            };
+            as_gate = rad_view(gate_spec, "gate");
+            as_up   = rad_view(up_spec, "up");
+            as_down = rad_view(down_spec, "down");
+        } else if (use_batched_copies) {
             if (cuda_collapse) {
                 as_gate = ggml_new_tensor_3d(
                     ctx.get(), gate_spec.type, gate_spec.ne0, gate_spec.ne1, (int64_t) n);
@@ -22187,6 +22754,7 @@ private:
             request_stats.n_weight_nonzero += nz;
             request_stats.n_weight_total   += wv.size();
         }
+        last_compute_path_ = "d3-grouped";
         grouped_log.success = true;
     }
 
@@ -22201,10 +22769,12 @@ private:
         int64_t        ne0 = 0;
         int64_t        ne1 = 0;
         uint64_t       offset = 0;
+        // MXFP4 radiance: the arena slots hold the packed layout, the view is flagged for ggml-cuda's radiance GEMM.
+        bool           radiance = false;
 
         bool operator==(const ArenaRoleKey & o) const {
             return type == o.type && ne0 == o.ne0 && ne1 == o.ne1 &&
-                   offset == o.offset;
+                   offset == o.offset && radiance == o.radiance;
         }
     };
 
@@ -22252,7 +22822,9 @@ private:
         for (size_t j = 0; j < roles.size(); ++j) {
             const RoleSpec & spec = specs.at(k_roles[j]);
             roles[j] = {spec.type, spec.ne0, spec.ne1,
-                        pages[0]->roles.at(k_roles[j]).device_offset};
+                        pages[0]->roles.at(k_roles[j]).device_offset,
+                        spec.type == GGML_TYPE_MXFP4 && pages[0]->roles.at(k_roles[j]).radiance &&
+                            batch.any_radiance_loaded()};
         }
 
         std::vector<ArenaGroup> groups;
@@ -22530,6 +23102,10 @@ private:
                     ctx, role.type, role.ne0, role.ne1,
                     (int64_t) (arena.n_slots + arena.n_pad_slots));
                 tensor->nb[2] = arena.stride;
+                if (role.radiance) {
+                    tensor->nb[3] = tensor->nb[2] * (size_t) tensor->ne[2];
+                    tensor->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                }
                 attach_weight(tensor, arena.buffer, arena.base, role.offset);
                 return tensor;
             };
@@ -22913,6 +23489,10 @@ private:
                 ggml_tensor * tensor = ggml_new_tensor_3d(
                     ctx, role.type, role.ne0, role.ne1, (int64_t) arena.n_slots);
                 tensor->nb[2] = arena.stride != 0 ? arena.stride : layout.slot_stride;
+                if (role.radiance) {
+                    tensor->nb[3] = tensor->nb[2] * (size_t) tensor->ne[2];
+                    tensor->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                }
                 attach_weight(tensor, arena.buffer, arena.base, role.offset);
                 return tensor;
             };
@@ -23051,6 +23631,7 @@ private:
             throw std::runtime_error("multi-arena expert backend graph compute failed");
         }
         ++request_stats.n_arena_hit;
+        last_compute_path_ = "arena";
         request_stats.n_arena_groups += groups.size();
         for (const pipe_expert_assignment & assignment : request.assignments) {
             for (float weight : assignment.weights) {
@@ -23087,7 +23668,9 @@ private:
         for (size_t j = 0; j < roles.size(); ++j) {
             const RoleSpec & spec = specs.at(k_roles[j]);
             roles[j] = {spec.type, spec.ne0, spec.ne1,
-                        pages[0]->roles.at(k_roles[j]).device_offset};
+                        pages[0]->roles.at(k_roles[j]).device_offset,
+                        spec.type == GGML_TYPE_MXFP4 && pages[0]->roles.at(k_roles[j]).radiance &&
+                            batch.any_radiance_loaded()};
         }
 
         std::vector<ArenaGroup> groups;
@@ -23235,6 +23818,10 @@ private:
                 ggml_tensor * tensor = ggml_new_tensor_3d(
                     ctx, role.type, role.ne0, role.ne1, (int64_t) layout.n_slots);
                 tensor->nb[2] = stride;
+                if (role.radiance) {
+                    tensor->nb[3] = tensor->nb[2] * (size_t) tensor->ne[2];
+                    tensor->flags |= GGML_TENSOR_FLAG_MXFP4_RADIANCE;
+                }
                 attach_weight(tensor, layout.buffer, layout.base, role.offset);
                 return tensor;
             };
@@ -23459,6 +24046,7 @@ private:
             throw std::runtime_error("arena expert backend graph compute failed");
         }
         ++request_stats.n_arena_hit;
+        last_compute_path_ = "arena";
         request_stats.n_arena_groups += groups.size();
         for (const pipe_expert_assignment & assignment : request.assignments) {
             for (float weight : assignment.weights) {
@@ -23825,21 +24413,24 @@ private:
         // expert where an unfused one has two, so the two shapes must never
         // share a cache entry (same failure mode as the type fields above).
         bool     fused_gate_up = false;
+        // MXFP4 radiance: the cached weight tensors carry the radiance flag (and, fused, the PAIR flag + offset), so a
+        // radiance graph and a stock one must never share an entry (the hit path rebinds pointers, not flags).
+        bool     radiance = false;
         bool operator<(const GraphKey & o) const {
             if (!wp_persistent_graphs_enabled()) {
                 return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
-                                type_gate, type_up, type_down, fused_gate_up) <
+                                type_gate, type_up, type_down, fused_gate_up, radiance) <
                        std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
-                                o.type_gate, o.type_up, o.type_down, o.fused_gate_up);
+                                o.type_gate, o.type_up, o.type_down, o.fused_gate_up, o.radiance);
             }
             return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits,
                             type_gate, type_up, type_down,
                             ne0_gate, ne1_gate, ne0_up, ne1_up, ne0_down, ne1_down,
-                            fused_gate_up) <
+                            fused_gate_up, radiance) <
                    std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits,
                             o.type_gate, o.type_up, o.type_down,
                             o.ne0_gate, o.ne1_gate, o.ne0_up, o.ne1_up,
-                            o.ne0_down, o.ne1_down, o.fused_gate_up);
+                            o.ne0_down, o.ne1_down, o.fused_gate_up, o.radiance);
         }
     };
     struct GraphCacheEntry {

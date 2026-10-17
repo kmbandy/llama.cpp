@@ -29,6 +29,7 @@
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -104,10 +105,70 @@ ParsedRequest read_request(const std::string & path) {
 
 } // namespace
 
+// --batch mode: replay a list of request files (one path per line, e.g. a WP_REQUEST_DUMP directory listing) in order
+// against the worker, <passes> times. Pass 0 is untimed (page-in / graph warm-up). Prints the per-pass wall time and
+// the mean request round trip, split by n_tokens and by main (layer < 40) vs spec-head (layer >= 40) layers.
+static int run_batch(const std::string & host, int port, const std::string & list_path, int passes) {
+    std::vector<ParsedRequest> reqs;
+    {
+        std::ifstream l(list_path);
+        std::string line;
+        while (std::getline(l, line)) {
+            if (!line.empty()) reqs.push_back(read_request(line));
+        }
+    }
+    if (reqs.empty()) throw std::runtime_error("empty request list");
+    pipe_socket_ptr socket = connect_with_retry(host, port, 400);
+    pipe_frame_type type;
+    uint64_t seq_id = 0;
+    std::vector<uint8_t> payload;
+    if (!pipe_recv_frame(*socket, type, seq_id, payload) || type != PIPE_HELLO) throw std::runtime_error("no HELLO");
+    pipe_expert_hello client_hello = pipe_decode_expert_hello(payload.data(), payload.size());
+    client_hello.role = PIPE_EXPERT_ROLE_CLIENT;
+    const std::vector<uint8_t> hp = pipe_encode_expert_hello(client_hello);
+    if (!pipe_send_frame(*socket, PIPE_HELLO, 0, hp.data(), hp.size())) throw std::runtime_error("hello send");
+    if (!pipe_recv_frame(*socket, type, seq_id, payload) || type != PIPE_EXPERT_HELLO_ACK) throw std::runtime_error("no ack");
+    std::vector<std::vector<uint8_t>> enc;
+    for (const auto & r : reqs) enc.push_back(pipe_encode_expert_dispatch_req(r.req));
+    for (int pass = 0; pass <= passes; ++pass) {
+        std::vector<double> ms(reqs.size());
+        const auto w0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, (uint64_t) i + 1, enc[i].data(), enc[i].size()))
+                throw std::runtime_error("send failed");
+            if (!pipe_recv_frame(*socket, type, seq_id, payload)) throw std::runtime_error("recv failed");
+            if (type != PIPE_EXPERT_PARTIAL) throw std::runtime_error("unexpected frame / worker error");
+            ms[i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        const double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        double sum_main = 0, sum_spec = 0; size_t n_main = 0, n_spec = 0;
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            if (reqs[i].layer >= 40) { sum_spec += ms[i]; ++n_spec; } else { sum_main += ms[i]; ++n_main; }
+        }
+        std::vector<double> sorted = ms; std::sort(sorted.begin(), sorted.end());
+        std::printf("pass %d%s: n=%zu wall_ms=%.1f mean_ms=%.3f p50_ms=%.3f main(n=%zu)=%.3f spec(n=%zu)=%.3f\n", pass,
+                    pass == 0 ? " (warm-up)" : "", reqs.size(), wall, wall / reqs.size(), sorted[sorted.size() / 2],
+                    n_main, n_main ? sum_main / n_main : 0.0, n_spec, n_spec ? sum_spec / n_spec : 0.0);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 6 && std::string(argv[3]) == "--batch") {
+        if (!pipe_transport_init()) return 1;
+        try {
+            return run_batch(argv[1], std::atoi(argv[2]), argv[4], std::atoi(argv[5]));
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "wp-worker-verify error: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc < 5) {
         std::fprintf(stderr,
-            "usage: %s <host> <port> <request_file> <output_file>\n", argv[0]);
+            "usage: %s <host> <port> <request_file> <output_file>\n"
+            "       %s <host> <port> --batch <list_file> <passes>\n", argv[0], argv[0]);
         return 2;
     }
     const std::string host        = argv[1];

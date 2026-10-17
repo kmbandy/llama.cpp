@@ -114,6 +114,9 @@ struct FuseGateUpCheck {
     int64_t  up_ne1 = 0;
     uint64_t gate_device_offset = 0;
     uint64_t up_device_offset = 0;
+    // Bytes the gate role occupies on the device when that is NOT ggml_row_size*ne1: MXFP4 radiance roles hold the
+    // packed layout (device_bytes). 0 = use the stock size.
+    uint64_t gate_device_span = 0;
 };
 
 struct FuseGateUpDiag {
