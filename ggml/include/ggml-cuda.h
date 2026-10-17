@@ -85,6 +85,38 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// rdna4 radiance MXFP4 weight packing (gfx1201 only). packed_bytes returns the packed size of one [N, K]
+// matrix (ggml_row_size(MXFP4,K)*N + N), or 0 if the shape is unsupported. repack converts ggml block_mxfp4
+// rows at src_blocks_dev into the packed layout at dst_packed_dev (device pointers, must not alias), on the
+// backend's stream. Returns false if the device is not gfx1201 or the shape is unsupported.
+GGML_BACKEND_API bool   ggml_backend_cuda_mxfp4_radiance_repack(ggml_backend_t backend, const void * src_blocks_dev,
+                                                               void * dst_packed_dev, int64_t N, int64_t K);
+GGML_BACKEND_API size_t ggml_backend_cuda_mxfp4_radiance_packed_bytes(int64_t N, int64_t K);
+// Exact inverse of repack: radiance packed matrix at packed_dev -> ggml block_mxfp4 rows at dst_blocks_dev
+// (ggml_row_size(MXFP4,K)*N bytes, must not alias packed_dev), on the backend's compute stream.
+GGML_BACKEND_API bool   ggml_backend_cuda_mxfp4_radiance_unpack(ggml_backend_t backend, const void * packed_dev,
+                                                               void * dst_blocks_dev, int64_t N, int64_t K);
+// true if backend is a CUDA/HIP device with radiance MXFP4 kernels compiled in and it is gfx1201.
+GGML_BACKEND_API bool   ggml_backend_cuda_mxfp4_radiance_available(ggml_backend_t backend);
+// In-place radiance repack of one worker slot role. role_dev holds stock block_mxfp4 bytes (stock_bytes = N*row_size(K));
+// on success it holds packed_bytes(N,K) radiance bytes. scratch_dev (>= stock_bytes, no overlap) is clobbered.
+// Enqueued on the backend's WP copy stream when enabled (ordered after prior WP copies), else on the compute
+// stream. host_wait blocks until the stream drains. Returns false if nothing was enqueued (treat as fatal).
+GGML_BACKEND_API bool   ggml_backend_cuda_wp_mxfp4_radiance_stage(ggml_backend_t backend, void * role_dev,
+                                                                 void * scratch_dev, size_t stock_bytes,
+                                                                 int64_t N, int64_t K, bool host_wait);
+
+// Worker slot unpack (inverse of the stage above) for D2H of a packed role: unpacks role_dev (packed) into
+// scratch_dev (>= stock_bytes, no overlap) as stock block_mxfp4 bytes. Safe from any thread: runs on a per-thread
+// non-blocking stream and always blocks until done (host_wait is ignored).
+GGML_BACKEND_API bool   ggml_backend_cuda_wp_mxfp4_radiance_unstage(ggml_backend_t backend, const void * role_dev,
+                                                                   void * scratch_dev, size_t stock_bytes,
+                                                                   int64_t N, int64_t K, bool host_wait);
+// Reader-thread repack (after a host-synchronized H2D of the stock role bytes): in place, per-thread stream and
+// device scratch, safe to call from several reader threads at once, returns after the packed bytes are on the device.
+GGML_BACKEND_API bool   ggml_backend_cuda_wp_mxfp4_radiance_stage_reader(ggml_backend_t backend, void * role_dev,
+                                                                        size_t stock_bytes, int64_t N, int64_t K);
+
 // HIP: flush deferred multi-input cross-device stages (no-op on CUDA/non-batch).
 // Call before WP eval_cb / any consumer that must see staged activations.
 GGML_BACKEND_API void ggml_backend_cuda_xdev_batch_flush(void);

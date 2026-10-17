@@ -7,6 +7,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
+#include "ggml-cuda/mxfp4-radiance.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
@@ -3675,6 +3676,13 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // rdna4 radiance-packed MXFP4 weights (GGML_TENSOR_FLAG_MXFP4_RADIANCE): the bytes are not block_mxfp4,
+    // so this must run before any stock MXFP4 path. Aborts if radiance is unavailable on this device.
+    if (src0->type == GGML_TYPE_MXFP4 && (src0->flags & GGML_TENSOR_FLAG_MXFP4_RADIANCE)) {
+        ggml_cuda_mul_mat_mxfp4_radiance(ctx, src0, src1, dst);
+        return;
+    }
+
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -3894,6 +3902,10 @@ static void ggml_cuda_ml8_mul_mat_generic(ggml_backend_cuda_context & ctx, ggml_
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    // radiance MXFP4 MUL_MAT_ID is fully device-side (mxfp4-radiance.cu): never needs a host sync.
+    if (src0->type == GGML_TYPE_MXFP4 && (src0->flags & GGML_TENSOR_FLAG_MXFP4_RADIANCE)) {
+        return false;
+    }
     const bool force_mm = ggml_cuda_mul_mat_id_force_mm(src1->ne[2]) || ggml_cuda_mul_mat_id_hint_pinned(dst);
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -3931,6 +3943,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    // rdna4 radiance-packed MXFP4 weights: see the note in ggml_cuda_mul_mat.
+    if (src0->type == GGML_TYPE_MXFP4 && (src0->flags & GGML_TENSOR_FLAG_MXFP4_RADIANCE)) {
+        ggml_cuda_mul_mat_id_mxfp4_radiance(ctx, dst);
+        return;
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -12325,6 +12343,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (a->type == GGML_TYPE_MXFP4 && (a->flags & GGML_TENSOR_FLAG_MXFP4_RADIANCE)) {
+                    return ggml_cuda_mxfp4_radiance_supports_op(op, ggml_cuda_info().devices[dev_ctx->device].cc);
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -13282,6 +13303,21 @@ static void ggml_backend_cuda_set_stream_no(ggml_backend_t backend, int stream_n
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_mxfp4_radiance_repack") == 0) {
+        return (void *)ggml_backend_cuda_mxfp4_radiance_repack;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mxfp4_radiance_packed_bytes") == 0) {
+        return (void *)ggml_backend_cuda_mxfp4_radiance_packed_bytes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mxfp4_radiance_unpack") == 0) {
+        return (void *)ggml_backend_cuda_mxfp4_radiance_unpack;
+    }
+    if (strcmp(name, "ggml_backend_cuda_wp_mxfp4_radiance_stage_reader") == 0) {
+        return (void *)ggml_backend_cuda_wp_mxfp4_radiance_stage_reader;
+    }
+    if (strcmp(name, "ggml_backend_cuda_wp_mxfp4_radiance_unstage") == 0) {
+        return (void *)ggml_backend_cuda_wp_mxfp4_radiance_unstage;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

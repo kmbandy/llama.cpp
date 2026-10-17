@@ -375,6 +375,11 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+if (GGML_HIP)
+    # rdna4 radiance MXFP4 MUL_MAT / MUL_MAT_ID on the R9700 (gfx1201). Needs the GPU, so it is built but
+    # not registered with ctest: run it by hand with HIP_VISIBLE_DEVICES selecting the R9700.
+    llama_build(test-mxfp4-radiance.cpp LINK ggml)
+endif()
 llama_build_and_test(test-wp-mul-mat-pin.cpp)
 llama_build_and_test(test-paged-attn-vk.cpp)
 

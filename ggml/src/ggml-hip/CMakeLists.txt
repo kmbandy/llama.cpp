@@ -134,7 +134,8 @@ list(APPEND GGML_SOURCES_ROCM
 # gemm_ml84_prod.hip / gemm_ml84_decode_v2.hip above.
 list(APPEND GGML_SOURCES_ROCM
     ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip
-        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.hip)
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_mxfp4_radiance.hip)
 
 # R4D vendored attention kernels (ggml-cuda/r4d/, see r4d/README-ORIGIN.txt for provenance --
 # radiance-libr4d commit b9e42ab-rx6). fp8-KV and bf16-KV paged, causal, GQA-6 attention at
@@ -219,6 +220,7 @@ if (GGML_HIP_R4D)
     set_source_files_properties(
         ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_radiance.hip
         ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/radiance_quant.hip
+        ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_mxfp4_radiance.hip
         ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_decode_v2.hip
         ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_ml84_prod.hip
         ../ggml-cuda/aiter-integration/rdna4_fp8_gemm/gemm_trfeed_prod.hip

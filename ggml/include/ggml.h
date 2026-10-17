@@ -816,6 +816,17 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_ML8_PACKED = 32, // ...GGML_TYPE_ML8_4 bytes already in the device GEMM layout (packed nibbles, then fp32 scales)
+        // ...GGML_TYPE_MXFP4 bytes are the rdna4 radiance packed layout (gemm_mxfp4_radiance.h), not block_mxfp4.
+        //    Type stays GGML_TYPE_MXFP4. Each [N rows, K] matrix is packed as ggml_row_size(MXFP4,K)*N + N bytes
+        //    (the +N is the Wref tail), starting at the matrix base, so whoever allocates must reserve the N extra
+        //    bytes. For 3D (MUL_MAT_ID) weights, expert e's matrix starts at data + e*nb[2], and nb[2] must be >= the
+        //    packed size. Only meaningful to ggml-cuda on gfx1201; other backends must not see this flag.
+        GGML_TENSOR_FLAG_MXFP4_RADIANCE = 64,
+        // ...with MXFP4_RADIANCE: a fused gate;up pair. ne[1] = 2*n rows hold TWO packed matrices of n rows each (every
+        //    expert, for 3D weights): the second starts op_params[0] bytes after the first (>= packed size of n x K).
+        //    A MUL_MAT / MUL_MAT_ID with such a src0 produces dst rows [first n | second n] (what a stock [gate;up]
+        //    matrix would), quantizing the activations only once.
+        GGML_TENSOR_FLAG_MXFP4_RADIANCE_PAIR = 128,
     };
 
     enum ggml_tri_type {
