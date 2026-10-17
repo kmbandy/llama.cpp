@@ -900,6 +900,17 @@ static __device__ __forceinline__ float radp_bf16_bits_to_f32(uint16_t bits) {
   return f;
 }
 
+// fp32 -> bf16 bits, round-to-nearest-even (matches the hardware convert and
+// the usual __float2bfloat16 for finite values). NaN keeps its sign and is
+// quieted. Used for the bf16 residual_out store only.
+static __device__ __forceinline__ uint16_t radp_f32_to_bf16_rne(float f) {
+  uint32_t b;
+  memcpy(&b, &f, 4);
+  if ((b & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((b >> 16) | 0x40u);
+  b += 0x7fffu + ((b >> 16) & 1u);
+  return (uint16_t)(b >> 16);
+}
+
 // Variant 6 (bf16-INPUT split silu*mul): identical to
 // radp_ml8_qrot_kernel<...,QMODE_SILU_SPLIT> except the load, which reads
 // bf16 gate/up (8 elements = 16 bytes per lane-step, one uint4 transaction)
@@ -1109,11 +1120,18 @@ __global__ void radp_ml8_qrot_silu_mul_split_bf16_kernel(
 // stream itself going bf16 end-to-end is a later step, not this kernel's
 // concern). norm_w/y_out share the exact same optional-fused-RMSNorm and
 // post-norm-capture semantics as the fp32 ADD kernel's tail.
-template <int B, int NW, int MAXAW, bool HAS_HA>
+//
+// RES_BF16 (bf16 residual stream, 2026-10-16): when true, residual_out_bf16
+// (nullable) receives the residual sum as bf16 (RNE of the fp32 sum v) instead
+// of residual_out (fp32). The norm, y_out and rotation still read the FP32 sum
+// (not the rounded bf16 value), so only the stored residual loses precision.
+// The fp32 residual_out pointer is ignored when RES_BF16 is set.
+template <int B, int NW, int MAXAW, bool HAS_HA, bool RES_BF16 = false>
 __launch_bounds__(32 * NW, (MAXAW * (B / 32) <= 32) ? 2 : 1)
 __global__ void radp_ml8_qrot_add_bf16_kernel(
     const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ residual_bf16,
-    float* __restrict__ residual_out, const float* __restrict__ h_a,
+    float* __restrict__ residual_out, uint16_t* __restrict__ residual_out_bf16,
+    const float* __restrict__ h_a,
     const float* __restrict__ norm_w, float norm_eps, uint8_t* __restrict__ a_tiled,
     float* __restrict__ a_scale, float* __restrict__ y_out, int K, int a_dim, int n_rows) {
   constexpr int E = B / 32;
@@ -1127,7 +1145,9 @@ __global__ void radp_ml8_qrot_add_bf16_kernel(
   if (row >= n_rows) return;
   const uint16_t* xrow = x_bf16 + (size_t)row * (size_t)K;
   const uint16_t* rrow = residual_bf16 ? residual_bf16 + (size_t)row * (size_t)K : nullptr;
-  float* rout = residual_out ? residual_out + (size_t)row * (size_t)K : nullptr;
+  float* rout = (!RES_BF16 && residual_out) ? residual_out + (size_t)row * (size_t)K : nullptr;
+  uint16_t* rout16 = (RES_BF16 && residual_out_bf16) ? residual_out_bf16 + (size_t)row * (size_t)K
+                                                      : nullptr;
   float* yout_row = y_out ? y_out + (size_t)row * (size_t)K : nullptr;
 
   float v[MAXAW][E];
@@ -1173,10 +1193,37 @@ __global__ void radp_ml8_qrot_add_bf16_kernel(
           }
         }
       }
-      if (rout) {
-        float* ob = rout + (size_t)a * B + lane * E;
+      if constexpr (RES_BF16) {
+        if (rout16) {
+          // bf16 residual_out: RNE of the fp32 sum (the same v the norm reads).
+          // Packed stores: element e sits in the low half of its 32-bit word,
+          // matching the little-endian load order above.
+          uint16_t* ob = rout16 + (size_t)a * B + lane * E;
 #pragma unroll
-        for (int e = 0; e < E; e++) ob[e] = v[j][e];
+          for (int e = 0; e < E; e += LOADSTEP) {
+            if constexpr (LOADSTEP == 8) {
+              uint32_t w[4];
+#pragma unroll
+              for (int q = 0; q < 4; q++)
+                w[q] = (uint32_t)radp_f32_to_bf16_rne(v[j][e + 2 * q]) |
+                       ((uint32_t)radp_f32_to_bf16_rne(v[j][e + 2 * q + 1]) << 16);
+              *reinterpret_cast<uint4*>(ob + e) = make_uint4(w[0], w[1], w[2], w[3]);
+            } else {
+              uint32_t w[2];
+#pragma unroll
+              for (int q = 0; q < 2; q++)
+                w[q] = (uint32_t)radp_f32_to_bf16_rne(v[j][e + 2 * q]) |
+                       ((uint32_t)radp_f32_to_bf16_rne(v[j][e + 2 * q + 1]) << 16);
+              *reinterpret_cast<uint2*>(ob + e) = make_uint2(w[0], w[1]);
+            }
+          }
+        }
+      } else {
+        if (rout) {
+          float* ob = rout + (size_t)a * B + lane * E;
+#pragma unroll
+          for (int e = 0; e < E; e++) ob[e] = v[j][e];
+        }
       }
     }
   }
@@ -1807,9 +1854,51 @@ bool rdna4_ml8_qrot_silu_mul_split_tiled_bf16(const void* gate_bf16, const void*
   return true;
 }
 
-// bf16-INPUT residual add (see radp_ml8_qrot_add_bf16_kernel's own comment).
-// residual_out, if requested, is still written fp32 -- keeping the residual
-// stream itself bf16 end-to-end is a later step, not this kernel's concern.
+// bf16-input residual add (see radp_ml8_qrot_add_bf16_kernel's own comment).
+// residual_out, if requested, is still written fp32 -- this entry point's
+// contract is unchanged. The bf16 residual stream is rdna4_ml8_qrot_add_tiled_bf16res.
+namespace {
+// Shape switch shared by every bf16-input add-kernel launcher. RES_BF16 picks
+// the residual_out store type; both outputs are nullable. A null residual with
+// null outputs is the plain (norm-only) bf16 path.
+template <bool RES_BF16>
+bool radp_launch_add_bf16(RadpQrotDisp disp, const uint16_t* x16, const uint16_t* r16,
+                          float* rout_f32, uint16_t* rout_bf16, const float* h_a_f,
+                          const float* norm_w, float norm_eps, uint8_t* A_tiled, float* a_scale,
+                          float* y_out, int K, int a_dim, int M, hipStream_t stream) {
+  using namespace ml8qrot;
+#define RADP_ADD_BF16_LAUNCH(B_, NW_, MAXAW_, HA_, HA_PTR_)                                      \
+  radp_ml8_qrot_add_bf16_kernel<B_, NW_, MAXAW_, HA_, RES_BF16><<<M, 32 * NW_, 0, stream>>>(     \
+      x16, r16, rout_f32, rout_bf16, HA_PTR_, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, \
+      M)
+  switch (disp) {
+    case RadpQrotDisp::KRON_B1024_A5: RADP_ADD_BF16_LAUNCH(1024, 5, 1, true, h_a_f); break;
+    case RadpQrotDisp::KRON_B1024_A8: RADP_ADD_BF16_LAUNCH(1024, 8, 1, true, h_a_f); break;
+    case RadpQrotDisp::KRON_B512_A16: RADP_ADD_BF16_LAUNCH(512, 16, 1, true, h_a_f); break;
+    case RadpQrotDisp::KRON_B256_A16: RADP_ADD_BF16_LAUNCH(256, 16, 1, true, h_a_f); break;
+    case RadpQrotDisp::HAD_B128_NW32_A4: RADP_ADD_BF16_LAUNCH(128, 32, 4, false, nullptr); break;
+    case RadpQrotDisp::HAD_B128_NW32_A12: RADP_ADD_BF16_LAUNCH(128, 32, 12, false, nullptr); break;
+    case RadpQrotDisp::HAD_B128_NW16_A34: RADP_ADD_BF16_LAUNCH(128, 16, 34, false, nullptr); break;
+    default: return false;
+  }
+#undef RADP_ADD_BF16_LAUNCH
+  return true;
+}
+}  // namespace
+
+bool rdna4_ml8_qrot_tiled_bf16(const void* x_bf16, const void* h_a, int rot_kind, int a_dim,
+                               int b_dim, const float* norm_w, float norm_eps, int M, int K,
+                               uint8_t* A_tiled, float* a_scale, hipStream_t stream, float* y_out) {
+  if (M <= 0 || K <= 0 || (K & 15) || !x_bf16) return false;
+  RadpQrotDisp disp;
+  if (!radp_qrot_shape_ok(rot_kind, a_dim, b_dim, K, &disp)) return false;
+  const int Mt = (M + 15) >> 4;
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, (size_t)Mt * 16 * (size_t)K, stream);
+  return radp_launch_add_bf16<false>(disp, (const uint16_t*)x_bf16, nullptr, nullptr, nullptr,
+                                     (const float*)h_a, norm_w, norm_eps, A_tiled, a_scale, y_out,
+                                     K, a_dim, M, stream);
+}
+
 bool rdna4_ml8_qrot_add_tiled_bf16(const void* x_bf16, const void* residual_bf16,
                                     float* residual_out, const void* h_a, int rot_kind, int a_dim,
                                     int b_dim, const float* norm_w, float norm_eps, int M, int K,
@@ -1818,49 +1907,26 @@ bool rdna4_ml8_qrot_add_tiled_bf16(const void* x_bf16, const void* residual_bf16
   if (M <= 0 || K <= 0 || (K & 15) || !x_bf16) return false;
   RadpQrotDisp disp;
   if (!radp_qrot_shape_ok(rot_kind, a_dim, b_dim, K, &disp)) return false;
-
   const int Mt = (M + 15) >> 4;
-  const size_t at_bytes = (size_t)Mt * 16 * (size_t)K;
-  // Zero only when there are pad rows: for M%16==0 the kernel writes every byte
-  // of the tile buffer (all rows, all K columns), so the memset is dead work.
-  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, at_bytes, stream);
-  const float* h_a_f = (const float*)h_a;
-  const uint16_t* x16 = (const uint16_t*)x_bf16;
-  const uint16_t* r16 = (const uint16_t*)residual_bf16;
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, (size_t)Mt * 16 * (size_t)K, stream);
+  return radp_launch_add_bf16<false>(disp, (const uint16_t*)x_bf16, (const uint16_t*)residual_bf16,
+                                     residual_out, nullptr, (const float*)h_a, norm_w, norm_eps,
+                                     A_tiled, a_scale, y_out, K, a_dim, M, stream);
+}
 
-  using namespace ml8qrot;
-  switch (disp) {
-    case RadpQrotDisp::KRON_B1024_A5:
-      radp_ml8_qrot_add_bf16_kernel<1024, 5, 1, true><<<M, 32 * 5, 0, stream>>>(
-          x16, r16, residual_out, h_a_f, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::KRON_B1024_A8:
-      radp_ml8_qrot_add_bf16_kernel<1024, 8, 1, true><<<M, 32 * 8, 0, stream>>>(
-          x16, r16, residual_out, h_a_f, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::KRON_B512_A16:
-      radp_ml8_qrot_add_bf16_kernel<512, 16, 1, true><<<M, 32 * 16, 0, stream>>>(
-          x16, r16, residual_out, h_a_f, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::KRON_B256_A16:
-      radp_ml8_qrot_add_bf16_kernel<256, 16, 1, true><<<M, 32 * 16, 0, stream>>>(
-          x16, r16, residual_out, h_a_f, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::HAD_B128_NW32_A4:
-      radp_ml8_qrot_add_bf16_kernel<128, 32, 4, false><<<M, 32 * 32, 0, stream>>>(
-          x16, r16, residual_out, nullptr, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::HAD_B128_NW32_A12:
-      radp_ml8_qrot_add_bf16_kernel<128, 32, 12, false><<<M, 32 * 32, 0, stream>>>(
-          x16, r16, residual_out, nullptr, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    case RadpQrotDisp::HAD_B128_NW16_A34:
-      radp_ml8_qrot_add_bf16_kernel<128, 16, 34, false><<<M, 32 * 16, 0, stream>>>(
-          x16, r16, residual_out, nullptr, norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M);
-      break;
-    default: return false;
-  }
-  return true;
+bool rdna4_ml8_qrot_add_tiled_bf16res(const void* x_bf16, const void* residual_bf16,
+                                       void* residual_out_bf16, const void* h_a, int rot_kind,
+                                       int a_dim, int b_dim, const float* norm_w, float norm_eps,
+                                       int M, int K, uint8_t* A_tiled, float* a_scale,
+                                       hipStream_t stream, float* y_out) {
+  if (M <= 0 || K <= 0 || (K & 15) || !x_bf16) return false;
+  RadpQrotDisp disp;
+  if (!radp_qrot_shape_ok(rot_kind, a_dim, b_dim, K, &disp)) return false;
+  const int Mt = (M + 15) >> 4;
+  if ((M & 15) != 0) (void)hipMemsetAsync(A_tiled, 0, (size_t)Mt * 16 * (size_t)K, stream);
+  return radp_launch_add_bf16<true>(disp, (const uint16_t*)x_bf16, (const uint16_t*)residual_bf16,
+                                    nullptr, (uint16_t*)residual_out_bf16, (const float*)h_a,
+                                    norm_w, norm_eps, A_tiled, a_scale, y_out, K, a_dim, M, stream);
 }
 
 #undef RADP_DISPATCH
@@ -2136,4 +2202,22 @@ bool rdna4_ml8_qrot_oracle_rowmajor(const float* x, const void* h_a, int rot_kin
     default: return false;
   }
   return true;
+}
+
+// bf16-INPUT gated per-head RMSNorm (`o` bf16, packed [M, n_heads*head_dim]).
+// Thin forward to the r4d entry point with identity head order: the r4d load
+// already reads bf16 `o` with exact upcast and shares the fp32 tail, so this
+// is the same math as rdna4_ml8_qrot_gated_norm_tiled with o upcast.
+bool rdna4_ml8_qrot_gated_norm_tiled_bf16o(const void* o_bf16, const float* z, size_t z_nb1,
+                                            size_t z_nb2, const float* norm_w, float norm_eps,
+                                            int head_dim, int n_heads, const void* h_a,
+                                            int rot_kind, int a_dim, int b_dim, int M,
+                                            uint8_t* A_tiled, float* a_scale, hipStream_t stream,
+                                            float* y_out) {
+  if (!o_bf16 || head_dim <= 0 || n_heads <= 0) return false;
+  const size_t K = (size_t)head_dim * (size_t)n_heads;
+  return rdna4_ml8_qrot_gated_norm_tiled_r4d(o_bf16, (size_t)head_dim * 2, K * 2,
+                                             /*head_src=*/nullptr, z, z_nb1, z_nb2, norm_w,
+                                             norm_eps, head_dim, n_heads, h_a, rot_kind, a_dim,
+                                             b_dim, M, A_tiled, a_scale, stream, y_out);
 }

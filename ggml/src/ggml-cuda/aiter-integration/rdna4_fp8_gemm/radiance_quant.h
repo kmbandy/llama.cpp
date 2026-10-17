@@ -132,6 +132,38 @@ bool rdna4_ml8_qrot_add_tiled_bf16(const void* x_bf16, const void* residual_bf16
                                     uint8_t* A_tiled, float* a_scale, hipStream_t stream,
                                     float* y_out = nullptr);
 
+// bf16-INPUT residual add with a BF16 residual stream (2026-10-16).
+// x and residual are bf16 bit patterns. The fp32 sum r = x + residual is
+// computed exactly as in the fp32 entry points (upcast both, add in fp32).
+// residual_out_bf16 (nullable) receives rne_bf16(r) -- round-to-nearest-even
+// of the fp32 sum, so residual_out == rne(fp32 residual_out) bit for bit. The
+// RMSNorm sum of squares, optional y_out, and the rotation all consume the
+// FP32 sum r, NOT the rounded bf16 value (only the stored residual is rounded).
+// norm_w/norm_eps/y_out match rdna4_ml8_qrot_add_tiled. residual may be null
+// (r = x). Same dispatch coverage / decline rules as the fp32 entry points.
+bool rdna4_ml8_qrot_add_tiled_bf16res(const void* x_bf16, const void* residual_bf16,
+                                       void* residual_out_bf16, const void* h_a, int rot_kind,
+                                       int a_dim, int b_dim, const float* norm_w, float norm_eps,
+                                       int M, int K, uint8_t* A_tiled, float* a_scale,
+                                       hipStream_t stream, float* y_out = nullptr);
+
+// bf16-INPUT plain RMSNorm*w -> rotate -> quant (no residual, no residual_out).
+// Same as rdna4_ml8_qrot_tiled with x upcast from bf16 (exact).
+bool rdna4_ml8_qrot_tiled_bf16(const void* x_bf16, const void* h_a, int rot_kind, int a_dim,
+                                int b_dim, const float* norm_w, float norm_eps, int M, int K,
+                                uint8_t* A_tiled, float* a_scale, hipStream_t stream,
+                                float* y_out = nullptr);
+
+// bf16-INPUT gated per-head RMSNorm: `o` is bf16 packed [M, n_heads*head_dim]
+// (identity head order); z stays fp32. Same math as
+// rdna4_ml8_qrot_gated_norm_tiled with o upcast from bf16 (exact).
+bool rdna4_ml8_qrot_gated_norm_tiled_bf16o(const void* o_bf16, const float* z, size_t z_nb1,
+                                            size_t z_nb2, const float* norm_w, float norm_eps,
+                                            int head_dim, int n_heads, const void* h_a,
+                                            int rot_kind, int a_dim, int b_dim, int M,
+                                            uint8_t* A_tiled, float* a_scale, hipStream_t stream,
+                                            float* y_out = nullptr);
+
 // qrot_tiled with a GATED PER-HEAD RMSNORM prologue, for the GDN output site
 // (qwen35 build_norm_gated -> ssm_out): the row [K = n_heads*head_dim] is
 // treated as n_heads groups of head_dim; each group is rms-normalized over
